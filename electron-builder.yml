@@ -1,0 +1,22 @@
+appId: io.ghcr.manager
+productName: GHCR Manager
+directories:
+  output: dist-exe
+files:
+  - dist/**/*
+  - electron/**/*
+  - package.json
+win:
+  target:
+    - nsis
+    - portable
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.developer-tools
