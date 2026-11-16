@@ -660,15 +660,36 @@ button:disabled {
   stroke: var(--theme-text-muted) !important;
 }
 
-/* Drag and Drop Zone - Adheres to All 5 Themes */
+/* Drag and Drop & Picker Panels - Adheres to All 5 Themes */
 .dropzone-container {
   border: 2px dashed var(--theme-border);
   background-color: var(--theme-bg);
-  transition: all 0.15s ease-in-out;
+  transition: border-color 0.15s ease-in-out, background-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
 }
 .dropzone-container:hover {
   border-color: var(--theme-accent-border);
 }
+
+/* Green Theme: Lower opacity green unhovered -> Full green on hover */
+html.theme-terminal-green .dropzone-container,
+.theme-terminal-green .dropzone-container {
+  border-color: rgba(34, 197, 94, 0.35) !important;
+}
+html.theme-terminal-green .dropzone-container:hover,
+.theme-terminal-green .dropzone-container:hover {
+  border-color: #22c55e !important;
+}
+
+/* Red Theme: Lower opacity red unhovered -> Full red on hover */
+html.theme-terminal-red .dropzone-container,
+.theme-terminal-red .dropzone-container {
+  border-color: rgba(239, 68, 68, 0.35) !important;
+}
+html.theme-terminal-red .dropzone-container:hover,
+.theme-terminal-red .dropzone-container:hover {
+  border-color: #ef4444 !important;
+}
+
 .dropzone-container.is-drag-over {
   border: 2px solid var(--theme-accent-border) !important;
   background-color: var(--theme-accent-soft) !important;

@@ -1792,16 +1792,7 @@ export default function App() {
                         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                           <div className="sm:col-span-3">
                             <label className="block text-xs font-semibold text-gray-200 mb-1">
-                              Image & Package Name{' '}
-                              {pickedFiles.length > 1 ? (
-                                <span className="text-gray-400 font-normal">
-                                  (Required for multiple files)
-                                </span>
-                              ) : (
-                                <span className="text-gray-400 font-normal">
-                                  (Defaults to file name — edit if you want another name)
-                                </span>
-                              )}
+                              Image & Package Name
                             </label>
                             <input
                               type="text"
@@ -1976,13 +1967,13 @@ export default function App() {
                     {!rootScan ? (
                       <div
                         onClick={handlePickRootFolder}
-                        className="border-2 border-dashed border-[#30363d] hover:border-gray-500 bg-[#0d1117] rounded-xl p-10 text-center transition cursor-pointer"
+                        className="dropzone-container rounded-xl p-10 text-center transition cursor-pointer select-none"
                       >
-                        <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3" />
-                        <div className="text-sm font-semibold text-white">
+                        <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3 dropzone-icon transition-transform pointer-events-none" />
+                        <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
                           Select a Root Folder to Scan
                         </div>
-                        <p className="text-xs text-gray-500 max-w-md mx-auto mt-1">
+                        <p className="text-xs text-gray-500 max-w-md mx-auto mt-1 pointer-events-none">
                           Detects all direct files and immediate sub-folders and prepares
                           an OCI package image for each one.
                         </p>
