@@ -2372,9 +2372,9 @@ export default function App() {
                                 e.stopPropagation();
                                 handleAbortUploadScan();
                               }}
-                              className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer hover:text-red-400 hover:border-red-500/50 transition-colors"
+                              className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                             >
-                              <X className="w-3.5 h-3.5 text-red-400" />
+                              <X className="w-3.5 h-3.5" />
                               Cancel
                             </button>
                           </div>
@@ -2651,7 +2651,7 @@ export default function App() {
                           className="hidden"
                           onChange={handleFallbackWebkitDirectory}
                         />
-                        {(rootScan || isScanningFolder) && (
+                        {rootScan && (
                           <button
                             type="button"
                             disabled={isSyncingFolder}
@@ -2665,30 +2665,38 @@ export default function App() {
                                 ? 'Click to abort scanning'
                                 : 'Rescan root folder'
                             }
-                            className={`btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors ${
-                              isScanningFolder && isHoveringScanAbort
-                                ? 'hover:text-red-400 hover:border-red-500/50'
-                                : ''
-                            }`}
+                            className="btn-modal-action px-3 py-2 rounded-md text-xs font-semibold inline-grid items-center justify-items-center cursor-pointer transition-colors"
                           >
-                            {isScanningFolder ? (
-                              isHoveringScanAbort ? (
-                                <>
-                                  <X className="w-3.5 h-3.5 text-red-400" />
-                                  <span>Cancel</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
-                                  <span>Scanning...</span>
-                                </>
-                              )
-                            ) : (
-                              <>
-                                <RefreshCw className="w-3.5 h-3.5" />
-                                <span>Rescan</span>
-                              </>
-                            )}
+                            <span
+                              className={`col-start-1 row-start-1 flex items-center justify-center gap-1.5 ${
+                                !isScanningFolder
+                                  ? 'visible'
+                                  : 'invisible pointer-events-none select-none'
+                              }`}
+                            >
+                              <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+                              <span>Rescan</span>
+                            </span>
+                            <span
+                              className={`col-start-1 row-start-1 flex items-center justify-center gap-1.5 ${
+                                isScanningFolder && !isHoveringScanAbort
+                                  ? 'visible'
+                                  : 'invisible pointer-events-none select-none'
+                              }`}
+                            >
+                              <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner shrink-0" />
+                              <span>Scanning...</span>
+                            </span>
+                            <span
+                              className={`col-start-1 row-start-1 flex items-center justify-center gap-1.5 ${
+                                isScanningFolder && isHoveringScanAbort
+                                  ? 'visible'
+                                  : 'invisible pointer-events-none select-none'
+                              }`}
+                            >
+                              <X className="w-3.5 h-3.5 shrink-0" />
+                              <span>Cancel</span>
+                            </span>
                           </button>
                         )}
                         <button
@@ -2802,9 +2810,9 @@ export default function App() {
                                   e.stopPropagation();
                                   handleAbortScan();
                                 }}
-                                className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer hover:text-red-400 hover:border-red-500/50 transition-colors"
+                                className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                               >
-                                <X className="w-3.5 h-3.5 text-red-400" />
+                                <X className="w-3.5 h-3.5" />
                                 Cancel
                               </button>
                             </div>

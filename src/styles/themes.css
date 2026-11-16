@@ -252,6 +252,10 @@ html.theme-monochrome .hover\:text-red-400:hover svg {
   color: var(--theme-text-main) !important;
   transition: all 120ms ease;
 }
+.btn-modal-action svg:not(.icon-upload):not(.icon-sync):not(.icon-packages):not(.theme-spinner) {
+  color: inherit !important;
+  stroke: currentColor !important;
+}
 .btn-modal-action:hover {
   border-color: var(--theme-text-muted) !important;
 }
