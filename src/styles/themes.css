@@ -352,6 +352,47 @@ button.bg-blue-600 *, a.bg-blue-600 * {
   stroke: var(--theme-accent-text) !important;
 }
 
+/* Tab 2 Sync Folder Primary Button (Green in Default Dark & Light, Theme-adherent in Green/Red/Monochrome) */
+button.btn-sync-green {
+  background-color: #16a34a !important;
+  color: #ffffff !important;
+  border: 1px solid #22c55e !important;
+}
+button.btn-sync-green:hover:not(:disabled) {
+  background-color: #15803d !important;
+}
+button.btn-sync-green * {
+  color: #ffffff !important;
+  stroke: #ffffff !important;
+}
+html.theme-terminal-green button.btn-sync-green,
+.theme-terminal-green button.btn-sync-green,
+html.theme-terminal-red button.btn-sync-green,
+.theme-terminal-red button.btn-sync-green,
+html.theme-monochrome button.btn-sync-green,
+.theme-monochrome button.btn-sync-green {
+  background-color: var(--theme-accent) !important;
+  color: var(--theme-accent-text) !important;
+  border: 1px solid var(--theme-accent-border) !important;
+}
+html.theme-terminal-green button.btn-sync-green:hover:not(:disabled),
+.theme-terminal-green button.btn-sync-green:hover:not(:disabled),
+html.theme-terminal-red button.btn-sync-green:hover:not(:disabled),
+.theme-terminal-red button.btn-sync-green:hover:not(:disabled),
+html.theme-monochrome button.btn-sync-green:hover:not(:disabled),
+.theme-monochrome button.btn-sync-green:hover:not(:disabled) {
+  background-color: var(--theme-accent-hover) !important;
+}
+html.theme-terminal-green button.btn-sync-green *,
+.theme-terminal-green button.btn-sync-green *,
+html.theme-terminal-red button.btn-sync-green *,
+.theme-terminal-red button.btn-sync-green *,
+html.theme-monochrome button.btn-sync-green *,
+.theme-monochrome button.btn-sync-green * {
+  color: var(--theme-accent-text) !important;
+  stroke: var(--theme-accent-text) !important;
+}
+
 /* Active Selection Cards & Variants */
 .active-variant, .provider-card-active {
   background-color: var(--theme-accent-soft) !important;

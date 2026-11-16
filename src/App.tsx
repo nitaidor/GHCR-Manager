@@ -54,8 +54,11 @@ import {
 } from './lib/github-oci';
 import {
   scanBrowserDirectoryHandle,
+  scanBrowserDirectoryForUpload,
+  type DesktopRootFolderFileEntry,
   type DesktopRootFolderItem,
   type DesktopRootFolderScanResult,
+  type UploadSelectionItem,
 } from './lib/http';
 import { toOciImageName, validateFilesSelectionName } from './lib/naming';
 import { createZipFromExtractedFiles, type TarInputFile } from './lib/tar';
@@ -270,14 +273,25 @@ export default function App() {
   // Navigation tab
   const [activeTab, setActiveTab] = useState<ActiveTab>('upload-files');
 
-  // --- TAB 1: Pick File(s) state ---
-  const [pickedFiles, setPickedFiles] = useState<File[]>([]);
+  // --- TAB 1: Pick File(s) or Folder(s) state ---
+  const [pickedItems, setPickedItems] = useState<UploadSelectionItem[]>([]);
+  const [expandedUploadFolders, setExpandedUploadFolders] = useState<Set<number>>(
+    new Set()
+  );
+  const [loadingUploadFolders, setLoadingUploadFolders] = useState<Set<number>>(
+    new Set()
+  );
+  const [isScanningUploadDrop, setIsScanningUploadDrop] = useState<boolean>(false);
+  const uploadScanSeqRef = useRef<number>(0);
+  const uploadScanIdRef = useRef<string | null>(null);
+  const uploadScanAbortRef = useRef<AbortController | null>(null);
   const [customImageName, setCustomImageName] = useState<string>('');
   const [imageTag, setImageTag] = useState<string>('latest');
   const [uploadProgress, setUploadProgress] = useState<PushProgressUpdate | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadSuccess, setUploadSuccess] = useState<OciPackageDetails | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const fileDragCounter = useRef<number>(0);
   const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
 
@@ -285,11 +299,13 @@ export default function App() {
   const [rootScan, setRootScan] = useState<DesktopRootFolderScanResult | null>(null);
   const [selectedSyncIndices, setSelectedSyncIndices] = useState<Set<number>>(new Set());
   const [expandedSubfolders, setExpandedSubfolders] = useState<Set<number>>(new Set());
+  const [loadingSubfolders, setLoadingSubfolders] = useState<Set<number>>(new Set());
   const [syncStatuses, setSyncStatuses] = useState<Record<number, SyncItemStatus>>({});
   const [isSyncingFolder, setIsSyncingFolder] = useState<boolean>(false);
   const [isScanningFolder, setIsScanningFolder] = useState<boolean>(false);
   const [isHoveringScanAbort, setIsHoveringScanAbort] = useState<boolean>(false);
   const scanSequenceRef = useRef<number>(0);
+  const activeScanIdRef = useRef<string | null>(null);
   const scanAbortControllerRef = useRef<AbortController | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [isDraggingRootFolder, setIsDraggingRootFolder] = useState<boolean>(false);
@@ -606,32 +622,213 @@ export default function App() {
     );
   }, [repos, repoSearch]);
 
-  // --- TAB 1: File selection & naming logic ---
-  function handleFilesAdded(newFiles: FileList | File[]) {
-    const incoming = Array.from(newFiles);
+  // --- TAB 1: File & Folder selection & naming logic ---
+  function handleAbortUploadScan() {
+    uploadScanSeqRef.current += 1;
+    if (uploadScanIdRef.current && window.electronAPI?.cancelFolderScan) {
+      window.electronAPI.cancelFolderScan(uploadScanIdRef.current);
+      uploadScanIdRef.current = null;
+    }
+    if (uploadScanAbortRef.current) {
+      uploadScanAbortRef.current.abort();
+      uploadScanAbortRef.current = null;
+    }
+    setIsScanningUploadDrop(false);
+  }
+
+  function handleUploadItemsAdded(incoming: UploadSelectionItem[]) {
     if (incoming.length === 0) return;
 
     setUploadError(null);
     setUploadSuccess(null);
 
-    const updated = [...pickedFiles, ...incoming];
-    setPickedFiles(updated);
+    setPickedItems((prev) => {
+      const updated = [...prev, ...incoming];
+      if (updated.length === 1) {
+        setCustomImageName(updated[0].name);
+      } else if (prev.length <= 1 && updated.length > 1) {
+        if (
+          !customImageName ||
+          (prev.length === 1 && customImageName === prev[0].name)
+        ) {
+          setCustomImageName('');
+        }
+      }
+      return updated;
+    });
+  }
 
-    if (updated.length === 1) {
-      setCustomImageName(updated[0].name);
-    } else if (pickedFiles.length <= 1 && updated.length > 1) {
+  function handleFilesAdded(newFiles: FileList | File[]) {
+    const incomingFiles = Array.from(newFiles);
+    if (incomingFiles.length === 0) return;
+
+    const items: UploadSelectionItem[] = incomingFiles.map((f) => ({
+      kind: 'file',
+      name: f.name,
+      size: f.size,
+      mtime: Math.floor(f.lastModified / 1000),
+      rawFile: f,
+      files: [
+        {
+          relativePath: f.name,
+          name: f.name,
+          size: f.size,
+          mtime: Math.floor(f.lastModified / 1000),
+          rawFile: f,
+        },
+      ],
+    }));
+
+    handleUploadItemsAdded(items);
+  }
+
+  async function handlePickUploadFolders() {
+    if (isScanningUploadDrop) return;
+    setUploadError(null);
+    const seq = ++uploadScanSeqRef.current;
+
+    try {
       if (
-        !customImageName ||
-        (pickedFiles.length === 1 && customImageName === pickedFiles[0].name)
+        window.electronAPI?.pickDirectoriesForUpload &&
+        window.electronAPI?.scanPathsForUpload
       ) {
-        setCustomImageName('');
+        const dirPaths = await window.electronAPI.pickDirectoriesForUpload();
+        if (!dirPaths || dirPaths.length === 0 || uploadScanSeqRef.current !== seq) {
+          return;
+        }
+        const scanId = `upload-scan-${Date.now()}-${seq}`;
+        uploadScanIdRef.current = scanId;
+        setIsScanningUploadDrop(true);
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+        const scannedItems = await window.electronAPI.scanPathsForUpload(
+          dirPaths,
+          scanId
+        );
+        if (uploadScanSeqRef.current !== seq) return;
+        handleUploadItemsAdded(scannedItems);
+        return;
+      }
+
+      if (typeof window.showDirectoryPicker === 'function') {
+        const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+        if (uploadScanSeqRef.current !== seq) return;
+        const abortCtrl = new AbortController();
+        uploadScanAbortRef.current = abortCtrl;
+        setIsScanningUploadDrop(true);
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+        const item = await scanBrowserDirectoryForUpload(
+          dirHandle,
+          abortCtrl.signal
+        );
+        if (uploadScanSeqRef.current !== seq) return;
+        handleUploadItemsAdded([item]);
+        return;
+      }
+
+      uploadFolderInputRef.current?.click();
+    } catch (err: unknown) {
+      if (err instanceof Error && (err.name === 'AbortError' || err.message === 'SCAN_ABORTED')) {
+        return;
+      }
+      if (uploadScanSeqRef.current === seq) {
+        setUploadError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (uploadScanSeqRef.current === seq) {
+        uploadScanIdRef.current = null;
+        uploadScanAbortRef.current = null;
+        setIsScanningUploadDrop(false);
       }
     }
   }
 
-  function handleRemovePickedFile(idx: number) {
-    const next = pickedFiles.filter((_, i) => i !== idx);
-    setPickedFiles(next);
+  async function handleUploadFallbackWebkitDirectory(
+    e: React.ChangeEvent<HTMLInputElement>
+  ) {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+    const rawFiles = Array.from(fileList);
+    e.target.value = '';
+
+    const seq = ++uploadScanSeqRef.current;
+    const abortCtrl = new AbortController();
+    uploadScanAbortRef.current = abortCtrl;
+    setIsScanningUploadDrop(true);
+
+    try {
+      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+      let folderName = 'Selected Folder';
+      let totalSize = 0;
+      const entries: DesktopRootFolderFileEntry[] = [];
+
+      for (let i = 0; i < rawFiles.length; i++) {
+        if (abortCtrl.signal.aborted || uploadScanSeqRef.current !== seq) return;
+        if (i > 0 && i % 40 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+          if (abortCtrl.signal.aborted || uploadScanSeqRef.current !== seq) return;
+        }
+        const file = rawFiles[i];
+        const rel = (file.webkitRelativePath || file.name).replace(/\\/g, '/');
+        const parts = rel.split('/').filter(Boolean);
+        if (parts.length === 0) continue;
+        folderName = parts[0];
+        const insideParts = parts.slice(1);
+        const relInside = insideParts.length > 0 ? insideParts.join('/') : file.name;
+        const lastPart = insideParts[insideParts.length - 1] || file.name;
+        if (lastPart === '.DS_Store' || lastPart === 'Thumbs.db') continue;
+
+        totalSize += file.size;
+        entries.push({
+          relativePath: relInside,
+          name: lastPart,
+          size: file.size,
+          mtime: Math.floor(file.lastModified / 1000),
+          rawFile: file,
+        });
+      }
+
+      if (uploadScanSeqRef.current === seq && entries.length > 0) {
+        handleUploadItemsAdded([
+          {
+            kind: 'folder',
+            name: folderName,
+            size: totalSize,
+            files: entries,
+          },
+        ]);
+      }
+    } finally {
+      if (uploadScanSeqRef.current === seq) {
+        uploadScanAbortRef.current = null;
+        setIsScanningUploadDrop(false);
+      }
+    }
+  }
+
+  function handleToggleUploadFolderExpand(idx: number) {
+    if (expandedUploadFolders.has(idx)) {
+      const next = new Set(expandedUploadFolders);
+      next.delete(idx);
+      setExpandedUploadFolders(next);
+      return;
+    }
+    setLoadingUploadFolders((prev) => new Set(prev).add(idx));
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        setExpandedUploadFolders((prev) => new Set(prev).add(idx));
+        setLoadingUploadFolders((prev) => {
+          const next = new Set(prev);
+          next.delete(idx);
+          return next;
+        });
+      }, 25);
+    });
+  }
+
+  function handleRemovePickedItem(idx: number) {
+    const next = pickedItems.filter((_, i) => i !== idx);
+    setPickedItems(next);
+    setExpandedUploadFolders(new Set());
     if (next.length === 1 && !customImageName.trim()) {
       setCustomImageName(next[0].name);
     } else if (next.length === 0) {
@@ -641,11 +838,27 @@ export default function App() {
 
   const fileNamingValidation = useMemo(() => {
     return validateFilesSelectionName(
-      pickedFiles.length,
+      pickedItems.length,
       customImageName,
-      pickedFiles.length === 1 ? pickedFiles[0].name : undefined
+      pickedItems.length === 1 ? pickedItems[0].name : undefined
     );
-  }, [pickedFiles, customImageName]);
+  }, [pickedItems, customImageName]);
+
+  async function readUploadEntryBytes(
+    entry: DesktopRootFolderFileEntry
+  ): Promise<Uint8Array> {
+    if (entry.rawFile) {
+      return new Uint8Array(await entry.rawFile.arrayBuffer());
+    }
+    if (entry.fileHandle) {
+      const fileObj = await entry.fileHandle.getFile();
+      return new Uint8Array(await fileObj.arrayBuffer());
+    }
+    if (entry.fullPath && window.electronAPI?.readFileBytes) {
+      return await window.electronAPI.readFileBytes(entry.fullPath);
+    }
+    throw new Error(`Unable to read bytes for file: ${entry.relativePath}`);
+  }
 
   async function handleUploadSelectedFiles() {
     if (!selectedRepo || !user || !authToken) return;
@@ -659,13 +872,33 @@ export default function App() {
 
     try {
       const tarInputs: TarInputFile[] = [];
-      for (const f of pickedFiles) {
-        const buf = new Uint8Array(await f.arrayBuffer());
-        tarInputs.push({
-          relativePath: f.name,
-          data: buf,
-          mtime: Math.floor(f.lastModified / 1000),
-        });
+      const isSingleFolderOnly =
+        pickedItems.length === 1 && pickedItems[0].kind === 'folder';
+
+      for (const item of pickedItems) {
+        if (item.kind === 'file') {
+          const entry = item.files[0];
+          const bytes = item.rawFile
+            ? new Uint8Array(await item.rawFile.arrayBuffer())
+            : await readUploadEntryBytes(entry);
+          tarInputs.push({
+            relativePath: item.name,
+            data: bytes,
+            mtime: item.mtime,
+          });
+        } else {
+          for (const entry of item.files) {
+            const bytes = await readUploadEntryBytes(entry);
+            const archivePath = isSingleFolderOnly
+              ? entry.relativePath
+              : `${item.name}/${entry.relativePath}`;
+            tarInputs.push({
+              relativePath: archivePath,
+              data: bytes,
+              mtime: entry.mtime,
+            });
+          }
+        }
       }
 
       const details = await buildAndPushOciImage({
@@ -674,7 +907,10 @@ export default function App() {
         repo: selectedRepo,
         rawImageName: fileNamingValidation.effectiveRawName,
         tag: imageTag.trim() || 'latest',
-        mode: pickedFiles.length === 1 ? 'single-file' : 'multi-file',
+        mode:
+          pickedItems.length === 1 && pickedItems[0].kind === 'file'
+            ? 'single-file'
+            : 'multi-file',
         files: tarInputs,
         onProgress: (p) => setUploadProgress(p),
       });
@@ -695,6 +931,10 @@ export default function App() {
   // --- TAB 2: Root Folder Sync handlers (Windows, Linux, macOS) ---
   function handleAbortScan() {
     scanSequenceRef.current += 1;
+    if (activeScanIdRef.current && window.electronAPI?.cancelFolderScan) {
+      window.electronAPI.cancelFolderScan(activeScanIdRef.current);
+      activeScanIdRef.current = null;
+    }
     if (scanAbortControllerRef.current) {
       scanAbortControllerRef.current.abort();
       scanAbortControllerRef.current = null;
@@ -708,16 +948,59 @@ export default function App() {
     setRootScan(null);
     setSelectedSyncIndices(new Set());
     setExpandedSubfolders(new Set());
+    setLoadingSubfolders(new Set());
     setSyncStatuses({});
     setSyncError(null);
     fallbackFileMapRef.current.clear();
+  }
+
+  function handleToggleSubfolderExpand(idx: number) {
+    if (expandedSubfolders.has(idx)) {
+      const next = new Set(expandedSubfolders);
+      next.delete(idx);
+      setExpandedSubfolders(next);
+      return;
+    }
+    setLoadingSubfolders((prev) => new Set(prev).add(idx));
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        setExpandedSubfolders((prev) => new Set(prev).add(idx));
+        setLoadingSubfolders((prev) => {
+          const next = new Set(prev);
+          next.delete(idx);
+          return next;
+        });
+      }, 25);
+    });
   }
 
   async function handlePickRootFolder() {
     if (isScanningFolder || isSyncingFolder) return;
     setSyncError(null);
     const seq = ++scanSequenceRef.current;
+
     try {
+      if (
+        window.electronAPI?.pickDirectoryPath &&
+        window.electronAPI?.rescanRootFolder
+      ) {
+        const chosenPath = await window.electronAPI.pickDirectoryPath();
+        if (!chosenPath || scanSequenceRef.current !== seq) return;
+
+        const scanId = `root-scan-${Date.now()}-${seq}`;
+        activeScanIdRef.current = scanId;
+        setIsScanningFolder(true);
+        setIsHoveringScanAbort(false);
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+
+        const scan = await window.electronAPI.rescanRootFolder(chosenPath, scanId);
+        if (scanSequenceRef.current !== seq) return;
+        if (scan) {
+          applyRootScan(scan);
+        }
+        return;
+      }
+
       if (window.electronAPI?.pickRootFolder) {
         setIsScanningFolder(true);
         const scan = await window.electronAPI.pickRootFolder();
@@ -730,8 +1013,17 @@ export default function App() {
 
       if (typeof window.showDirectoryPicker === 'function') {
         const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+        if (scanSequenceRef.current !== seq) return;
+        const abortCtrl = new AbortController();
+        scanAbortControllerRef.current = abortCtrl;
         setIsScanningFolder(true);
-        const scan = await scanBrowserDirectoryHandle(dirHandle);
+        setIsHoveringScanAbort(false);
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+
+        const scan = await scanBrowserDirectoryHandle(
+          dirHandle,
+          abortCtrl.signal
+        );
         if (scanSequenceRef.current !== seq) return;
         applyRootScan(scan);
         return;
@@ -739,131 +1031,183 @@ export default function App() {
 
       fallbackFolderInputRef.current?.click();
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (
+        err instanceof Error &&
+        (err.name === 'AbortError' || err.message === 'SCAN_ABORTED')
+      ) {
+        return;
+      }
       if (scanSequenceRef.current === seq) {
         setSyncError(err instanceof Error ? err.message : String(err));
       }
     } finally {
       if (scanSequenceRef.current === seq) {
+        activeScanIdRef.current = null;
+        scanAbortControllerRef.current = null;
         setIsScanningFolder(false);
         setIsHoveringScanAbort(false);
       }
     }
   }
 
-  function handleFallbackWebkitDirectory(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleFallbackWebkitDirectory(
+    e: React.ChangeEvent<HTMLInputElement>
+  ) {
     const fileList = e.target.files;
     if (!fileList || fileList.length === 0) return;
+    const rawFiles = Array.from(fileList);
+    e.target.value = '';
 
-    fallbackFileMapRef.current.clear();
-    const rootFiles: DesktopRootFolderItem[] = [];
-    const subFoldersMap = new Map<string, DesktopRootFolderItem>();
-    let detectedRootName = 'Selected Folder';
+    const seq = ++scanSequenceRef.current;
+    const abortCtrl = new AbortController();
+    scanAbortControllerRef.current = abortCtrl;
+    setIsScanningFolder(true);
+    setIsHoveringScanAbort(false);
 
-    for (const file of Array.from(fileList)) {
-      const rel = (file.webkitRelativePath || file.name).replace(/\\/g, '/');
-      const parts = rel.split('/').filter(Boolean);
-      if (parts.length === 0) continue;
+    try {
+      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+      fallbackFileMapRef.current.clear();
+      const rootFiles: DesktopRootFolderItem[] = [];
+      const subFoldersMap = new Map<string, DesktopRootFolderItem>();
+      let detectedRootName = 'Selected Folder';
 
-      detectedRootName = parts[0];
-      const insideRootParts = parts.slice(1);
-      if (insideRootParts.length === 0) continue;
-
-      const lastPart = insideRootParts[insideRootParts.length - 1];
-      if (lastPart === '.DS_Store' || lastPart === 'Thumbs.db') continue;
-
-      if (insideRootParts.length === 1) {
-        const fileName = insideRootParts[0];
-        const mapKey = `root-file:${fileName}`;
-        fallbackFileMapRef.current.set(mapKey, file);
-        rootFiles.push({
-          kind: 'root-file',
-          name: fileName,
-          size: file.size,
-          mtime: Math.floor(file.lastModified / 1000),
-          files: [
-            {
-              fullPath: mapKey,
-              relativePath: fileName,
-              name: fileName,
-              size: file.size,
-              mtime: Math.floor(file.lastModified / 1000),
-            },
-          ],
-        });
-      } else {
-        const subFolderName = insideRootParts[0];
-        const pathInsideSubFolder = insideRootParts.slice(1).join('/');
-        const mapKey = `subfolder:${subFolderName}/${pathInsideSubFolder}`;
-        fallbackFileMapRef.current.set(mapKey, file);
-
-        let group = subFoldersMap.get(subFolderName);
-        if (!group) {
-          group = {
-            kind: 'root-subfolder',
-            name: subFolderName,
-            size: 0,
-            files: [],
-          };
-          subFoldersMap.set(subFolderName, group);
+      for (let i = 0; i < rawFiles.length; i++) {
+        if (abortCtrl.signal.aborted || scanSequenceRef.current !== seq) return;
+        if (i > 0 && i % 40 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+          if (abortCtrl.signal.aborted || scanSequenceRef.current !== seq) return;
         }
-        group.size += file.size;
-        group.files.push({
-          fullPath: mapKey,
-          relativePath: pathInsideSubFolder,
-          name: lastPart,
-          size: file.size,
-          mtime: Math.floor(file.lastModified / 1000),
+        const file = rawFiles[i];
+        const rel = (file.webkitRelativePath || file.name).replace(/\\/g, '/');
+        const parts = rel.split('/').filter(Boolean);
+        if (parts.length === 0) continue;
+
+        detectedRootName = parts[0];
+        const insideRootParts = parts.slice(1);
+        if (insideRootParts.length === 0) continue;
+
+        const lastPart = insideRootParts[insideRootParts.length - 1];
+        if (lastPart === '.DS_Store' || lastPart === 'Thumbs.db') continue;
+
+        if (insideRootParts.length === 1) {
+          const fileName = insideRootParts[0];
+          const mapKey = `root-file:${fileName}`;
+          fallbackFileMapRef.current.set(mapKey, file);
+          rootFiles.push({
+            kind: 'root-file',
+            name: fileName,
+            size: file.size,
+            mtime: Math.floor(file.lastModified / 1000),
+            files: [
+              {
+                fullPath: mapKey,
+                relativePath: fileName,
+                name: fileName,
+                size: file.size,
+                mtime: Math.floor(file.lastModified / 1000),
+              },
+            ],
+          });
+        } else {
+          const subFolderName = insideRootParts[0];
+          const pathInsideSubFolder = insideRootParts.slice(1).join('/');
+          const mapKey = `subfolder:${subFolderName}/${pathInsideSubFolder}`;
+          fallbackFileMapRef.current.set(mapKey, file);
+
+          let group = subFoldersMap.get(subFolderName);
+          if (!group) {
+            group = {
+              kind: 'root-subfolder',
+              name: subFolderName,
+              size: 0,
+              files: [],
+            };
+            subFoldersMap.set(subFolderName, group);
+          }
+          group.size += file.size;
+          group.files.push({
+            fullPath: mapKey,
+            relativePath: pathInsideSubFolder,
+            name: lastPart,
+            size: file.size,
+            mtime: Math.floor(file.lastModified / 1000),
+          });
+        }
+      }
+
+      if (scanSequenceRef.current === seq) {
+        const items = [...rootFiles, ...Array.from(subFoldersMap.values())];
+        applyRootScan({
+          rootFolderPath: detectedRootName,
+          rootFolderName: detectedRootName,
+          items,
         });
       }
+    } finally {
+      if (scanSequenceRef.current === seq) {
+        scanAbortControllerRef.current = null;
+        setIsScanningFolder(false);
+        setIsHoveringScanAbort(false);
+      }
     }
-
-    const items = [...rootFiles, ...Array.from(subFoldersMap.values())];
-    applyRootScan({
-      rootFolderPath: detectedRootName,
-      rootFolderName: detectedRootName,
-      items,
-    });
-    e.target.value = '';
   }
 
   function applyRootScan(scan: DesktopRootFolderScanResult) {
     setRootScan(scan);
     setSelectedSyncIndices(new Set(scan.items.map((_, idx) => idx)));
     setExpandedSubfolders(new Set());
+    setLoadingSubfolders(new Set());
     setSyncStatuses({});
   }
 
   async function handleRescanRootFolder() {
-    if (!rootScan || isSyncingFolder) return;
+    if (isSyncingFolder) return;
     if (isScanningFolder) {
       handleAbortScan();
       return;
     }
+    if (!rootScan) return;
 
     setSyncError(null);
     const seq = ++scanSequenceRef.current;
+    const scanId = `root-scan-${Date.now()}-${seq}`;
+    activeScanIdRef.current = scanId;
+    const abortCtrl = new AbortController();
+    scanAbortControllerRef.current = abortCtrl;
     setIsScanningFolder(true);
     setIsHoveringScanAbort(false);
 
     try {
+      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
       if (window.electronAPI?.rescanRootFolder && rootScan.rootFolderPath) {
         const updated = await window.electronAPI.rescanRootFolder(
-          rootScan.rootFolderPath
+          rootScan.rootFolderPath,
+          scanId
         );
         if (scanSequenceRef.current !== seq) return;
         applyRootScan(updated);
       } else if (rootScan.dirHandle) {
-        const updated = await scanBrowserDirectoryHandle(rootScan.dirHandle);
+        const updated = await scanBrowserDirectoryHandle(
+          rootScan.dirHandle,
+          abortCtrl.signal
+        );
         if (scanSequenceRef.current !== seq) return;
         applyRootScan(updated);
       }
     } catch (err: unknown) {
+      if (
+        err instanceof Error &&
+        (err.name === 'AbortError' || err.message === 'SCAN_ABORTED')
+      ) {
+        return;
+      }
       if (scanSequenceRef.current === seq) {
         setSyncError(err instanceof Error ? err.message : String(err));
       }
     } finally {
       if (scanSequenceRef.current === seq) {
+        activeScanIdRef.current = null;
+        scanAbortControllerRef.current = null;
         setIsScanningFolder(false);
         setIsHoveringScanAbort(false);
       }
@@ -1725,7 +2069,7 @@ export default function App() {
                         Upload Single or Multiple Files as an Image
                       </h3>
                       <p className="text-xs text-gray-400 mt-1">
-                        Select file(s) to package into an OCI container image and push to{' '}
+                        Select files or folders to package into an OCI container image and push to{' '}
                         <span className="text-white font-semibold">
                           {selectedRepo.full_name}
                         </span>
@@ -1733,11 +2077,12 @@ export default function App() {
                       </p>
                     </div>
 
-                    {/* File Dropzone */}
+                    {/* File & Folder Dropzone */}
                     <div
                       onDragEnter={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
+                        if (isScanningUploadDrop) return;
                         fileDragCounter.current += 1;
                         if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
                           setIsDraggingFiles(true);
@@ -1762,6 +2107,53 @@ export default function App() {
                         e.stopPropagation();
                         fileDragCounter.current = 0;
                         setIsDraggingFiles(false);
+                        if (isScanningUploadDrop) return;
+
+                        const droppedFileObjs = Array.from(e.dataTransfer.files || []);
+                        const nativePaths = droppedFileObjs
+                          .map((f) => (f as unknown as { path?: string }).path)
+                          .filter((p): p is string => Boolean(p));
+
+                        const seq = ++uploadScanSeqRef.current;
+
+                        if (
+                          nativePaths.length > 0 &&
+                          window.electronAPI?.scanPathsForUpload
+                        ) {
+                          const scanId = `upload-drop-${Date.now()}-${seq}`;
+                          uploadScanIdRef.current = scanId;
+                          setIsScanningUploadDrop(true);
+                          try {
+                            await new Promise((r) =>
+                              requestAnimationFrame(() => setTimeout(r, 0))
+                            );
+                            const scanned = await window.electronAPI.scanPathsForUpload(
+                              nativePaths,
+                              scanId
+                            );
+                            if (uploadScanSeqRef.current === seq && scanned.length > 0) {
+                              handleUploadItemsAdded(scanned);
+                            }
+                          } catch (err: unknown) {
+                            if (
+                              !(
+                                err instanceof Error &&
+                                err.message === 'SCAN_ABORTED'
+                              ) &&
+                              uploadScanSeqRef.current === seq
+                            ) {
+                              setUploadError(
+                                err instanceof Error ? err.message : String(err)
+                              );
+                            }
+                          } finally {
+                            if (uploadScanSeqRef.current === seq) {
+                              uploadScanIdRef.current = null;
+                              setIsScanningUploadDrop(false);
+                            }
+                          }
+                          return;
+                        }
 
                         const items = e.dataTransfer.items;
                         if (
@@ -1769,49 +2161,164 @@ export default function App() {
                           items.length > 0 &&
                           typeof items[0].webkitGetAsEntry === 'function'
                         ) {
-                          const extractedFiles: File[] = [];
-                          const traverse = async (entry: any): Promise<void> => {
-                            if (!entry) return;
-                            if (entry.isFile) {
-                              await new Promise<void>((resolve) => {
-                                entry.file(
-                                  (f: File) => {
-                                    extractedFiles.push(f);
-                                    resolve();
-                                  },
-                                  () => resolve()
-                                );
-                              });
-                            } else if (entry.isDirectory) {
-                              const reader = entry.createReader();
-                              const readBatch = (): Promise<any[]> => {
-                                return new Promise((resolve) => {
-                                  reader.readEntries(
-                                    (ents: any[]) => resolve(ents || []),
-                                    () => resolve([])
-                                  );
-                                });
-                              };
-                              let batch: any[] = [];
-                              do {
-                                batch = await readBatch();
-                                for (const child of batch) {
-                                  await traverse(child);
-                                }
-                              } while (batch.length > 0);
-                            }
-                          };
-
-                          const entriesToProcess: any[] = [];
+                          const topEntries: any[] = [];
                           for (let i = 0; i < items.length; i++) {
                             const ent = items[i].webkitGetAsEntry();
-                            if (ent) entriesToProcess.push(ent);
+                            if (ent) topEntries.push(ent);
                           }
-                          for (const ent of entriesToProcess) {
-                            await traverse(ent);
-                          }
-                          if (extractedFiles.length > 0) {
-                            handleFilesAdded(extractedFiles);
+
+                          if (topEntries.length > 0) {
+                            const abortCtrl = new AbortController();
+                            uploadScanAbortRef.current = abortCtrl;
+                            setIsScanningUploadDrop(true);
+
+                            try {
+                              await new Promise((r) =>
+                                requestAnimationFrame(() => setTimeout(r, 0))
+                              );
+                              let stepCounter = 0;
+                              const collectDirEntries = async (
+                                dirEntry: any,
+                                prefix = ''
+                              ): Promise<DesktopRootFolderFileEntry[]> => {
+                                if (
+                                  abortCtrl.signal.aborted ||
+                                  uploadScanSeqRef.current !== seq
+                                ) {
+                                  throw new Error('SCAN_ABORTED');
+                                }
+                                const out: DesktopRootFolderFileEntry[] = [];
+                                const reader = dirEntry.createReader();
+                                const readBatch = (): Promise<any[]> =>
+                                  new Promise((resolve) => {
+                                    reader.readEntries(
+                                      (ents: any[]) => resolve(ents || []),
+                                      () => resolve([])
+                                    );
+                                  });
+
+                                let batch: any[] = [];
+                                do {
+                                  batch = await readBatch();
+                                  for (const child of batch) {
+                                    if (
+                                      abortCtrl.signal.aborted ||
+                                      uploadScanSeqRef.current !== seq
+                                    ) {
+                                      throw new Error('SCAN_ABORTED');
+                                    }
+                                    if (
+                                      child.name === '.DS_Store' ||
+                                      child.name === 'Thumbs.db'
+                                    ) {
+                                      continue;
+                                    }
+                                    stepCounter += 1;
+                                    if (stepCounter % 25 === 0) {
+                                      await new Promise((r) => setTimeout(r, 0));
+                                    }
+                                    const relPath = prefix
+                                      ? `${prefix}/${child.name}`
+                                      : child.name;
+                                    if (child.isFile) {
+                                      await new Promise<void>((resolve) => {
+                                        child.file(
+                                          (f: File) => {
+                                            out.push({
+                                              relativePath: relPath,
+                                              name: child.name,
+                                              size: f.size,
+                                              mtime: Math.floor(
+                                                f.lastModified / 1000
+                                              ),
+                                              rawFile: f,
+                                            });
+                                            resolve();
+                                          },
+                                          () => resolve()
+                                        );
+                                      });
+                                    } else if (child.isDirectory) {
+                                      const nested = await collectDirEntries(
+                                        child,
+                                        relPath
+                                      );
+                                      for (let k = 0; k < nested.length; k++) {
+                                        out.push(nested[k]);
+                                      }
+                                    }
+                                  }
+                                } while (batch.length > 0);
+                                return out;
+                              };
+
+                              const resultingItems: UploadSelectionItem[] = [];
+                              for (const entry of topEntries) {
+                                if (
+                                  abortCtrl.signal.aborted ||
+                                  uploadScanSeqRef.current !== seq
+                                ) {
+                                  throw new Error('SCAN_ABORTED');
+                                }
+                                if (entry.isFile) {
+                                  await new Promise<void>((resolve) => {
+                                    entry.file(
+                                      (f: File) => {
+                                        resultingItems.push({
+                                          kind: 'file',
+                                          name: f.name,
+                                          size: f.size,
+                                          mtime: Math.floor(f.lastModified / 1000),
+                                          rawFile: f,
+                                          files: [
+                                            {
+                                              relativePath: f.name,
+                                              name: f.name,
+                                              size: f.size,
+                                              mtime: Math.floor(
+                                                f.lastModified / 1000
+                                              ),
+                                              rawFile: f,
+                                            },
+                                          ],
+                                        });
+                                        resolve();
+                                      },
+                                      () => resolve()
+                                    );
+                                  });
+                                } else if (entry.isDirectory) {
+                                  const folderFiles = await collectDirEntries(
+                                    entry,
+                                    ''
+                                  );
+                                  const totalSize = folderFiles.reduce(
+                                    (acc, f) => acc + f.size,
+                                    0
+                                  );
+                                  resultingItems.push({
+                                    kind: 'folder',
+                                    name: entry.name,
+                                    size: totalSize,
+                                    files: folderFiles,
+                                  });
+                                }
+                              }
+
+                              if (
+                                uploadScanSeqRef.current === seq &&
+                                resultingItems.length > 0
+                              ) {
+                                handleUploadItemsAdded(resultingItems);
+                              }
+                            } catch {
+                              // Aborted or failed
+                            } finally {
+                              if (uploadScanSeqRef.current === seq) {
+                                uploadScanAbortRef.current = null;
+                                setIsScanningUploadDrop(false);
+                              }
+                            }
                             return;
                           }
                         }
@@ -1820,10 +2327,14 @@ export default function App() {
                           handleFilesAdded(e.dataTransfer.files);
                         }
                       }}
-                      onClick={() => fileInputRef.current?.click()}
-                      className={`dropzone-container rounded-xl p-8 text-center transition cursor-pointer select-none ${
-                        isDraggingFiles ? 'is-drag-over' : ''
-                      }`}
+                      onClick={() => {
+                        if (!isScanningUploadDrop) {
+                          fileInputRef.current?.click();
+                        }
+                      }}
+                      className={`dropzone-container rounded-xl p-8 text-center transition select-none ${
+                        isScanningUploadDrop ? 'cursor-default' : 'cursor-pointer'
+                      } ${isDraggingFiles ? 'is-drag-over' : ''}`}
                     >
                       <input
                         ref={fileInputRef}
@@ -1837,31 +2348,80 @@ export default function App() {
                           }
                         }}
                       />
-                      <Upload className="w-8 h-8 icon-upload mx-auto mb-2.5 dropzone-icon transition-transform pointer-events-none" />
-                      <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
-                        {isDraggingFiles
-                          ? 'Drop files here to select'
-                          : 'Click to choose files or drag & drop here'}
-                      </div>
-                      <div className="text-xs text-gray-500 mt-1 pointer-events-none">
-                        Select one or multiple files or folders from your device
-                      </div>
+                      <input
+                        ref={uploadFolderInputRef}
+                        type="file"
+                        // @ts-expect-error webkitdirectory is supported across desktop browsers
+                        webkitdirectory="true"
+                        directory="true"
+                        multiple
+                        className="hidden"
+                        onChange={handleUploadFallbackWebkitDirectory}
+                      />
+
+                      {isScanningUploadDrop ? (
+                        <div className="space-y-3 py-1">
+                          <Loader2 className="w-8 h-8 icon-upload mx-auto animate-spin" />
+                          <div className="text-sm font-semibold text-white">
+                            Scanning folder...
+                          </div>
+                          <div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleAbortUploadScan();
+                              }}
+                              className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer hover:text-red-400 hover:border-red-500/50 transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5 text-red-400" />
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <Upload className="w-8 h-8 icon-upload mx-auto mb-2.5 dropzone-icon transition-transform pointer-events-none" />
+                          <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
+                            {isDraggingFiles
+                              ? 'Drop files or folders here to select'
+                              : 'Click to choose files or drag & drop here'}
+                          </div>
+                          <div className="text-xs text-gray-500 mt-1 pointer-events-none">
+                            Select one or multiple files or folders from your device
+                          </div>
+                          <div className="mt-3 flex items-center justify-center gap-2">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handlePickUploadFolders();
+                              }}
+                              className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                            >
+                              <Folder className="w-3.5 h-3.5 icon-upload" />
+                              Choose Folder
+                            </button>
+                          </div>
+                        </>
+                      )}
                     </div>
 
-                    {/* Picked Files List */}
-                    {pickedFiles.length > 0 && (
+                    {/* Picked Files & Folders List */}
+                    {pickedItems.length > 0 && (
                       <div className="space-y-3">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-semibold text-gray-300">
-                            Selected Files ({pickedFiles.length}) — Total:{' '}
+                            Selected Items ({pickedItems.length}) — Total:{' '}
                             {formatBytes(
-                              pickedFiles.reduce((acc, f) => acc + f.size, 0)
+                              pickedItems.reduce((acc, item) => acc + item.size, 0)
                             )}
                           </span>
                           <button
                             type="button"
                             onClick={() => {
-                              setPickedFiles([]);
+                              setPickedItems([]);
+                              setExpandedUploadFolders(new Set());
                               setCustomImageName('');
                             }}
                             className="text-xs text-gray-400 hover:text-white cursor-pointer"
@@ -1870,36 +2430,81 @@ export default function App() {
                           </button>
                         </div>
 
-                        <div className="max-h-48 overflow-y-auto divide-y divide-[#30363d] bg-[#0d1117] rounded-md border border-[#30363d]">
-                          {pickedFiles.map((file, idx) => (
-                            <div
-                              key={`${file.name}-${idx}`}
-                              className="px-3.5 py-2 flex items-center justify-between gap-2 text-xs"
-                            >
-                              <div className="flex items-center gap-2 min-w-0">
-                                <FileIcon className="w-4 h-4 icon-upload shrink-0" />
-                                <span className="truncate text-white font-medium">
-                                  {file.name}
-                                </span>
-                                <span className="text-gray-500 shrink-0">
-                                  ({formatBytes(file.size)})
-                                </span>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => handleRemovePickedFile(idx)}
-                                className="modal-close-btn p-1"
+                        <div className="max-h-72 overflow-y-auto divide-y divide-[#30363d] bg-[#0d1117] rounded-md border border-[#30363d]">
+                          {pickedItems.map((item, idx) => {
+                            const isExpanded = expandedUploadFolders.has(idx);
+                            const isLoadingFiles = loadingUploadFolders.has(idx);
+
+                            return (
+                              <div
+                                key={`${item.kind}-${item.name}-${idx}`}
+                                className="px-3.5 py-2.5 text-xs"
                               >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          ))}
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    {item.kind === 'folder' ? (
+                                      <Folder className="w-4 h-4 icon-upload shrink-0" />
+                                    ) : (
+                                      <FileIcon className="w-4 h-4 icon-upload shrink-0" />
+                                    )}
+                                    <span className="truncate text-white font-medium">
+                                      {item.name}
+                                    </span>
+                                    {item.kind === 'folder' && (
+                                      <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium shrink-0">
+                                        Folder ({item.files.length} file
+                                        {item.files.length === 1 ? '' : 's'})
+                                      </span>
+                                    )}
+                                    <span className="text-gray-500 shrink-0">
+                                      ({formatBytes(item.size)})
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    {item.kind === 'folder' && (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleToggleUploadFolderExpand(idx)
+                                        }
+                                        className="btn-modal-action text-xs px-2 py-1 rounded flex items-center gap-1 cursor-pointer"
+                                      >
+                                        {isLoadingFiles ? (
+                                          <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
+                                        ) : isExpanded ? (
+                                          <ChevronDown className="w-3.5 h-3.5" />
+                                        ) : (
+                                          <ChevronRight className="w-3.5 h-3.5" />
+                                        )}
+                                        Files
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemovePickedItem(idx)}
+                                      className="modal-close-btn p-1"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {item.kind === 'folder' && isExpanded && (
+                                  <SubfolderFileTree
+                                    files={item.files}
+                                    iconClassName="icon-upload"
+                                  />
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
 
                     {/* Image / Package Name Input */}
-                    {pickedFiles.length > 0 && (
+                    {pickedItems.length > 0 && (
                       <div className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-4">
                         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                           <div className="sm:col-span-3">
@@ -1911,9 +2516,9 @@ export default function App() {
                               value={customImageName}
                               onChange={(e) => setCustomImageName(e.target.value)}
                               placeholder={
-                                pickedFiles.length === 1
-                                  ? pickedFiles[0].name
-                                  : 'Enter a name for this multi-file image (e.g. release-bundle)'
+                                pickedItems.length === 1
+                                  ? pickedItems[0].name
+                                  : 'Enter a name for this multi-item image (e.g. release-bundle)'
                               }
                               className="w-full px-3.5 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white focus:outline-none"
                             />
@@ -2046,62 +2651,51 @@ export default function App() {
                           className="hidden"
                           onChange={handleFallbackWebkitDirectory}
                         />
-                        {rootScan && (
-                          <>
-                            <button
-                              type="button"
-                              disabled={isSyncingFolder}
-                              onClick={handleRescanRootFolder}
-                              onMouseEnter={() => isScanningFolder && setIsHoveringScanAbort(true)}
-                              onMouseLeave={() => setIsHoveringScanAbort(false)}
-                              title={
-                                isScanningFolder
-                                  ? 'Click to abort scanning'
-                                  : 'Rescan root folder'
-                              }
-                              className={`btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors ${
-                                isScanningFolder && isHoveringScanAbort
-                                  ? 'hover:text-red-400 hover:border-red-500/50'
-                                  : ''
-                              }`}
-                            >
-                              {isScanningFolder ? (
-                                isHoveringScanAbort ? (
-                                  <>
-                                    <X className="w-3.5 h-3.5 text-red-400" />
-                                    <span>Cancel</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
-                                    <span>Scanning...</span>
-                                  </>
-                                )
+                        {(rootScan || isScanningFolder) && (
+                          <button
+                            type="button"
+                            disabled={isSyncingFolder}
+                            onClick={handleRescanRootFolder}
+                            onMouseEnter={() =>
+                              isScanningFolder && setIsHoveringScanAbort(true)
+                            }
+                            onMouseLeave={() => setIsHoveringScanAbort(false)}
+                            title={
+                              isScanningFolder
+                                ? 'Click to abort scanning'
+                                : 'Rescan root folder'
+                            }
+                            className={`btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                              isScanningFolder && isHoveringScanAbort
+                                ? 'hover:text-red-400 hover:border-red-500/50'
+                                : ''
+                            }`}
+                          >
+                            {isScanningFolder ? (
+                              isHoveringScanAbort ? (
+                                <>
+                                  <X className="w-3.5 h-3.5 text-red-400" />
+                                  <span>Cancel</span>
+                                </>
                               ) : (
                                 <>
-                                  <RefreshCw className="w-3.5 h-3.5" />
-                                  <span>Rescan</span>
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
+                                  <span>Scanning...</span>
                                 </>
-                              )}
-                            </button>
-
-                            <button
-                              type="button"
-                              disabled={isSyncingFolder || isScanningFolder}
-                              onClick={handleRemoveRootFolder}
-                              title="Remove root folder"
-                              className="btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer hover:text-red-400 hover:border-red-500/50 transition-colors"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                              <span>Remove Folder</span>
-                            </button>
-                          </>
+                              )
+                            ) : (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                <span>Rescan</span>
+                              </>
+                            )}
+                          </button>
                         )}
                         <button
                           type="button"
                           disabled={isSyncingFolder || isScanningFolder}
                           onClick={handlePickRootFolder}
-                          className="px-4 py-2 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                          className="px-4 py-2 rounded-md btn-sync-green text-xs font-semibold text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <Folder className="w-4 h-4" />
                           {rootScan ? 'Change Root Folder' : 'Choose Root Folder'}
@@ -2118,10 +2712,15 @@ export default function App() {
 
                     {!rootScan ? (
                       <div
-                        onClick={handlePickRootFolder}
+                        onClick={() => {
+                          if (!isScanningFolder) {
+                            handlePickRootFolder();
+                          }
+                        }}
                         onDragEnter={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
+                          if (isScanningFolder) return;
                           rootFolderDragCounter.current += 1;
                           if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
                             setIsDraggingRootFolder(true);
@@ -2146,42 +2745,84 @@ export default function App() {
                           e.stopPropagation();
                           rootFolderDragCounter.current = 0;
                           setIsDraggingRootFolder(false);
+                          if (isScanningFolder) return;
                           const firstFile = e.dataTransfer.files?.[0] as any;
                           if (firstFile?.path && window.electronAPI?.rescanRootFolder) {
                             const seq = ++scanSequenceRef.current;
+                            const scanId = `root-drop-${Date.now()}-${seq}`;
+                            activeScanIdRef.current = scanId;
                             setIsScanningFolder(true);
+                            setIsHoveringScanAbort(false);
                             try {
+                              await new Promise((r) =>
+                                requestAnimationFrame(() => setTimeout(r, 0))
+                              );
                               const scan = await window.electronAPI.rescanRootFolder(
-                                firstFile.path
+                                firstFile.path,
+                                scanId
                               );
                               if (scanSequenceRef.current === seq && scan) {
                                 applyRootScan(scan);
                               }
-                            } catch {
-                              handlePickRootFolder();
+                            } catch (err: unknown) {
+                              if (
+                                !(
+                                  err instanceof Error &&
+                                  err.message === 'SCAN_ABORTED'
+                                ) &&
+                                scanSequenceRef.current === seq
+                              ) {
+                                handlePickRootFolder();
+                              }
                             } finally {
                               if (scanSequenceRef.current === seq) {
+                                activeScanIdRef.current = null;
                                 setIsScanningFolder(false);
+                                setIsHoveringScanAbort(false);
                               }
                             }
                           } else {
                             handlePickRootFolder();
                           }
                         }}
-                        className={`dropzone-container dropzone-container-sync rounded-xl p-10 text-center transition cursor-pointer select-none ${
-                          isDraggingRootFolder ? 'is-drag-over' : ''
-                        }`}
+                        className={`dropzone-container dropzone-container-sync rounded-xl p-10 text-center transition select-none ${
+                          isScanningFolder ? 'cursor-default' : 'cursor-pointer'
+                        } ${isDraggingRootFolder ? 'is-drag-over' : ''}`}
                       >
-                        <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3 dropzone-icon transition-transform pointer-events-none" />
-                        <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
-                          {isDraggingRootFolder
-                            ? 'Drop root folder here to scan'
-                            : 'Select a Root Folder to Scan'}
-                        </div>
-                        <p className="text-xs text-gray-500 max-w-md mx-auto mt-1 pointer-events-none">
-                          Detects all direct files and immediate sub-folders and prepares
-                          an OCI package image for each one.
-                        </p>
+                        {isScanningFolder ? (
+                          <div className="space-y-3 py-1">
+                            <Loader2 className="w-9 h-9 icon-sync mx-auto animate-spin" />
+                            <div className="text-sm font-semibold text-white">
+                              Scanning root folder...
+                            </div>
+                            <div>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleAbortScan();
+                                }}
+                                className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer hover:text-red-400 hover:border-red-500/50 transition-colors"
+                              >
+                                <X className="w-3.5 h-3.5 text-red-400" />
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3 dropzone-icon transition-transform pointer-events-none" />
+                            <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
+                              {isDraggingRootFolder
+                                ? 'Drop root folder here to scan'
+                                : 'Select a Root Folder to Scan'}
+                            </div>
+                            <p className="text-xs text-gray-500 max-w-md mx-auto mt-1 pointer-events-none">
+                              Detects all direct files and immediate sub-folders and prepares
+                              an OCI package image for each one.
+                            </p>
+                          </>
+                        )}
                       </div>
                     ) : (
                       <div className="space-y-4">
@@ -2238,6 +2879,7 @@ export default function App() {
                               const ociName = toOciImageName(item.name);
                               const isChecked = selectedSyncIndices.has(idx);
                               const isExpanded = expandedSubfolders.has(idx);
+                              const isLoadingFiles = loadingSubfolders.has(idx);
                               const status = syncStatuses[idx];
 
                               return (
@@ -2318,15 +2960,14 @@ export default function App() {
                                       {item.kind === 'root-subfolder' && (
                                         <button
                                           type="button"
-                                          onClick={() => {
-                                            const next = new Set(expandedSubfolders);
-                                            if (next.has(idx)) next.delete(idx);
-                                            else next.add(idx);
-                                            setExpandedSubfolders(next);
-                                          }}
+                                          onClick={() =>
+                                            handleToggleSubfolderExpand(idx)
+                                          }
                                           className="btn-modal-action text-xs px-2 py-1 rounded flex items-center gap-1 cursor-pointer"
                                         >
-                                          {isExpanded ? (
+                                          {isLoadingFiles ? (
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
+                                          ) : isExpanded ? (
                                             <ChevronDown className="w-3.5 h-3.5" />
                                           ) : (
                                             <ChevronRight className="w-3.5 h-3.5" />
@@ -2357,7 +2998,7 @@ export default function App() {
                             type="button"
                             disabled={isSyncingFolder || selectedSyncIndices.size === 0}
                             onClick={handleSyncRootFolder}
-                            className="w-full py-3 px-5 rounded-md bg-blue-600 font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
+                            className="w-full py-3 px-5 rounded-md btn-sync-green font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
                           >
                             {isSyncingFolder ? (
                               <>

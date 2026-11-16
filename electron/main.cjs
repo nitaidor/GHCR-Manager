@@ -223,28 +223,60 @@ function createWindow() {
   }
 }
 
+// Track cancelled folder scan IDs so long directory walks can abort immediately
+const cancelledFolderScans = new Set();
+
 /**
- * Recursively collect all files inside a directory with paths relative to baseDir
+ * Recursively collect all files inside a directory with paths relative to baseDir.
+ * Yields periodically to the event loop and aborts immediately if scanId is cancelled.
  */
-async function collectFilesRecursively(dirPath, baseDir) {
+async function collectFilesRecursively(dirPath, baseDir, scanState = { count: 0, scanId: null }) {
+  if (scanState.scanId && cancelledFolderScans.has(scanState.scanId)) {
+    throw new Error('SCAN_ABORTED');
+  }
+
   const results = [];
-  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.readdir(dirPath, { withFileTypes: true });
+  } catch {
+    return results;
+  }
+
   for (const entry of entries) {
+    if (scanState.scanId && cancelledFolderScans.has(scanState.scanId)) {
+      throw new Error('SCAN_ABORTED');
+    }
     if (entry.name === '.DS_Store' || entry.name === 'Thumbs.db') continue;
+
+    scanState.count += 1;
+    if (scanState.count % 40 === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (scanState.scanId && cancelledFolderScans.has(scanState.scanId)) {
+        throw new Error('SCAN_ABORTED');
+      }
+    }
+
     const fullPath = path.join(dirPath, entry.name);
     if (entry.isDirectory()) {
-      const nested = await collectFilesRecursively(fullPath, baseDir);
-      results.push(...nested);
+      const nested = await collectFilesRecursively(fullPath, baseDir, scanState);
+      for (let i = 0; i < nested.length; i++) {
+        results.push(nested[i]);
+      }
     } else if (entry.isFile()) {
-      const stat = await fs.stat(fullPath);
-      const relPath = path.relative(baseDir, fullPath).split(path.sep).join('/');
-      results.push({
-        fullPath,
-        relativePath: relPath,
-        name: entry.name,
-        size: stat.size,
-        mtime: Math.floor(stat.mtimeMs / 1000),
-      });
+      try {
+        const stat = await fs.stat(fullPath);
+        const relPath = path.relative(baseDir, fullPath).split(path.sep).join('/');
+        results.push({
+          fullPath,
+          relativePath: relPath,
+          name: entry.name,
+          size: stat.size,
+          mtime: Math.floor(stat.mtimeMs / 1000),
+        });
+      } catch {
+        // Ignore unreadable transient files
+      }
     }
   }
   return results;
@@ -255,12 +287,16 @@ async function collectFilesRecursively(dirPath, baseDir) {
  * - Each direct file in Root Folder -> 1 standalone image (image name = file name)
  * - Each immediate sub-folder in Root Folder -> 1 bundled image containing all files in that sub-folder (image name = sub-folder name)
  */
-async function scanRootFolderEntries(rootFolderPath) {
+async function scanRootFolderEntries(rootFolderPath, scanId = null) {
+  const scanState = { count: 0, scanId };
   const entries = await fs.readdir(rootFolderPath, { withFileTypes: true });
   const rootFiles = [];
   const subFolders = [];
 
   for (const entry of entries) {
+    if (scanId && cancelledFolderScans.has(scanId)) {
+      throw new Error('SCAN_ABORTED');
+    }
     if (entry.name === '.DS_Store' || entry.name === 'Thumbs.db') continue;
     const fullPath = path.join(rootFolderPath, entry.name);
 
@@ -283,7 +319,7 @@ async function scanRootFolderEntries(rootFolderPath) {
         ],
       });
     } else if (entry.isDirectory()) {
-      const files = await collectFilesRecursively(fullPath, fullPath);
+      const files = await collectFilesRecursively(fullPath, fullPath, scanState);
       if (files.length > 0) {
         const totalSize = files.reduce((acc, f) => acc + f.size, 0);
         subFolders.push({
@@ -304,7 +340,79 @@ async function scanRootFolderEntries(rootFolderPath) {
   };
 }
 
+/**
+ * Scan one or more file/folder paths for Tab 1 (Upload File(s) or Folder(s))
+ */
+async function scanPathsForUpload(targetPaths, scanId = null) {
+  const scanState = { count: 0, scanId };
+  const items = [];
+
+  for (const targetPath of targetPaths) {
+    if (scanId && cancelledFolderScans.has(scanId)) {
+      throw new Error('SCAN_ABORTED');
+    }
+    let stat;
+    try {
+      stat = await fs.stat(targetPath);
+    } catch {
+      continue;
+    }
+
+    const baseName = path.basename(targetPath);
+    if (baseName === '.DS_Store' || baseName === 'Thumbs.db') continue;
+
+    if (stat.isFile()) {
+      items.push({
+        kind: 'file',
+        name: baseName,
+        fullPath: targetPath,
+        size: stat.size,
+        mtime: Math.floor(stat.mtimeMs / 1000),
+        files: [
+          {
+            fullPath: targetPath,
+            relativePath: baseName,
+            name: baseName,
+            size: stat.size,
+            mtime: Math.floor(stat.mtimeMs / 1000),
+          },
+        ],
+      });
+    } else if (stat.isDirectory()) {
+      const files = await collectFilesRecursively(targetPath, targetPath, scanState);
+      const totalSize = files.reduce((acc, f) => acc + f.size, 0);
+      items.push({
+        kind: 'folder',
+        name: baseName,
+        fullPath: targetPath,
+        size: totalSize,
+        files,
+      });
+    }
+  }
+
+  return items;
+}
+
 app.whenReady().then(() => {
+  ipcMain.handle('desktop:pickDirectoryPath', async () => {
+    const res = await dialog.showOpenDialog({
+      title: 'Select Root Folder to Sync with GitHub Packages',
+      properties: ['openDirectory'],
+    });
+    if (res.canceled || res.filePaths.length === 0) return null;
+    return res.filePaths[0];
+  });
+
+  ipcMain.handle('desktop:pickDirectoriesForUpload', async () => {
+    const res = await dialog.showOpenDialog({
+      title: 'Select Folder(s) to Upload as OCI Image',
+      properties: ['openDirectory', 'multiSelections'],
+    });
+    if (res.canceled || res.filePaths.length === 0) return [];
+    return res.filePaths;
+  });
+
   ipcMain.handle('desktop:pickRootFolder', async () => {
     const res = await dialog.showOpenDialog({
       title: 'Select Root Folder to Sync with GitHub Packages',
@@ -314,8 +422,26 @@ app.whenReady().then(() => {
     return await scanRootFolderEntries(res.filePaths[0]);
   });
 
-  ipcMain.handle('desktop:rescanRootFolder', async (_event, rootFolderPath) => {
-    return await scanRootFolderEntries(rootFolderPath);
+  ipcMain.handle('desktop:rescanRootFolder', async (_event, rootFolderPath, scanId) => {
+    try {
+      return await scanRootFolderEntries(rootFolderPath, scanId || null);
+    } finally {
+      if (scanId) cancelledFolderScans.delete(scanId);
+    }
+  });
+
+  ipcMain.handle('desktop:scanPathsForUpload', async (_event, targetPaths, scanId) => {
+    try {
+      return await scanPathsForUpload(targetPaths, scanId || null);
+    } finally {
+      if (scanId) cancelledFolderScans.delete(scanId);
+    }
+  });
+
+  ipcMain.on('desktop:cancelFolderScan', (_event, scanId) => {
+    if (scanId) {
+      cancelledFolderScans.add(scanId);
+    }
   });
 
   ipcMain.handle('desktop:readFileBytes', async (_event, fullPath) => {

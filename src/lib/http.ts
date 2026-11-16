@@ -11,6 +11,7 @@ export interface DesktopRootFolderFileEntry {
   size: number;
   mtime?: number;
   fileHandle?: FileSystemFileHandle;
+  rawFile?: File;
 }
 
 export interface DesktopRootFolderItem {
@@ -20,6 +21,16 @@ export interface DesktopRootFolderItem {
   fullPath?: string;
   size: number;
   mtime?: number;
+  files: DesktopRootFolderFileEntry[];
+}
+
+export interface UploadSelectionItem {
+  kind: 'file' | 'folder';
+  name: string;
+  fullPath?: string;
+  size: number;
+  mtime?: number;
+  rawFile?: File;
   files: DesktopRootFolderFileEntry[];
 }
 
@@ -36,8 +47,18 @@ declare global {
       isDesktop: boolean;
       platform: string;
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void;
+      pickDirectoryPath?: () => Promise<string | null>;
+      pickDirectoriesForUpload?: () => Promise<string[]>;
       pickRootFolder: () => Promise<DesktopRootFolderScanResult | null>;
-      rescanRootFolder: (rootFolderPath: string) => Promise<DesktopRootFolderScanResult>;
+      rescanRootFolder: (
+        rootFolderPath: string,
+        scanId?: string
+      ) => Promise<DesktopRootFolderScanResult>;
+      scanPathsForUpload?: (
+        targetPaths: string[],
+        scanId?: string
+      ) => Promise<UploadSelectionItem[]>;
+      cancelFolderScan?: (scanId: string) => void;
       readFileBytes: (fullPath: string) => Promise<Uint8Array>;
       saveExtractedFiles: (
         defaultFolderName: string,
@@ -170,12 +191,23 @@ export async function crossPlatformHttpRequest(opts: {
  */
 async function collectBrowserDirFilesRecursively(
   dirHandle: FileSystemDirectoryHandle,
-  prefix = ''
+  prefix = '',
+  signal?: AbortSignal,
+  counter = { count: 0 }
 ): Promise<DesktopRootFolderFileEntry[]> {
+  if (signal?.aborted) throw new Error('SCAN_ABORTED');
   const results: DesktopRootFolderFileEntry[] = [];
   // @ts-expect-error FileSystemDirectoryHandle.entries() is supported in Chromium browsers
   for await (const [name, handle] of dirHandle.entries()) {
+    if (signal?.aborted) throw new Error('SCAN_ABORTED');
     if (name === '.DS_Store' || name === 'Thumbs.db') continue;
+
+    counter.count += 1;
+    if (counter.count % 25 === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+      if (signal?.aborted) throw new Error('SCAN_ABORTED');
+    }
+
     const relPath = prefix ? `${prefix}/${name}` : name;
     if (handle.kind === 'file') {
       const fileHandle = handle as FileSystemFileHandle;
@@ -189,21 +221,31 @@ async function collectBrowserDirFilesRecursively(
       });
     } else if (handle.kind === 'directory') {
       const subDir = handle as FileSystemDirectoryHandle;
-      const nested = await collectBrowserDirFilesRecursively(subDir, relPath);
-      results.push(...nested);
+      const nested = await collectBrowserDirFilesRecursively(
+        subDir,
+        relPath,
+        signal,
+        counter
+      );
+      for (let i = 0; i < nested.length; i++) {
+        results.push(nested[i]);
+      }
     }
   }
   return results;
 }
 
 export async function scanBrowserDirectoryHandle(
-  dirHandle: FileSystemDirectoryHandle
+  dirHandle: FileSystemDirectoryHandle,
+  signal?: AbortSignal
 ): Promise<DesktopRootFolderScanResult> {
   const rootFiles: DesktopRootFolderItem[] = [];
   const subFolders: DesktopRootFolderItem[] = [];
+  const counter = { count: 0 };
 
   // @ts-expect-error FileSystemDirectoryHandle.entries() is supported in Chromium browsers
   for await (const [name, handle] of dirHandle.entries()) {
+    if (signal?.aborted) throw new Error('SCAN_ABORTED');
     if (name === '.DS_Store' || name === 'Thumbs.db') continue;
     if (handle.kind === 'file') {
       const fileHandle = handle as FileSystemFileHandle;
@@ -225,7 +267,12 @@ export async function scanBrowserDirectoryHandle(
       });
     } else if (handle.kind === 'directory') {
       const subDir = handle as FileSystemDirectoryHandle;
-      const files = await collectBrowserDirFilesRecursively(subDir, '');
+      const files = await collectBrowserDirFilesRecursively(
+        subDir,
+        '',
+        signal,
+        counter
+      );
       if (files.length > 0) {
         const totalSize = files.reduce((acc, f) => acc + f.size, 0);
         subFolders.push({
@@ -243,5 +290,19 @@ export async function scanBrowserDirectoryHandle(
     rootFolderName: dirHandle.name,
     items: [...rootFiles, ...subFolders],
     dirHandle,
+  };
+}
+
+export async function scanBrowserDirectoryForUpload(
+  dirHandle: FileSystemDirectoryHandle,
+  signal?: AbortSignal
+): Promise<UploadSelectionItem> {
+  const files = await collectBrowserDirFilesRecursively(dirHandle, '', signal);
+  const totalSize = files.reduce((acc, f) => acc + f.size, 0);
+  return {
+    kind: 'folder',
+    name: dirHandle.name,
+    size: totalSize,
+    files,
   };
 }
