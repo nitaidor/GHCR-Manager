@@ -1,7 +1,7 @@
 {
   "name": "ghcr-manager",
   "productName": "GHCR Manager",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "author": "Nitai",
   "description": "Cross-platform GHCR Manager (Windows, Linux, macOS, Android, iOS) for creating, syncing, viewing, downloading, and removing OCI container packages on ghcr.io.",
   "main": "electron/main.cjs",

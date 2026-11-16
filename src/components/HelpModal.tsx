@@ -7,6 +7,7 @@ import {
   FolderSync,
   Layers,
   Pencil,
+  Settings,
 } from 'lucide-react';
 
 interface HelpModalProps {
@@ -79,13 +80,13 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                 </h4>
                 <ul className="text-sm text-gray-300 space-y-3 list-disc list-inside">
                   <li>
-                    <strong>Automatic Naming:</strong> Whenever you sign in, your credential is automatically saved under your GitHub username and masked key suffix (for example, <code>nitaidor/ghp_••••x9a2</code>).
+                    <strong>Automatic Naming:</strong> Saved PATs and OAuth Client IDs are stored under your GitHub username with a masked suffix (for example, <code>nitaidor/ghp_••••x9a2</code> or <code>nitaidor/Ov23••••4f1a</code>).
                   </li>
                   <li>
-                    <strong>Quick Re-Login on Sign Out:</strong> When you click <strong>Sign Out</strong>, all saved PATs and OAuth Client IDs appear directly below the input box on their respective sign-in tab so you can sign back in or switch accounts with a single click.
+                    <strong>Quick Re-Login on Sign Out:</strong> When you click <strong>Sign Out</strong>, saved credentials appear below their respective sign-in input for one-click sign-in and account switching.
                   </li>
                   <li>
-                    <strong>Inline Rename & Delete:</strong> Click the <Pencil className="inline w-3.5 h-3.5 text-gray-400 align-text-bottom" /> icon on any saved credential row to give it a custom nickname (e.g., <code>nitaidor/Desktop PAT</code>), or click the trash icon to remove it.
+                    <strong>Inline Rename &amp; Delete:</strong> Click the <Pencil className="inline w-3.5 h-3.5 text-gray-400 align-text-bottom" /> icon on any saved credential row to set a nickname (e.g., <code>nitaidor/Desktop PAT</code>), or click the trash icon to remove it.
                   </li>
                 </ul>
               </div>
@@ -98,7 +99,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               <Upload className="w-5 h-5 icon-upload" /> 2. Upload Files Tab — Naming, Tags &amp; Version Replace
             </h2>
             <p className="text-sm text-gray-400 mb-4">
-              Available on Windows, Linux, macOS, Android, and iOS. Select your target repository at the top, pick or drag-and-drop one or more files or folders, then click <strong>Create Image</strong>:
+              Available on Windows, Linux, macOS, Android, and iOS. Select a target repository, choose or drag-and-drop files or folders (expandable to preview nested contents), review the package name, and click <strong>Create Image</strong>:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -106,7 +107,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                   Single Item Selected
                 </h4>
                 <p className="text-sm text-gray-300">
-                  When you pick <strong>1 file or folder</strong>, the Image &amp; Package Name field automatically defaults to its name. You can either keep it as-is or type a custom name for the image.
+                  Picking <strong>1 file or folder</strong> pre-fills the Image &amp; Package Name automatically from that item&apos;s name, and you can edit it before creating the image.
                 </p>
               </div>
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -114,13 +115,18 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                   Multiple Items Selected
                 </h4>
                 <p className="text-sm text-gray-300">
-                  When you pick <strong>2 or more items</strong>, they are bundled together into a single OCI image, and you <strong>must</strong> enter a name for the image before creating it.
+                  Picking <strong>2 or more items</strong> bundles them into a single OCI image, and you <strong>must</strong> enter a package name before clicking <strong>Create Image</strong>.
                 </p>
               </div>
             </div>
-            <p className="text-xs text-gray-400 mt-4 font-mono bg-[#0d1117] p-3 rounded border border-[#30363d]">
-              Clicking Create Image verifies the package name live on GitHub, lets you inspect or replace any existing tagged versions of that package (or keep all existing versions with New Image), and defaults the tag to a live timestamp (configurable as 24h/12h and YYYY-MM-DD / YY-MM-DD / DD-MM-YYYY / DD-MM-YY in App Settings).
-            </p>
+            <ul className="text-xs text-gray-400 mt-4 bg-[#0d1117] p-3.5 rounded border border-[#30363d] space-y-1.5 list-disc list-inside">
+              <li>
+                <strong>Live Version Check &amp; Replace:</strong> Clicking <strong>Create Image</strong> checks GitHub live for existing versions of that package (click any version to inspect its files). Keep all versions with <strong>New image</strong>, or select one or more existing versions to delete after upload succeeds (requires <code>delete:packages</code>).
+              </li>
+              <li>
+                <strong>Live Timestamp Tag:</strong> The version tag defaults to a live-ticking timestamp (using your <strong>App Settings</strong> format) until manually edited. Choosing a tag already used by an unselected version is blocked unless you replace that version or pick another tag. Selected items clear automatically after upload.
+              </li>
+            </ul>
           </section>
 
           {/* 3. Sync Root Folder Tab */}
@@ -129,7 +135,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               <FolderSync className="w-5 h-5 icon-sync" /> 3. Sync Root Folder Tab (Desktop Folder Auto-Sync)
             </h2>
             <p className="text-sm text-gray-400 mb-4">
-              On Windows, Linux, and macOS, click <strong>Choose Root Folder</strong> to select a local directory. Pressing <strong>Sync Folder</strong> checks every selected item live against GitHub so you can review existing package versions, replace or skip conflicts, adjust timestamp tags, and upload everything according to two rules:
+              On Windows, Linux, and macOS, click <strong>Choose Root Folder</strong> to scan a directory, select which items to include (and expand sub-folders to preview nested trees), then press <strong>Sync Folder</strong> to review tags and GitHub version conflicts before uploading:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -137,7 +143,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                   Rule 1: Direct Files in Root Folder
                 </h4>
                 <p className="text-sm text-gray-300">
-                  Every file placed directly inside the chosen root folder becomes its <strong>own separate image and package</strong>. The name of the image/package is the <strong>name of the file</strong>.
+                  Every direct file inside the root folder becomes its <strong>own separate image and package</strong> named after that file.
                 </p>
               </div>
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -145,31 +151,59 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                   Rule 2: Sub-Folders in Root Folder
                 </h4>
                 <p className="text-sm text-gray-300">
-                  Every immediate sub-folder inside the root folder bundles <strong>all files inside that sub-folder</strong> (including nested sub-directories) into <strong>one single image and package</strong>. The name of the image/package is the <strong>name of the sub-folder</strong>.
+                  Every immediate sub-folder bundles <strong>all nested files and directories inside it</strong> into <strong>one single package</strong> named after that sub-folder.
                 </p>
               </div>
             </div>
+            <p className="text-xs text-gray-400 mt-4 bg-[#0d1117] p-3.5 rounded border border-[#30363d]">
+              In the review popup, set a shared <strong>Batch Tag</strong> (or override tags per item), inspect any existing GitHub versions, and choose <strong>New image</strong>, <strong>Replace</strong> (requires <code>delete:packages</code>), or <strong>Skip</strong> for each item before syncing.
+            </p>
           </section>
 
           {/* 4. Repo Packages Tab */}
           <section className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md">
             <h2 className="text-xl font-semibold mb-4 flex items-center gap-2 icon-packages">
-              <Layers className="w-5 h-5 icon-packages" /> 4. Repo Packages Tab (Auto-Indexing, Search, Download & Remove)
+              <Layers className="w-5 h-5 icon-packages" /> 4. Repo Packages Tab (Search, Inspect, Download &amp; Remove)
             </h2>
             <ul className="text-sm text-gray-300 space-y-3 list-disc list-inside">
               <li>
-                <strong>Automatic Repository Linking:</strong> Every uploaded image includes the <code>org.opencontainers.image.source</code> label and annotation so it automatically links to your selected GitHub repository.
+                <strong>Automatic Repository Linking:</strong> Uploaded images include <code>org.opencontainers.image.source</code> labels and annotations so GitHub automatically links them to the selected repository.
               </li>
               <li>
-                <strong>Automatic File Indexing & Deep Search Across Versions:</strong> Switching to the <strong>Repo Packages</strong> tab or clicking <strong>Refresh</strong> lists all versions and tags for every package and indexes their file lists by SHA-256 digest—so every timestamped upload and tag is visible and searchable in nested folder trees. External images under 50 MB are streamed automatically in the background (with images over 50 MB available via on-demand <strong>Load Files</strong> header streaming without loading full contents into RAM). Typing in the search bar filters package names, version tags, and inner files, automatically expanding matching folders.
+                <strong>Auto-Indexing, Folder Trees &amp; Search:</strong> Switching to <strong>Repo Packages</strong> or clicking <strong>Refresh</strong> lists all tagged and untagged versions and caches their file lists by SHA-256 digest in expandable nested folder trees. External layers under 50 MB index automatically; larger layers load on demand via <strong>Load Files</strong> header streaming. Searching filters package names, tags, and inner files and auto-expands matching folders.
               </li>
               <li>
-                <strong>Download & Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts your original files—saving them directly to a destination folder on Desktop, or downloading the original file / <code>.zip</code> bundle on Web and Mobile.
+                <strong>Download &amp; Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts files directly to a destination folder on Desktop, or downloads the file / <code>.zip</code> bundle on Web and Mobile.
               </li>
               <li>
-                <strong>Remove Version or Package:</strong> Permanently delete an individual tagged/untagged version, or remove an entire package and all of its versions using the <code>delete:packages</code> scope.
+                <strong>Confirmed Deletion:</strong> Removing a single version or an entire package opens a confirmation popup before permanently deleting it on GitHub (requires <code>delete:packages</code>).
               </li>
             </ul>
+          </section>
+
+          {/* 5. Application Settings */}
+          <section className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md">
+            <h2 className="text-xl font-semibold mb-4 flex items-center gap-2 header-logo">
+              <Settings className="w-5 h-5 header-logo" /> 5. Application Settings
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
+                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                  Appearance &amp; 5 Themes
+                </h4>
+                <p className="text-sm text-gray-300">
+                  Switch between Dark and Light mode and pick from five color schemes: <strong>Default Dark</strong>, <strong>Green on Black</strong>, <strong>Red on Black</strong>, <strong>Default Light</strong>, and <strong>Black on White (Monochrome)</strong>.
+                </p>
+              </div>
+              <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
+                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                  Default Timestamp Tags
+                </h4>
+                <p className="text-sm text-gray-300">
+                  Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This affects only new uploads—existing tags on GitHub remain unchanged.
+                </p>
+              </div>
+            </div>
           </section>
         </div>
       </div>
