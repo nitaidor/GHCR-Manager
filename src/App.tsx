@@ -636,6 +636,7 @@ export default function App() {
   }
 
   function handleUploadItemsAdded(incoming: UploadSelectionItem[]) {
+    setShowUploadPickerPrompt(false);
     if (incoming.length === 0) return;
 
     setUploadError(null);
@@ -658,6 +659,7 @@ export default function App() {
   }
 
   function handleFilesAdded(newFiles: FileList | File[]) {
+    setShowUploadPickerPrompt(false);
     const incomingFiles = Array.from(newFiles);
     if (incomingFiles.length === 0) return;
 
@@ -682,6 +684,7 @@ export default function App() {
   }
 
   async function handlePickUploadFolders() {
+    setShowUploadPickerPrompt(false);
     if (isScanningUploadDrop) return;
     setUploadError(null);
     const seq = ++uploadScanSeqRef.current;
@@ -2326,10 +2329,10 @@ export default function App() {
                           handleFilesAdded(e.dataTransfer.files);
                         }
                       }}
-                      onClick={() => {
-                        if (!isScanningUploadDrop) {
-                          setShowUploadPickerPrompt(true);
-                        }
+                      onClick={(e) => {
+                        if (isScanningUploadDrop) return;
+                        if ((e.target as HTMLElement).closest('button')) return;
+                        setShowUploadPickerPrompt(true);
                       }}
                       className={`dropzone-container rounded-xl p-8 text-center transition select-none ${
                         isScanningUploadDrop ? 'cursor-default' : 'cursor-pointer'
@@ -2340,7 +2343,9 @@ export default function App() {
                         type="file"
                         multiple
                         className="hidden"
+                        onClick={(e) => e.stopPropagation()}
                         onChange={(e) => {
+                          setShowUploadPickerPrompt(false);
                           if (e.target.files) {
                             handleFilesAdded(e.target.files);
                             e.target.value = '';
@@ -2355,7 +2360,11 @@ export default function App() {
                         directory="true"
                         multiple
                         className="hidden"
-                        onChange={handleUploadFallbackWebkitDirectory}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => {
+                          setShowUploadPickerPrompt(false);
+                          handleUploadFallbackWebkitDirectory(e);
+                        }}
                       />
 
                       {isScanningUploadDrop ? (
@@ -2394,6 +2403,7 @@ export default function App() {
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
+                                setShowUploadPickerPrompt(false);
                                 fileInputRef.current?.click();
                               }}
                               className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
@@ -2405,6 +2415,7 @@ export default function App() {
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
+                                setShowUploadPickerPrompt(false);
                                 handlePickUploadFolders();
                               }}
                               className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
@@ -2446,9 +2457,12 @@ export default function App() {
                           <div className="grid grid-cols-2 gap-3 pt-1">
                             <button
                               type="button"
-                              onClick={() => {
+                              onClick={(e) => {
+                                e.stopPropagation();
                                 setShowUploadPickerPrompt(false);
-                                fileInputRef.current?.click();
+                                setTimeout(() => {
+                                  fileInputRef.current?.click();
+                                }, 20);
                               }}
                               className="btn-modal-action py-3 px-3 rounded-lg text-xs font-semibold flex flex-col items-center gap-2 cursor-pointer text-center"
                             >
@@ -2457,7 +2471,8 @@ export default function App() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => {
+                              onClick={(e) => {
+                                e.stopPropagation();
                                 setShowUploadPickerPrompt(false);
                                 handlePickUploadFolders();
                               }}
