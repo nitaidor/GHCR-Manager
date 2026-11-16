@@ -690,10 +690,15 @@ html.theme-terminal-red .dropzone-container:hover,
   border-color: #ef4444 !important;
 }
 
-.dropzone-container.is-drag-over {
+.dropzone-container.is-drag-over,
+html.theme-terminal-green .dropzone-container.is-drag-over,
+.theme-terminal-green .dropzone-container.is-drag-over,
+html.theme-terminal-red .dropzone-container.is-drag-over,
+.theme-terminal-red .dropzone-container.is-drag-over {
   border: 2px solid var(--theme-accent-border) !important;
+  border-color: var(--theme-accent-border) !important;
   background-color: var(--theme-accent-soft) !important;
-  box-shadow: 0 0 0 1px var(--theme-accent-border), 0 4px 20px -2px var(--theme-accent-soft) !important;
+  box-shadow: none !important;
 }
 .dropzone-container.is-drag-over .dropzone-icon {
   transform: scale(1.15) translateY(-2px);
