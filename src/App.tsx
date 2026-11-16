@@ -39,6 +39,10 @@ import SubfolderFileTree from './components/SubfolderFileTree';
 import UploadVersionModal, {
   makeVersionStateKey,
 } from './components/UploadVersionModal';
+import SyncFolderReviewModal, {
+  type SyncBatchItemPlan,
+  type SyncRootSelectedItem,
+} from './components/SyncFolderReviewModal';
 import {
   VersionFileDetailsPanel,
   VersionInspectButton,
@@ -47,6 +51,7 @@ import {
   buildAndPushOciImage,
   deleteGitHubPackage,
   deletePackageVersion,
+  deleteReplacedVersions,
   downloadAndExtractPackage,
   fetchGitHubAuthInfo,
   fetchLivePackageState,
@@ -62,10 +67,12 @@ import {
   type GitHubPackageVersion,
   type GitHubRepo,
   type GitHubUser,
+  type LivePackageState,
   type OciPackageDetails,
   type PushProgressUpdate,
 } from './lib/github-oci';
 import {
+  mapWithConcurrency,
   scanBrowserDirectoryHandle,
   scanBrowserDirectoryForUpload,
   type DesktopRootFolderFileEntry,
@@ -81,7 +88,7 @@ import {
 import { createZipFromExtractedFiles, type TarInputFile } from './lib/tar';
 
 interface SyncItemStatus {
-  state: 'idle' | 'uploading' | 'done' | 'error';
+  state: 'idle' | 'uploading' | 'done' | 'skipped' | 'error';
   message?: string;
   percent?: number;
 }
@@ -334,6 +341,30 @@ export default function App() {
   const [syncError, setSyncError] = useState<string | null>(null);
   const fallbackFolderInputRef = useRef<HTMLInputElement | null>(null);
   const fallbackFileMapRef = useRef<Map<string, File>>(new Map());
+  const [showSyncReviewModal, setShowSyncReviewModal] = useState<boolean>(false);
+  const [syncReviewSelectedItems, setSyncReviewSelectedItems] = useState<
+    SyncRootSelectedItem[]
+  >([]);
+  const [syncLookupLoading, setSyncLookupLoading] = useState<boolean>(false);
+  const [syncLookupDoneCount, setSyncLookupDoneCount] = useState<number>(0);
+  const [syncLookupTotalCount, setSyncLookupTotalCount] = useState<number>(0);
+  const [syncLookupError, setSyncLookupError] = useState<string | null>(null);
+  const [syncLiveStatesByIndex, setSyncLiveStatesByIndex] = useState<
+    Record<number, LivePackageState>
+  >({});
+  const syncLookupSeqRef = useRef<number>(0);
+  const [syncOverallProgress, setSyncOverallProgress] = useState<{
+    current: number;
+    total: number;
+    message: string;
+    percent: number;
+  } | null>(null);
+  const [syncModalError, setSyncModalError] = useState<string | null>(null);
+  const [syncBatchSummary, setSyncBatchSummary] = useState<{
+    syncedCount: number;
+    skippedCount: number;
+    replacedCount: number;
+  } | null>(null);
 
   // --- TAB 3: Repo Packages state (Digest-keyed versions) ---
   const [repoPackages, setRepoPackages] = useState<GitHubPackageItem[]>([]);
@@ -370,6 +401,7 @@ export default function App() {
     showAboutModal ||
     showUploadPickerPrompt ||
     showUploadVersionModal ||
+    showSyncReviewModal ||
     Boolean(confirmDeletePkg) ||
     Boolean(confirmDeleteVersion);
   useEffect(() => {
@@ -513,6 +545,8 @@ export default function App() {
     setIndexingKeys(new Set());
     setExpandedVersionKeys(new Set());
     setShowUploadVersionModal(false);
+    setShowSyncReviewModal(false);
+    setSyncBatchSummary(null);
     setConfirmDeletePkg(null);
     setConfirmDeleteVersion(null);
   }
@@ -1102,12 +1136,8 @@ export default function App() {
       }
 
       // Delete checked old versions ONLY after the new image push succeeded
-      const toDelete = opts.replaceVersions.filter(
-        (v) => v.name !== details.manifestDigest
-      );
-      const deleteErrors: string[] = [];
-
-      if (toDelete.length > 0) {
+      let deleteErrors: string[] = [];
+      if (opts.replaceVersions.length > 0) {
         const pkgOwnerLogin =
           modalLivePkg?.owner.login || selectedRepo.owner.login;
         const pkgOwnerType =
@@ -1115,28 +1145,19 @@ export default function App() {
 
         setUploadProgress({
           stage: 'publishing-manifest',
-          message: `Removing ${toDelete.length} replaced version(s)...`,
+          message: `Removing ${opts.replaceVersions.length} replaced version(s)...`,
           percent: 96,
         });
 
-        for (const oldVer of toDelete) {
-          try {
-            await deletePackageVersion({
-              githubToken: authToken,
-              currentUserLogin: user.login,
-              owner: pkgOwnerLogin,
-              ownerType: pkgOwnerType,
-              packageName: details.packageName,
-              versionId: oldVer.id,
-            });
-          } catch (delErr: unknown) {
-            const info = getVersionReferenceInfo(oldVer);
-            const label = info.primaryTag || info.shortDigest;
-            deleteErrors.push(
-              `${label}: ${delErr instanceof Error ? delErr.message : String(delErr)}`
-            );
-          }
-        }
+        deleteErrors = await deleteReplacedVersions({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: pkgOwnerLogin,
+          ownerType: pkgOwnerType,
+          packageName: details.packageName,
+          newManifestDigest: details.manifestDigest,
+          targets: opts.replaceVersions,
+        });
       }
 
       setUploadSuccess(details);
@@ -1180,6 +1201,8 @@ export default function App() {
     setExpandedSubfolders(new Set());
     setLoadingSubfolders(new Set());
     setSyncStatuses({});
+    setSyncBatchSummary(null);
+    setShowSyncReviewModal(false);
     setSyncError(null);
     fallbackFileMapRef.current.clear();
   }
@@ -1388,6 +1411,7 @@ export default function App() {
     setExpandedSubfolders(new Set());
     setLoadingSubfolders(new Set());
     setSyncStatuses({});
+    setSyncBatchSummary(null);
   }
 
   async function handleRescanRootFolder() {
@@ -1474,7 +1498,61 @@ export default function App() {
     return result;
   }
 
-  async function handleSyncRootFolder() {
+  async function runLiveLookupForSyncModal(itemsList: SyncRootSelectedItem[]) {
+    if (!selectedRepo || !user || !authToken || itemsList.length === 0) return;
+    const seq = ++syncLookupSeqRef.current;
+    setSyncLookupLoading(true);
+    setSyncLookupError(null);
+    setSyncLiveStatesByIndex({});
+    setSyncLookupDoneCount(0);
+
+    // Deduplicate normalized package names before querying GitHub API
+    const uniquePkgNames = Array.from(new Set(itemsList.map((entry) => entry.ociName)));
+    setSyncLookupTotalCount(uniquePkgNames.length);
+
+    try {
+      const statesByPkgName: Record<string, LivePackageState> = {};
+      await mapWithConcurrency(uniquePkgNames, 4, async (pkgName) => {
+        if (syncLookupSeqRef.current !== seq) return;
+        const liveState = await fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: selectedRepo.owner.login,
+          ownerType: selectedRepo.owner.type,
+          packageName: pkgName,
+        });
+        if (syncLookupSeqRef.current !== seq) return;
+        statesByPkgName[pkgName] = liveState;
+        setSyncLookupDoneCount((prev) => prev + 1);
+        if (liveState.exists && liveState.versions.length > 0) {
+          indexVersionList(
+            pkgName,
+            liveState.packageItem?.owner.login || selectedRepo.owner.login,
+            liveState.versions
+          );
+        }
+      });
+
+      if (syncLookupSeqRef.current !== seq) return;
+      const byIndex: Record<number, LivePackageState> = {};
+      for (const entry of itemsList) {
+        if (statesByPkgName[entry.ociName]) {
+          byIndex[entry.idx] = statesByPkgName[entry.ociName];
+        }
+      }
+      setSyncLiveStatesByIndex(byIndex);
+    } catch (err: unknown) {
+      if (syncLookupSeqRef.current === seq) {
+        setSyncLookupError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (syncLookupSeqRef.current === seq) {
+        setSyncLookupLoading(false);
+      }
+    }
+  }
+
+  function handleOpenSyncReviewModal() {
     if (!rootScan || !selectedRepo || !user || !authToken) return;
     const indicesToSync = Array.from(selectedSyncIndices).sort((a, b) => a - b);
     if (indicesToSync.length === 0) {
@@ -1482,16 +1560,63 @@ export default function App() {
       return;
     }
 
-    setIsSyncingFolder(true);
-    setSyncError(null);
-
+    const itemsList: SyncRootSelectedItem[] = [];
     for (const idx of indicesToSync) {
       const item = rootScan.items[idx];
       if (!item) continue;
+      itemsList.push({
+        idx,
+        item,
+        ociName: toOciImageName(item.name),
+      });
+    }
+
+    if (itemsList.length === 0) return;
+    setSyncError(null);
+    setSyncModalError(null);
+    setSyncBatchSummary(null);
+    setSyncReviewSelectedItems(itemsList);
+    setShowSyncReviewModal(true);
+    runLiveLookupForSyncModal(itemsList);
+  }
+
+  async function handleExecuteBatchSync(plans: SyncBatchItemPlan[]) {
+    if (!selectedRepo || !user || !authToken) return;
+    const activePlans = plans.filter((p) => p.action !== 'skip');
+    if (activePlans.length === 0) return;
+
+    setIsSyncingFolder(true);
+    setSyncError(null);
+    setSyncModalError(null);
+    setSyncBatchSummary(null);
+
+    const initialStatuses: Record<number, SyncItemStatus> = {};
+    for (const p of plans) {
+      if (p.action === 'skip') {
+        initialStatuses[p.idx] = { state: 'skipped', message: 'Skipped' };
+      }
+    }
+    setSyncStatuses(initialStatuses);
+
+    let syncedCount = 0;
+    let totalReplacedCount = 0;
+    const skippedCount = plans.length - activePlans.length;
+    const batchErrors: string[] = [];
+
+    for (let i = 0; i < activePlans.length; i++) {
+      const plan = activePlans[i];
+      const basePercent = Math.floor((i / activePlans.length) * 100);
+
+      setSyncOverallProgress({
+        current: i + 1,
+        total: activePlans.length,
+        message: `Reading files for ${plan.ociName}:${plan.tag}...`,
+        percent: basePercent,
+      });
 
       setSyncStatuses((prev) => ({
         ...prev,
-        [idx]: {
+        [plan.idx]: {
           state: 'uploading',
           message: 'Reading files...',
           percent: 5,
@@ -1499,19 +1624,29 @@ export default function App() {
       }));
 
       try {
-        const tarFiles = await readRootSyncItemFiles(item);
+        const tarFiles = await readRootSyncItemFiles(plan.item);
         const details = await buildAndPushOciImage({
           username: user.login,
           githubToken: authToken,
           repo: selectedRepo,
-          rawImageName: item.name,
-          tag: 'latest',
-          mode: item.kind,
+          rawImageName: plan.item.name,
+          tag: plan.tag,
+          mode: plan.item.kind,
           files: tarFiles,
           onProgress: (p) => {
+            const overallPct = Math.min(
+              99,
+              Math.floor(((i + p.percent / 100) / activePlans.length) * 100)
+            );
+            setSyncOverallProgress({
+              current: i + 1,
+              total: activePlans.length,
+              message: `${plan.ociName}:${plan.tag} — ${p.message}`,
+              percent: overallPct,
+            });
             setSyncStatuses((prev) => ({
               ...prev,
-              [idx]: {
+              [plan.idx]: {
                 state: 'uploading',
                 message: p.message,
                 percent: p.percent,
@@ -1528,27 +1663,73 @@ export default function App() {
           }));
         }
 
-        setSyncStatuses((prev) => ({
-          ...prev,
-          [idx]: {
-            state: 'done',
-            message: `Uploaded as package "${details.packageName}"`,
-            percent: 100,
-          },
-        }));
+        let deleteErrors: string[] = [];
+        if (plan.replaceVersions.length > 0) {
+          setSyncOverallProgress({
+            current: i + 1,
+            total: activePlans.length,
+            message: `Removing ${plan.replaceVersions.length} old version(s) of ${plan.ociName}...`,
+            percent: Math.min(
+              99,
+              Math.floor(((i + 0.96) / activePlans.length) * 100)
+            ),
+          });
+          deleteErrors = await deleteReplacedVersions({
+            githubToken: authToken,
+            currentUserLogin: user.login,
+            owner: plan.packageOwnerLogin,
+            ownerType: plan.packageOwnerType,
+            packageName: details.packageName,
+            newManifestDigest: details.manifestDigest,
+            targets: plan.replaceVersions,
+          });
+          totalReplacedCount +=
+            plan.replaceVersions.length - deleteErrors.length;
+        }
+
+        syncedCount += 1;
+
+        if (deleteErrors.length > 0) {
+          const msg = `Uploaded ${details.packageName}:${details.tag}, but failed to remove old version(s): ${deleteErrors.join('; ')}`;
+          batchErrors.push(msg);
+          setSyncStatuses((prev) => ({
+            ...prev,
+            [plan.idx]: { state: 'error', message: msg },
+          }));
+        } else {
+          setSyncStatuses((prev) => ({
+            ...prev,
+            [plan.idx]: {
+              state: 'done',
+              message: `Uploaded ${details.packageName}:${details.tag}`,
+              percent: 100,
+            },
+          }));
+        }
       } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        batchErrors.push(`${plan.ociName}: ${msg}`);
         setSyncStatuses((prev) => ({
           ...prev,
-          [idx]: {
-            state: 'error',
-            message: err instanceof Error ? err.message : String(err),
-          },
+          [plan.idx]: { state: 'error', message: msg },
         }));
       }
     }
 
+    setSyncOverallProgress(null);
     setIsSyncingFolder(false);
-    refreshPackages();
+    await refreshPackages();
+
+    if (batchErrors.length > 0) {
+      setSyncModalError(batchErrors.join(' | '));
+    } else {
+      setShowSyncReviewModal(false);
+      setSyncBatchSummary({
+        syncedCount,
+        skippedCount,
+        replacedCount: totalReplacedCount,
+      });
+    }
   }
 
   // --- TAB 3 & MODAL: Version Inspect, Download, and Delete handlers ---
@@ -3244,6 +3425,11 @@ export default function App() {
                                           Synced
                                         </span>
                                       )}
+                                      {status?.state === 'skipped' && (
+                                        <span className="text-xs px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-400 font-medium">
+                                          Skipped
+                                        </span>
+                                      )}
                                       {status?.state === 'error' && (
                                         <span
                                           title={status.message}
@@ -3290,26 +3476,61 @@ export default function App() {
                           </div>
                         )}
 
+                        {syncBatchSummary && (
+                          <div className="p-3.5 rounded-md theme-success-banner text-xs flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <CheckCircle2 className="w-4 h-4 shrink-0" />
+                              <div>
+                                <span className="font-semibold">
+                                  Synced {syncBatchSummary.syncedCount} image
+                                  {syncBatchSummary.syncedCount === 1 ? '' : 's'}!
+                                </span>
+                                {syncBatchSummary.replacedCount > 0 && (
+                                  <span>
+                                    {' '}
+                                    ({syncBatchSummary.replacedCount} old version
+                                    {syncBatchSummary.replacedCount === 1 ? '' : 's'}{' '}
+                                    replaced)
+                                  </span>
+                                )}
+                                {syncBatchSummary.skippedCount > 0 && (
+                                  <span>
+                                    {' '}
+                                    ({syncBatchSummary.skippedCount} skipped)
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => setActiveTab('packages')}
+                                className="btn-modal-action px-2.5 py-1 rounded-md font-medium cursor-pointer"
+                              >
+                                View in Packages →
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setSyncBatchSummary(null)}
+                                className="modal-close-btn p-1"
+                                aria-label="Dismiss sync notice"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
                         {rootScan.items.length > 0 && (
                           <button
                             type="button"
                             disabled={isSyncingFolder || selectedSyncIndices.size === 0}
-                            onClick={handleSyncRootFolder}
+                            onClick={handleOpenSyncReviewModal}
                             className="w-full py-3 px-5 rounded-md btn-sync-green font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
                           >
-                            {isSyncingFolder ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                                Syncing Folder Images to {selectedRepo.full_name}...
-                              </>
-                            ) : (
-                              <>
-                                <FolderSync className="w-4 h-4" />
-                                Sync Folder — Create & Upload {selectedSyncIndices.size}{' '}
-                                Image{selectedSyncIndices.size === 1 ? '' : 's'} to Repo
-                                Packages
-                              </>
-                            )}
+                            <FolderSync className="w-4 h-4" />
+                            Sync Folder — Review &amp; Upload {selectedSyncIndices.size}{' '}
+                            Image{selectedSyncIndices.size === 1 ? '' : 's'} to Repo Packages
                           </button>
                         )}
                       </div>
@@ -3826,6 +4047,41 @@ export default function App() {
           uploadProgress={uploadProgress}
           uploadError={uploadError}
           onConfirmUpload={handleExecuteVersionedUpload}
+        />
+      )}
+
+      {selectedRepo && (
+        <SyncFolderReviewModal
+          isOpen={showSyncReviewModal}
+          onClose={() => {
+            if (!isSyncingFolder) {
+              handleCancelInspect();
+              setShowSyncReviewModal(false);
+            }
+          }}
+          repo={selectedRepo}
+          selectedItems={syncReviewSelectedItems}
+          clockFormat={settings.clockFormat}
+          dateFormat={settings.dateFormat}
+          canDeletePackages={
+            oauthScopes === null || oauthScopes.includes('delete:packages')
+          }
+          lookupLoading={syncLookupLoading}
+          lookupDoneCount={syncLookupDoneCount}
+          lookupTotalCount={syncLookupTotalCount}
+          lookupError={syncLookupError}
+          liveStatesByIndex={syncLiveStatesByIndex}
+          onRetryLookup={() => runLiveLookupForSyncModal(syncReviewSelectedItems)}
+          inspectedByKey={inspectedByKey}
+          indexingKeys={indexingKeys}
+          inspectingKey={inspectingKey}
+          inspectProgress={inspectProgress}
+          onLoadVersionFiles={handleLoadVersionFiles}
+          onCancelInspect={handleCancelInspect}
+          isSyncing={isSyncingFolder}
+          syncOverallProgress={syncOverallProgress}
+          syncModalError={syncModalError}
+          onConfirmSync={handleExecuteBatchSync}
         />
       )}
 

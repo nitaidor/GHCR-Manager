@@ -186,6 +186,30 @@ export async function crossPlatformHttpRequest(opts: {
 }
 
 /**
+ * Runs async tasks across an array with a fixed worker concurrency cap.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+/**
  * Browser File System Access API fallback for Desktop Root Folder Sync when running in Chrome/Edge
  * outside of the Electron shell.
  */

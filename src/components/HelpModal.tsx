@@ -129,7 +129,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               <FolderSync className="w-5 h-5 icon-sync" /> 3. Sync Root Folder Tab (Desktop Folder Auto-Sync)
             </h2>
             <p className="text-sm text-gray-400 mb-4">
-              On Windows, Linux, and macOS, click <strong>Choose Root Folder</strong> to select a local directory. When you click <strong>Sync Folder</strong>, GHCR Manager automatically creates and uploads images according to two rules:
+              On Windows, Linux, and macOS, click <strong>Choose Root Folder</strong> to select a local directory. Pressing <strong>Sync Folder</strong> checks every selected item live against GitHub so you can review existing package versions, replace or skip conflicts, adjust timestamp tags, and upload everything according to two rules:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">

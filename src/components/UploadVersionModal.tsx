@@ -27,14 +27,14 @@ import {
   type ClockFormat,
   type DateFormat,
 } from '../lib/naming';
+import { useLiveTimestampTag } from '../lib/useLiveTimestampTag';
 import {
+  makeVersionStateKey,
   VersionFileDetailsPanel,
   VersionInspectButton,
 } from './VersionInspectButton';
 
-export function makeVersionStateKey(pkgName: string, versionDigest: string): string {
-  return `${pkgName.toLowerCase()}@${versionDigest}`;
-}
+export { makeVersionStateKey };
 
 export interface UploadVersionModalProps {
   isOpen: boolean;
@@ -97,29 +97,25 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
 }) => {
   const [selectedReplaceIds, setSelectedReplaceIds] = useState<Set<number>>(new Set());
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
-  const [tagInput, setTagInput] = useState<string>(() =>
-    formatTimestampTag(new Date(), clockFormat, dateFormat)
-  );
-  const [isTagManuallyEdited, setIsTagManuallyEdited] = useState<boolean>(false);
+  const {
+    tagInput,
+    isManuallyEdited: isTagManuallyEdited,
+    setCustomTag,
+    resumeLiveClock,
+  } = useLiveTimestampTag({
+    isOpen,
+    isBusy: isUploading,
+    clockFormat,
+    dateFormat,
+    resetKey: packageName,
+  });
 
   // Reset local modal selections whenever it opens or target package changes
   useEffect(() => {
     if (!isOpen) return;
     setSelectedReplaceIds(new Set());
     setExpandedKeys(new Set());
-    setIsTagManuallyEdited(false);
-    setTagInput(formatTimestampTag(new Date(), clockFormat, dateFormat));
-  }, [isOpen, packageName, clockFormat, dateFormat]);
-
-  // Keep timestamp tag ticking live every second until user manually edits (or while upload starts)
-  useEffect(() => {
-    if (!isOpen || isTagManuallyEdited || isUploading) return;
-    setTagInput(formatTimestampTag(new Date(), clockFormat, dateFormat));
-    const timer = setInterval(() => {
-      setTagInput(formatTimestampTag(new Date(), clockFormat, dateFormat));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [isOpen, isTagManuallyEdited, isUploading, clockFormat, dateFormat]);
+  }, [isOpen, packageName]);
 
   // Allow Escape to close when not actively uploading
   useEffect(() => {
@@ -450,12 +446,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
                   <button
                     type="button"
                     disabled={isUploading}
-                    onClick={() => {
-                      setIsTagManuallyEdited(false);
-                      setTagInput(
-                        formatTimestampTag(new Date(), clockFormat, dateFormat)
-                      );
-                    }}
+                    onClick={resumeLiveClock}
                     className="btn-saved-action inline-flex items-center gap-1 cursor-pointer font-medium"
                   >
                     <RotateCcw className="w-3 h-3" />
@@ -475,10 +466,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
               type="text"
               disabled={isUploading}
               value={tagInput}
-              onChange={(e) => {
-                setIsTagManuallyEdited(true);
-                setTagInput(e.target.value);
-              }}
+              onChange={(e) => setCustomTag(e.target.value)}
               placeholder={formatTimestampTag(new Date(), clockFormat, dateFormat)}
               className="w-full px-3.5 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white font-mono focus:outline-none"
             />

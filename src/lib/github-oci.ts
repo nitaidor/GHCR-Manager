@@ -1098,6 +1098,45 @@ export async function deletePackageVersion(opts: {
 }
 
 /**
+ * Deletes replaced package versions after a new push has succeeded,
+ * skipping any version whose digest matches the newly pushed manifest
+ * and returning human-readable error strings for any version that failed to delete.
+ */
+export async function deleteReplacedVersions(opts: {
+  githubToken: string;
+  currentUserLogin: string;
+  owner: string;
+  ownerType: 'User' | 'Organization';
+  packageName: string;
+  newManifestDigest?: string;
+  targets: GitHubPackageVersion[];
+}): Promise<string[]> {
+  const toDelete = opts.targets.filter((v) => v.name !== opts.newManifestDigest);
+  const errors: string[] = [];
+
+  for (const oldVer of toDelete) {
+    try {
+      await deletePackageVersion({
+        githubToken: opts.githubToken,
+        currentUserLogin: opts.currentUserLogin,
+        owner: opts.owner,
+        ownerType: opts.ownerType,
+        packageName: opts.packageName,
+        versionId: oldVer.id,
+      });
+    } catch (delErr: unknown) {
+      const info = getVersionReferenceInfo(oldVer);
+      const label = info.primaryTag || info.shortDigest;
+      errors.push(
+        `${label}: ${delErr instanceof Error ? delErr.message : String(delErr)}`
+      );
+    }
+  }
+
+  return errors;
+}
+
+/**
  * Deletes an entire container package from GitHub Packages.
  * Requires the 'delete:packages' scope on the GitHub token.
  */

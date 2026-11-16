@@ -120,6 +120,10 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
   );
 };
 
+export function makeVersionStateKey(pkgName: string, versionDigest: string): string {
+  return `${pkgName.toLowerCase()}@${versionDigest}`;
+}
+
 export interface VersionFileDetailsPanelProps {
   details: OciPackageDetails;
   highlightQuery?: string;
