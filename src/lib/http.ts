@@ -35,6 +35,7 @@ declare global {
     electronAPI?: {
       isDesktop: boolean;
       platform: string;
+      setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void;
       pickRootFolder: () => Promise<DesktopRootFolderScanResult | null>;
       rescanRootFolder: (rootFolderPath: string) => Promise<DesktopRootFolderScanResult>;
       readFileBytes: (fullPath: string) => Promise<Uint8Array>;
@@ -48,6 +49,16 @@ declare global {
         headers?: Record<string, string>;
         body?: Uint8Array;
       }) => Promise<HttpResponseData>;
+      streamLayerFileList?: (opts: {
+        url: string;
+        registryToken: string;
+        expectedSize?: number;
+        requestId: string;
+      }) => Promise<{ files: Array<{ path: string; size: number }> }>;
+      cancelLayerStream?: (requestId: string) => void;
+      onLayerStreamProgress?: (
+        cb: (payload: { requestId: string; percent: number }) => void
+      ) => () => void;
     };
     showDirectoryPicker?: (options?: {
       mode?: 'read' | 'readwrite';

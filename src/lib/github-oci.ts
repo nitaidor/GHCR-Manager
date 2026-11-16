@@ -1,11 +1,13 @@
 import { crossPlatformHttpRequest, decodeJson, decodeText } from './http';
 import {
   buildOciLayerFromFiles,
+  extractFileMetaListStreaming,
   extractFilesFromOciLayer,
   sha256Hex,
   type TarInputFile,
 } from './tar';
 import { toOciImageName } from './naming';
+import pkg from '../../package.json';
 
 export interface GitHubUser {
   login: string;
@@ -50,6 +52,9 @@ export interface GitHubPackageItem {
   } | null;
 }
 
+export const AUTO_INSPECT_EXTERNAL_MAX_BYTES = 50 * 1024 * 1024;
+const EXTERNAL_LAYER_CACHE_KEY = 'ghpm_external_layer_cache_v1';
+
 export interface OciManifestFileMeta {
   path: string;
   size: number;
@@ -68,6 +73,7 @@ export interface OciPackageDetails {
   createdAt: string;
   sourceRepoUrl: string;
   files: OciManifestFileMeta[];
+  needsManualLargeLayerLoad?: boolean;
 }
 
 export type PushProgressStage =
@@ -100,7 +106,7 @@ function githubApiHeaders(token: string): Record<string, string> {
     Authorization: `Bearer ${token.trim()}`,
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'GHCR-Manager/0.1.0',
+    'User-Agent': `GHCR-Manager/${pkg.version}`,
   };
 }
 
@@ -615,6 +621,46 @@ export async function listPackagesForRepo(
   return { repoPackages, otherOwnerPackages };
 }
 
+function readExternalLayerCache(): Record<string, OciManifestFileMeta[]> {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(EXTERNAL_LAYER_CACHE_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw) as Record<string, OciManifestFileMeta[]>;
+  } catch {
+    return {};
+  }
+}
+
+function getCachedExternalLayerFiles(
+  layerDigest: string
+): OciManifestFileMeta[] | null {
+  if (!layerDigest) return null;
+  const cache = readExternalLayerCache();
+  return Array.isArray(cache[layerDigest]) ? cache[layerDigest] : null;
+}
+
+function setCachedExternalLayerFiles(
+  layerDigest: string,
+  files: OciManifestFileMeta[]
+): void {
+  if (!layerDigest || typeof localStorage === 'undefined') return;
+  try {
+    const cache = readExternalLayerCache();
+    // Cap stored items per external image in localStorage so giant images don't overflow quota
+    cache[layerDigest] = files.slice(0, 5000);
+    const keys = Object.keys(cache);
+    if (keys.length > 100) {
+      for (const oldKey of keys.slice(0, keys.length - 100)) {
+        delete cache[oldKey];
+      }
+    }
+    localStorage.setItem(EXTERNAL_LAYER_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
 /**
  * Inspects an OCI package's manifest on ghcr.io to retrieve its file list, sizes, and metadata.
  */
@@ -624,10 +670,30 @@ export async function inspectPackageManifest(opts: {
   owner: string;
   packageName: string;
   tag?: string;
+  forceLoadLargeExternal?: boolean;
+  skipLayerScan?: boolean;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+  requestId?: string;
 }): Promise<OciPackageDetails> {
-  const { username, githubToken, owner, packageName, tag = 'latest' } = opts;
+  const {
+    username,
+    githubToken,
+    owner,
+    packageName,
+    tag = 'latest',
+    forceLoadLargeExternal = false,
+    skipLayerScan = false,
+    onProgress,
+    signal,
+    requestId,
+  } = opts;
   const ownerLower = owner.toLowerCase();
   const pkgLower = packageName.toLowerCase();
+
+  if (signal?.aborted) {
+    throw new DOMException('Layer scan aborted', 'AbortError');
+  }
 
   const registryToken = await getGhcrBearerToken(
     username,
@@ -658,19 +724,95 @@ export async function inspectPackageManifest(opts: {
 
   const firstLayer = manifest.layers?.[0];
   const annotations = manifest.annotations || {};
+  const compressedSize = firstLayer?.size || 0;
+  const layerDigest = firstLayer?.digest || '';
 
   let files: OciManifestFileMeta[] = [];
+  let needsManualLargeLayerLoad = false;
+
   if (annotations['io.ghpm.file-list']) {
     try {
       files = JSON.parse(annotations['io.ghpm.file-list']) as OciManifestFileMeta[];
     } catch {
       files = [];
     }
+  } else if (layerDigest && !skipLayerScan) {
+    const cachedFiles = getCachedExternalLayerFiles(layerDigest);
+    if (cachedFiles) {
+      files = cachedFiles;
+    } else if (!forceLoadLargeExternal && compressedSize > AUTO_INSPECT_EXTERNAL_MAX_BYTES) {
+      needsManualLargeLayerLoad = true;
+    } else {
+      const layerUrl = `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${layerDigest}`;
+      if (typeof window !== 'undefined' && window.electronAPI?.streamLayerFileList) {
+        const reqId =
+          requestId || `stream_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        let unsubProgress: (() => void) | undefined;
+        let abortHandler: (() => void) | undefined;
+
+        if (onProgress && window.electronAPI.onLayerStreamProgress) {
+          unsubProgress = window.electronAPI.onLayerStreamProgress((p) => {
+            if (p.requestId === reqId) onProgress(p.percent);
+          });
+        }
+
+        if (signal) {
+          if (signal.aborted) {
+            unsubProgress?.();
+            throw new DOMException('Layer scan aborted', 'AbortError');
+          }
+          abortHandler = () => {
+            window.electronAPI?.cancelLayerStream?.(reqId);
+          };
+          signal.addEventListener('abort', abortHandler, { once: true });
+        }
+
+        try {
+          const streamRes = await window.electronAPI.streamLayerFileList({
+            url: layerUrl,
+            registryToken,
+            expectedSize: compressedSize,
+            requestId: reqId,
+          });
+          files = streamRes.files;
+        } finally {
+          unsubProgress?.();
+          if (signal && abortHandler) {
+            signal.removeEventListener('abort', abortHandler);
+          }
+        }
+      } else {
+        if (signal?.aborted) {
+          throw new DOMException('Layer scan aborted', 'AbortError');
+        }
+        onProgress?.(5);
+        const blobRes = await crossPlatformHttpRequest({
+          url: layerUrl,
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${registryToken}`,
+          },
+        });
+        if (signal?.aborted) {
+          throw new DOMException('Layer scan aborted', 'AbortError');
+        }
+        if (blobRes.status !== 200) {
+          throw new Error(`Failed to download layer blob (HTTP ${blobRes.status})`);
+        }
+        files = await extractFileMetaListStreaming(blobRes.body, {
+          onProgress: (pct) => onProgress?.(Math.max(5, pct)),
+          signal,
+        });
+      }
+
+      setCachedExternalLayerFiles(layerDigest, files);
+    }
   }
 
-  const compressedSize = firstLayer?.size || 0;
+  const computedTotalBytes =
+    files.length > 0 ? files.reduce((acc, f) => acc + f.size, 0) : compressedSize;
   const totalUncompressedBytes =
-    Number(annotations['io.ghpm.total-bytes']) || compressedSize;
+    Number(annotations['io.ghpm.total-bytes']) || computedTotalBytes;
   const fileCount =
     Number(annotations['io.ghpm.file-count']) || (files.length > 0 ? files.length : 1);
 
@@ -678,15 +820,16 @@ export async function inspectPackageManifest(opts: {
     packageName: pkgLower,
     tag,
     manifestDigest: res.headers['docker-content-digest'],
-    layerDigest: firstLayer?.digest || '',
+    layerDigest,
     compressedSize,
     totalUncompressedBytes,
     fileCount,
     originalName: annotations['io.ghpm.original-name'] || pkgLower,
-    mode: annotations['io.ghpm.mode'] || 'oci-image',
+    mode: annotations['io.ghpm.mode'] || 'external-oci-image',
     createdAt: annotations['org.opencontainers.image.created'] || '',
     sourceRepoUrl: annotations['org.opencontainers.image.source'] || '',
     files,
+    needsManualLargeLayerLoad,
   };
 }
 
@@ -703,7 +846,7 @@ export async function downloadAndExtractPackage(opts: {
   details: OciPackageDetails;
   extractedFiles: TarInputFile[];
 }> {
-  const details = await inspectPackageManifest(opts);
+  const details = await inspectPackageManifest({ ...opts, skipLayerScan: true });
   if (!details.layerDigest) {
     throw new Error('Package manifest does not contain a downloadable layer.');
   }
@@ -732,6 +875,16 @@ export async function downloadAndExtractPackage(opts: {
   }
 
   const extractedFiles = extractFilesFromOciLayer(blobRes.body);
+  if (details.files.length === 0 && extractedFiles.length > 0) {
+    const fileMeta = extractedFiles.map((f) => ({
+      path: f.relativePath,
+      size: f.data.byteLength,
+    }));
+    details.files = fileMeta;
+    details.fileCount = fileMeta.length;
+    details.totalUncompressedBytes = fileMeta.reduce((acc, f) => acc + f.size, 0);
+    setCachedExternalLayerFiles(details.layerDigest, fileMeta);
+  }
   return { details, extractedFiles };
 }
 

@@ -34,9 +34,13 @@ if not exist "electron\main.cjs" (
     exit /b 1
 )
 
-:: Dynamically read version from package.json
+:: Dynamically read version from package.json (single source of truth)
 for /f "delims=" %%v in ('powershell -NoProfile -Command "(Get-Content package.json -Raw | ConvertFrom-Json).version"') do set "APP_VER=%%v"
-if "!APP_VER!"=="" set "APP_VER=0.1.0"
+if "!APP_VER!"=="" (
+    echo [ERROR] Could not read version from package.json
+    pause
+    exit /b 1
+)
 
 echo [OK] Project files verified (v!APP_VER!).
 echo.

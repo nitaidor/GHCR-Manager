@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Box,
+  AlertCircle,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -19,8 +19,8 @@ import {
   Layers,
   Loader2,
   Lock,
-  LogOut,
   Package,
+  Pencil,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -28,8 +28,12 @@ import {
   Trash2,
   Upload,
   X,
-  AlertCircle,
 } from 'lucide-react';
+import Header, { type AppSettings } from './components/Header';
+import TabNav, { type ActiveTab } from './components/TabNav';
+import SettingsModal from './components/SettingsModal';
+import HelpModal from './components/HelpModal';
+import AboutModal from './components/AboutModal';
 import {
   buildAndPushOciImage,
   deleteGitHubPackage,
@@ -55,22 +59,175 @@ import {
 import { toOciImageName, validateFilesSelectionName } from './lib/naming';
 import { createZipFromExtractedFiles, type TarInputFile } from './lib/tar';
 
-type ActiveTab = 'upload-files' | 'sync-folder' | 'packages';
-
 interface SyncItemStatus {
   state: 'idle' | 'uploading' | 'done' | 'error';
   message?: string;
   percent?: number;
 }
 
-const STORAGE_TOKEN_KEY = 'ghpm_github_token_v1';
+export interface SavedPatCredential {
+  token: string;
+  username: string;
+  maskedSuffix: string;
+  customName: string;
+}
+
+export interface SavedOAuthCredential {
+  clientId: string;
+  accessToken?: string;
+  username: string;
+  maskedSuffix: string;
+  customName: string;
+}
+
+const STORAGE_ACTIVE_TOKEN_KEY = 'ghpm_active_session_token_v1';
 const STORAGE_REPO_KEY = 'ghpm_selected_repo_id_v1';
+const STORAGE_SAVED_PATS_KEY = 'ghpm_saved_pats_v1';
+const STORAGE_SAVED_OAUTHS_KEY = 'ghpm_saved_oauths_v1';
+const STORAGE_THEME_SETTINGS_KEY = 'ghpm_theme_settings_v1';
+
+/**
+ * Formats a PAT or Client ID into a compact masked suffix like "ghp_••••x9a2" or "Ov23••••4f1a"
+ */
+function formatMaskedSecret(secret: string): string {
+  const clean = secret.trim();
+  if (clean.length <= 8) return clean;
+  const prefix = clean.slice(0, 4);
+  const suffix = clean.slice(-4);
+  return `${prefix}••••${suffix}`;
+}
 
 export default function App() {
-  // Auth state
-  const [tokenInput, setTokenInput] = useState<string>(
-    () => localStorage.getItem(STORAGE_TOKEN_KEY) || ''
-  );
+  // --- Theme & Appearance State (Matches ShellAssist) ---
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_THEME_SETTINGS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed.isDarkMode === 'boolean') return parsed.isDarkMode;
+      }
+    } catch {
+      // ignore
+    }
+    return true;
+  });
+
+  const [settings, setSettings] = useState<AppSettings>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_THEME_SETTINGS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          darkTheme: parsed.darkTheme || 'default',
+          lightTheme: parsed.lightTheme || 'default',
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return {
+      darkTheme: 'default',
+      lightTheme: 'default',
+    };
+  });
+
+  // Header Menu & Modals State
+  const [showMenu, setShowMenu] = useState<boolean>(false);
+  const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+  const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
+  const [showAboutModal, setShowAboutModal] = useState<boolean>(false);
+
+  // Sync theme classes onto <html> root element & save to localStorage
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.remove(
+      'theme-terminal-green',
+      'theme-terminal-red',
+      'theme-light',
+      'theme-monochrome'
+    );
+    if (!isDarkMode) {
+      root.classList.add('theme-light');
+      if (settings.lightTheme === 'monochrome') {
+        root.classList.add('theme-monochrome');
+      }
+    } else {
+      if (settings.darkTheme === 'green') {
+        root.classList.add('theme-terminal-green');
+      }
+      if (settings.darkTheme === 'red') {
+        root.classList.add('theme-terminal-red');
+      }
+    }
+
+    localStorage.setItem(
+      STORAGE_THEME_SETTINGS_KEY,
+      JSON.stringify({ isDarkMode, ...settings })
+    );
+
+    // Synchronize native OS right-click context menus with app theme state (dark in 3 dark themes, light in 2 light themes)
+    if (
+      typeof window !== 'undefined' &&
+      window.electronAPI &&
+      typeof window.electronAPI.setNativeTheme === 'function'
+    ) {
+      window.electronAPI.setNativeTheme(isDarkMode ? 'dark' : 'light');
+    }
+  }, [isDarkMode, settings]);
+
+  const isDesktopEnv =
+    typeof window !== 'undefined' && Boolean(window.electronAPI?.isDesktop);
+
+  // Lock background page scroll whenever any modal is open
+  const isAnyModalOpen = showSettingsModal || showHelpModal || showAboutModal;
+  useEffect(() => {
+    if (isAnyModalOpen) {
+      document.documentElement.classList.add('modal-open');
+    } else {
+      document.documentElement.classList.remove('modal-open');
+    }
+    return () => {
+      document.documentElement.classList.remove('modal-open');
+    };
+  }, [isAnyModalOpen]);
+
+  // --- Saved Credentials State (Displayed on Sign-In screen below each option's textbox) ---
+  const [savedPats, setSavedPats] = useState<SavedPatCredential[]>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_SAVED_PATS_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+
+  const [savedOAuths, setSavedOAuths] = useState<SavedOAuthCredential[]>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_SAVED_OAUTHS_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_SAVED_PATS_KEY, JSON.stringify(savedPats));
+  }, [savedPats]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_SAVED_OAUTHS_KEY, JSON.stringify(savedOAuths));
+  }, [savedOAuths]);
+
+  // Inline Rename state for Saved PATs & Saved OAuth Client IDs
+  const [editingPatIndex, setEditingPatIndex] = useState<number | null>(null);
+  const [editingPatNameInput, setEditingPatNameInput] = useState<string>('');
+  const [editingOAuthIndex, setEditingOAuthIndex] = useState<number | null>(null);
+  const [editingOAuthNameInput, setEditingOAuthNameInput] = useState<string>('');
+
+  // --- Auth State ---
+  const [tokenInput, setTokenInput] = useState<string>('');
   const [authToken, setAuthToken] = useState<string>('');
   const [user, setUser] = useState<GitHubUser | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(false);
@@ -91,7 +248,23 @@ export default function App() {
   const [repos, setRepos] = useState<GitHubRepo[]>([]);
   const [reposLoading, setReposLoading] = useState<boolean>(false);
   const [repoSearch, setRepoSearch] = useState<string>('');
+  const [showRepoDropdown, setShowRepoDropdown] = useState<boolean>(false);
   const [selectedRepo, setSelectedRepo] = useState<GitHubRepo | null>(null);
+  const repoDropdownRef = useRef<HTMLDivElement | null>(null);
+
+  // Close repo dropdown on outside click
+  useEffect(() => {
+    const handleOutside = (e: MouseEvent) => {
+      if (
+        repoDropdownRef.current &&
+        !repoDropdownRef.current.contains(e.target as Node)
+      ) {
+        setShowRepoDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
 
   // Navigation tab
   const [activeTab, setActiveTab] = useState<ActiveTab>('upload-files');
@@ -104,6 +277,8 @@ export default function App() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadSuccess, setUploadSuccess] = useState<OciPackageDetails | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const fileDragCounter = useRef<number>(0);
+  const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
 
   // --- TAB 2: Root Folder Sync state (Windows / Linux / macOS) ---
   const [rootScan, setRootScan] = useState<DesktopRootFolderScanResult | null>(null);
@@ -113,19 +288,23 @@ export default function App() {
   const [isSyncingFolder, setIsSyncingFolder] = useState<boolean>(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const fallbackFolderInputRef = useRef<HTMLInputElement | null>(null);
-  // Keep raw browser File objects mapped when using <input webkitdirectory> fallback
   const fallbackFileMapRef = useRef<Map<string, File>>(new Map());
 
   // --- TAB 3: Repo Packages state ---
   const [repoPackages, setRepoPackages] = useState<GitHubPackageItem[]>([]);
   const [otherPackages, setOtherPackages] = useState<GitHubPackageItem[]>([]);
   const [showOtherPackages, setShowOtherPackages] = useState<boolean>(false);
+  const [packageSearch, setPackageSearch] = useState<string>('');
+  const [expandedPackages, setExpandedPackages] = useState<Set<string>>(new Set());
   const [packagesLoading, setPackagesLoading] = useState<boolean>(false);
   const [packagesError, setPackagesError] = useState<string | null>(null);
   const [inspectedManifests, setInspectedManifests] = useState<
     Record<string, OciPackageDetails>
   >({});
+  const [indexingPkgNames, setIndexingPkgNames] = useState<Set<string>>(new Set());
   const [inspectingPkgName, setInspectingPkgName] = useState<string | null>(null);
+  const [inspectProgress, setInspectProgress] = useState<number>(0);
+  const inspectAbortRef = useRef<AbortController | null>(null);
   const [downloadingPkgName, setDownloadingPkgName] = useState<string | null>(null);
   const [deletingPkgName, setDeletingPkgName] = useState<string | null>(null);
   const [confirmDeletePkg, setConfirmDeletePkg] = useState<GitHubPackageItem | null>(null);
@@ -135,15 +314,18 @@ export default function App() {
     text: string;
   } | null>(null);
 
-  // Auto sign-in if token is saved in localStorage
+  // Auto sign-in if an active session token exists
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_TOKEN_KEY);
-    if (saved) {
-      handleSignInWithToken(saved);
+    const activeSaved = localStorage.getItem(STORAGE_ACTIVE_TOKEN_KEY);
+    if (activeSaved) {
+      handleSignInWithToken(activeSaved, { source: 'restore' });
     }
   }, []);
 
-  async function handleSignInWithToken(tokenToUse: string) {
+  async function handleSignInWithToken(
+    tokenToUse: string,
+    opts?: { source?: 'pat' | 'oauth' | 'restore'; oauthClientId?: string }
+  ) {
     const clean = tokenToUse.trim();
     if (!clean) {
       setAuthError('Please enter a GitHub token.');
@@ -155,8 +337,57 @@ export default function App() {
       const ghUser = await fetchGitHubUser(clean);
       setUser(ghUser);
       setAuthToken(clean);
-      localStorage.setItem(STORAGE_TOKEN_KEY, clean);
+      localStorage.setItem(STORAGE_ACTIVE_TOKEN_KEY, clean);
 
+      // Save credential into the respective Saved Credentials list (<username>/ghp_••••xxxx)
+      if (opts?.source === 'oauth' && opts.oauthClientId) {
+        const cleanCid = opts.oauthClientId.trim();
+        setSavedOAuths((prev) => {
+          const existingIdx = prev.findIndex((item) => item.clientId === cleanCid);
+          if (existingIdx >= 0) {
+            const copy = [...prev];
+            copy[existingIdx] = {
+              ...copy[existingIdx],
+              username: ghUser.login,
+              accessToken: clean,
+            };
+            return copy;
+          }
+          return [
+            {
+              clientId: cleanCid,
+              accessToken: clean,
+              username: ghUser.login,
+              maskedSuffix: formatMaskedSecret(cleanCid),
+              customName: '',
+            },
+            ...prev,
+          ];
+        });
+      } else if (opts?.source !== 'restore') {
+        setSavedPats((prev) => {
+          const existingIdx = prev.findIndex((item) => item.token === clean);
+          if (existingIdx >= 0) {
+            const copy = [...prev];
+            copy[existingIdx] = {
+              ...copy[existingIdx],
+              username: ghUser.login,
+            };
+            return copy;
+          }
+          return [
+            {
+              token: clean,
+              username: ghUser.login,
+              maskedSuffix: formatMaskedSecret(clean),
+              customName: '',
+            },
+            ...prev,
+          ];
+        });
+      }
+
+      setTokenInput('');
       setReposLoading(true);
       const userRepos = await listUserRepositories(clean);
       setRepos(userRepos);
@@ -169,6 +400,7 @@ export default function App() {
       setAuthError(err instanceof Error ? err.message : String(err));
       setUser(null);
       setAuthToken('');
+      localStorage.removeItem(STORAGE_ACTIVE_TOKEN_KEY);
     } finally {
       setAuthLoading(false);
       setReposLoading(false);
@@ -176,26 +408,80 @@ export default function App() {
   }
 
   function handleSignOut() {
-    localStorage.removeItem(STORAGE_TOKEN_KEY);
+    handleCancelInspect();
+    localStorage.removeItem(STORAGE_ACTIVE_TOKEN_KEY);
     setUser(null);
     setAuthToken('');
     setTokenInput('');
+    setDeviceFlowInfo(null);
+    setDevicePolling(false);
     setRepos([]);
     setSelectedRepo(null);
     setRepoPackages([]);
     setOtherPackages([]);
+    setInspectedManifests({});
+    setIndexingPkgNames(new Set());
+  }
+
+  // Saved PAT handlers
+  function handleRenamePat(token: string, newCustomName: string) {
+    setSavedPats((prev) =>
+      prev.map((item) =>
+        item.token === token ? { ...item, customName: newCustomName.trim() } : item
+      )
+    );
+    setEditingPatIndex(null);
+  }
+
+  function handleDeletePat(tokenToDelete: string) {
+    setSavedPats((prev) => prev.filter((item) => item.token !== tokenToDelete));
+  }
+
+  // Saved OAuth Client ID handlers
+  function handleRenameOAuth(clientId: string, newCustomName: string) {
+    setSavedOAuths((prev) =>
+      prev.map((item) =>
+        item.clientId === clientId
+          ? { ...item, customName: newCustomName.trim() }
+          : item
+      )
+    );
+    setEditingOAuthIndex(null);
+  }
+
+  function handleDeleteOAuth(clientIdToDelete: string) {
+    setSavedOAuths((prev) =>
+      prev.filter((item) => item.clientId !== clientIdToDelete)
+    );
+  }
+
+  async function handleSelectSavedOAuth(entry: SavedOAuthCredential) {
+    setOauthClientId(entry.clientId);
+    if (entry.accessToken) {
+      try {
+        await handleSignInWithToken(entry.accessToken, {
+          source: 'oauth',
+          oauthClientId: entry.clientId,
+        });
+        return;
+      } catch {
+        // Stored token expired or revoked; fall through to start Device Flow
+      }
+    }
+    await handleStartDeviceFlowWithClientId(entry.clientId);
   }
 
   // OAuth Device Flow handlers
-  async function handleStartDeviceFlow() {
-    if (!oauthClientId.trim()) {
+  async function handleStartDeviceFlowWithClientId(cid: string) {
+    const clean = cid.trim();
+    if (!clean) {
       setAuthError('Please enter your GitHub OAuth App Client ID.');
       return;
     }
     setAuthLoading(true);
     setAuthError(null);
     try {
-      const info = await startGitHubDeviceFlow(oauthClientId);
+      const info = await startGitHubDeviceFlow(clean);
       setDeviceFlowInfo(info);
       setDevicePolling(true);
     } catch (err: unknown) {
@@ -218,8 +504,10 @@ export default function App() {
         if (res.status === 'success' && res.accessToken) {
           setDevicePolling(false);
           setDeviceFlowInfo(null);
-          setTokenInput(res.accessToken);
-          await handleSignInWithToken(res.accessToken);
+          await handleSignInWithToken(res.accessToken, {
+            source: 'oauth',
+            oauthClientId,
+          });
         }
       } catch (err: unknown) {
         if (!cancelled) {
@@ -235,13 +523,22 @@ export default function App() {
     };
   }, [devicePolling, deviceFlowInfo, oauthClientId]);
 
-  // Refresh packages when selectedRepo changes or when switching to Packages tab
+  // Refresh packages when selectedRepo changes or when switching to Repo Packages tab
   useEffect(() => {
     if (selectedRepo && authToken && user) {
+      handleCancelInspect();
+      setExpandedPackages(new Set());
       localStorage.setItem(STORAGE_REPO_KEY, String(selectedRepo.id));
       refreshPackages();
     }
   }, [selectedRepo, authToken, user]);
+
+  useEffect(() => {
+    if (activeTab === 'packages' && selectedRepo && authToken && user) {
+      setExpandedPackages(new Set());
+      refreshPackages();
+    }
+  }, [activeTab]);
 
   async function refreshPackages() {
     if (!selectedRepo || !authToken || !user) return;
@@ -252,6 +549,39 @@ export default function App() {
         await listPackagesForRepo(authToken, user.login, selectedRepo);
       setRepoPackages(linked);
       setOtherPackages(others);
+
+      // Automatically inspect manifests for all packages on refresh so:
+      // 1. Any newly pushed versions (changed layerDigest) are always detected.
+      // 2. All GHCR Manager packages and external packages <= 50 MB are auto-indexed.
+      // 3. External packages > 50 MB skip auto-download and wait for user click.
+      const allToIndex = [...linked, ...others];
+      setIndexingPkgNames(new Set(allToIndex.map((p) => p.name)));
+
+      for (const pkg of allToIndex) {
+        inspectPackageManifest({
+          username: user.login,
+          githubToken: authToken,
+          owner: pkg.owner.login,
+          packageName: pkg.name,
+          forceLoadLargeExternal: false,
+        })
+          .then((details) => {
+            setInspectedManifests((prev) => ({
+              ...prev,
+              [pkg.name]: details,
+            }));
+          })
+          .catch(() => {
+            // ignore individual manifest background fetch errors
+          })
+          .finally(() => {
+            setIndexingPkgNames((prev) => {
+              const next = new Set(prev);
+              next.delete(pkg.name);
+              return next;
+            });
+          });
+      }
     } catch (err: unknown) {
       setPackagesError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -280,13 +610,9 @@ export default function App() {
     const updated = [...pickedFiles, ...incoming];
     setPickedFiles(updated);
 
-    // Apply the user's exact naming rules:
-    // - If 1 file is picked: default to the file's name (user can keep it or edit it)
-    // - If multiple files are picked: user MUST enter a name (clear auto-filled single-file default if transitioning from 0/1 to 2+)
     if (updated.length === 1) {
       setCustomImageName(updated[0].name);
     } else if (pickedFiles.length <= 1 && updated.length > 1) {
-      // Transitioned to multiple files: require user to enter a name explicitly
       if (
         !customImageName ||
         (pickedFiles.length === 1 && customImageName === pickedFiles[0].name)
@@ -363,7 +689,6 @@ export default function App() {
   async function handlePickRootFolder() {
     setSyncError(null);
     try {
-      // 1. Native Desktop Electron folder dialog
       if (window.electronAPI?.pickRootFolder) {
         const scan = await window.electronAPI.pickRootFolder();
         if (scan) {
@@ -372,7 +697,6 @@ export default function App() {
         return;
       }
 
-      // 2. Chromium File System Access API (showDirectoryPicker)
       if (typeof window.showDirectoryPicker === 'function') {
         const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
         const scan = await scanBrowserDirectoryHandle(dirHandle);
@@ -380,7 +704,6 @@ export default function App() {
         return;
       }
 
-      // 3. Universal fallback via <input webkitdirectory>
       fallbackFolderInputRef.current?.click();
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return;
@@ -410,7 +733,6 @@ export default function App() {
       if (lastPart === '.DS_Store' || lastPart === 'Thumbs.db') continue;
 
       if (insideRootParts.length === 1) {
-        // Direct file in Root Folder -> 1 standalone image named after the file
         const fileName = insideRootParts[0];
         const mapKey = `root-file:${fileName}`;
         fallbackFileMapRef.current.set(mapKey, file);
@@ -430,7 +752,6 @@ export default function App() {
           ],
         });
       } else {
-        // Inside an immediate sub-folder of the Root Folder -> bundled into 1 image named after the sub-folder
         const subFolderName = insideRootParts[0];
         const pathInsideSubFolder = insideRootParts.slice(1).join('/');
         const mapKey = `subfolder:${subFolderName}/${pathInsideSubFolder}`;
@@ -551,9 +872,6 @@ export default function App() {
           username: user.login,
           githubToken: authToken,
           repo: selectedRepo,
-          // Rule:
-          // - Root file -> image/package name is the file name
-          // - Sub-folder -> image/package name is the sub-folder name
           rawImageName: item.name,
           tag: 'latest',
           mode: item.kind,
@@ -599,28 +917,65 @@ export default function App() {
   }
 
   // --- TAB 3: Package Inspect, Download, and Delete handlers ---
-  async function handleInspectPackage(pkgName: string) {
+  function handleTogglePackageFiles(pkgName: string) {
+    const next = new Set(expandedPackages);
+    if (next.has(pkgName)) {
+      next.delete(pkgName);
+    } else {
+      next.add(pkgName);
+    }
+    setExpandedPackages(next);
+  }
+
+  function handleCancelInspect() {
+    if (inspectAbortRef.current) {
+      inspectAbortRef.current.abort();
+      inspectAbortRef.current = null;
+    }
+    setInspectingPkgName(null);
+    setInspectProgress(0);
+  }
+
+  async function handleLoadLargeExternalPackage(pkgName: string, ownerLogin?: string) {
     if (!selectedRepo || !user || !authToken) return;
+    if (inspectAbortRef.current) {
+      inspectAbortRef.current.abort();
+    }
+    const ac = new AbortController();
+    inspectAbortRef.current = ac;
     setInspectingPkgName(pkgName);
+    setInspectProgress(0);
     setActionBanner(null);
+
     try {
       const details = await inspectPackageManifest({
         username: user.login,
         githubToken: authToken,
-        owner: selectedRepo.owner.login,
+        owner: ownerLogin || selectedRepo.owner.login,
         packageName: pkgName,
+        forceLoadLargeExternal: true,
+        onProgress: (pct) => setInspectProgress(pct),
+        signal: ac.signal,
       });
       setInspectedManifests((prev) => ({
         ...prev,
         [pkgName]: details,
       }));
+      setExpandedPackages((prev) => new Set(prev).add(pkgName));
     } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
       setActionBanner({
         type: 'error',
         text: err instanceof Error ? err.message : String(err),
       });
     } finally {
+      if (inspectAbortRef.current === ac) {
+        inspectAbortRef.current = null;
+      }
       setInspectingPkgName(null);
+      setInspectProgress(0);
     }
   }
 
@@ -659,7 +1014,6 @@ export default function App() {
         throw new Error('No files were found inside the package layer.');
       }
 
-      // On Desktop (Electron), let user choose a folder to extract directly to disk
       if (window.electronAPI?.saveExtractedFiles) {
         const res = await window.electronAPI.saveExtractedFiles(
           details.originalName || pkgName,
@@ -674,7 +1028,6 @@ export default function App() {
         return;
       }
 
-      // On Web / Mobile: if single file, download that exact file directly; if multiple files, download as .zip
       if (extractedFiles.length === 1) {
         const single = extractedFiles[0];
         const fileName = single.relativePath.split('/').pop() || pkgName;
@@ -736,1256 +1089,1528 @@ export default function App() {
     setTimeout(() => setCopiedText(null), 2000);
   }
 
-  // ==================== RENDER: SIGN-IN SCREEN ====================
-  if (!user) {
-    const tokenGenUrl =
-      'https://github.com/settings/tokens/new?description=GHCR%20Manager&scopes=repo,write:packages,read:packages,delete:packages';
+  const tokenGenUrl =
+    'https://github.com/settings/tokens/new?description=GHCR%20Manager&scopes=repo,write:packages,read:packages,delete:packages';
 
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-4">
-        <div className="w-full max-w-lg bg-slate-900/90 border border-slate-800 rounded-2xl shadow-2xl p-6 sm:p-8">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="w-12 h-12 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
-              <Package className="w-7 h-7" />
-            </div>
-            <div>
-              <h1 className="text-xl font-bold tracking-tight text-white">
-                GHCR Manager
-              </h1>
-            </div>
-          </div>
-
-          {/* Auth Method Tabs */}
-          <div className="grid grid-cols-2 gap-2 p-1 bg-slate-950 rounded-xl border border-slate-800 mb-6">
-            <button
-              type="button"
-              onClick={() => {
-                setAuthTab('pat');
-                setAuthError(null);
-              }}
-              className={`py-2 px-3 rounded-lg text-xs font-medium transition flex items-center justify-center gap-2 ${
-                authTab === 'pat'
-                  ? 'bg-indigo-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <KeyRound className="w-3.5 h-3.5" />
-              GitHub Token (Instant)
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setAuthTab('device');
-                setAuthError(null);
-              }}
-              className={`py-2 px-3 rounded-lg text-xs font-medium transition flex items-center justify-center gap-2 ${
-                authTab === 'device'
-                  ? 'bg-indigo-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Smartphone className="w-3.5 h-3.5" />
-              OAuth Device Flow
-            </button>
-          </div>
-
-          {authError && (
-            <div className="mb-5 p-3.5 rounded-xl bg-rose-950/60 border border-rose-800/70 text-rose-200 text-xs flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-              <span>{authError}</span>
-            </div>
-          )}
-
-          {authTab === 'pat' ? (
-            <div className="space-y-4">
-              <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 text-xs text-slate-300 space-y-2">
-                <div className="font-medium text-slate-200 flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  Required GitHub Scopes:
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {['repo', 'write:packages', 'read:packages', 'delete:packages'].map(
-                    (scope) => (
-                      <span
-                        key={scope}
-                        className="px-2 py-0.5 rounded bg-slate-800 text-indigo-300 font-mono text-[11px]"
-                      >
-                        {scope}
-                      </span>
-                    )
-                  )}
-                </div>
-                <a
-                  href={tokenGenUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 text-indigo-400 hover:text-indigo-300 font-medium pt-1"
-                >
-                  Open GitHub with scopes pre-selected
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  Personal Access Token (Classic `ghp_...`)
-                </label>
-                <input
-                  type="password"
-                  value={tokenInput}
-                  onChange={(e) => setTokenInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleSignInWithToken(tokenInput);
-                  }}
-                  placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 font-mono"
-                />
-              </div>
-
-              <button
-                type="button"
-                disabled={authLoading}
-                onClick={() => handleSignInWithToken(tokenInput)}
-                className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/20 cursor-pointer"
-              >
-                {authLoading ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Signing in to GitHub...
-                  </>
-                ) : (
-                  <>
-                    <Github className="w-4 h-4" />
-                    Sign In with GitHub
-                  </>
-                )}
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Sign in via browser code using a GitHub OAuth App Client ID (with Device
-                Flow enabled in your GitHub OAuth App settings).
-              </p>
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  GitHub OAuth App Client ID
-                </label>
-                <input
-                  type="text"
-                  value={oauthClientId}
-                  onChange={(e) => setOauthClientId(e.target.value)}
-                  placeholder="Iv1.xxxxxxxxxxxxxxxx or Ov23lixxxxxxxxx"
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 font-mono"
-                />
-              </div>
-
-              {!deviceFlowInfo ? (
-                <button
-                  type="button"
-                  disabled={authLoading}
-                  onClick={handleStartDeviceFlow}
-                  className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium text-sm transition flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  {authLoading ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Github className="w-4 h-4" />
-                  )}
-                  Generate Device Login Code
-                </button>
-              ) : (
-                <div className="p-4 rounded-xl bg-slate-950 border border-indigo-500/40 text-center space-y-3">
-                  <div className="text-xs text-slate-400">
-                    Enter this code on GitHub to authorize:
-                  </div>
-                  <div className="text-2xl font-mono font-bold tracking-widest text-indigo-400 bg-slate-900 py-2 px-4 rounded-lg inline-block border border-slate-800">
-                    {deviceFlowInfo.user_code}
-                  </div>
-                  <div>
-                    <a
-                      href={deviceFlowInfo.verification_uri}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 px-3.5 py-2 rounded-lg"
-                    >
-                      Open {deviceFlowInfo.verification_uri}
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  </div>
-                  <div className="flex items-center justify-center gap-2 text-xs text-slate-400 pt-1">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                    Waiting for authorization in browser...
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  // ==================== RENDER: AUTHENTICATED MAIN WORKSPACE ====================
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      {/* Top Navigation Bar */}
-      <header className="border-b border-slate-800/80 bg-slate-900/70 backdrop-blur sticky top-0 z-20">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
-              <Package className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-sm sm:text-base text-white">
-                  GHCR Manager
-                </span>
-                <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full bg-indigo-950 text-indigo-300 border border-indigo-800/60 font-semibold">
-                  ghcr.io OCI
-                </span>
-              </div>
-              <p className="text-xs text-slate-400 hidden sm:block">
-                Create, sync, view, download & remove repository container packages
-              </p>
-            </div>
-          </div>
+    <div className="min-h-screen font-sans flex flex-col items-center py-10 px-4 transition-colors duration-200">
+      <Header
+        isDarkMode={isDarkMode}
+        settings={settings}
+        user={user}
+        authLoading={authLoading}
+        showMenu={showMenu}
+        setShowMenu={setShowMenu}
+        onOpenSettings={() => setShowSettingsModal(true)}
+        onOpenHelp={() => setShowHelpModal(true)}
+        onOpenAbout={() => setShowAboutModal(true)}
+        onSignOut={handleSignOut}
+      />
 
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800">
-              <img
-                src={user.avatar_url}
-                alt={user.login}
-                className="w-5 h-5 rounded-full"
-              />
-              <span className="text-xs font-medium text-slate-200">{user.login}</span>
-            </div>
-            <button
-              type="button"
-              onClick={handleSignOut}
-              title="Sign Out"
-              className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-rose-400 border border-slate-800 transition cursor-pointer"
-            >
-              <LogOut className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* Main Layout: Left Sidebar (Repo Picker) + Right Content */}
-      <div className="max-w-7xl w-full mx-auto flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6 p-4 sm:p-6">
-        {/* Left Column: Repository Picker */}
-        <aside className="lg:col-span-4 xl:col-span-3 flex flex-col bg-slate-900/60 border border-slate-800/90 rounded-2xl overflow-hidden max-h-[420px] lg:max-h-[calc(100vh-120px)]">
-          <div className="p-3.5 border-b border-slate-800 space-y-2.5">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                1. Select Repository ({repos.length})
-              </h2>
+      {!user ? (
+        /* ==================== SIGN-IN VIEW ==================== */
+        <main className="w-full max-w-xl relative z-10 mt-2">
+          <div className="bg-[#161b22] border border-[#30363d] rounded-xl shadow-2xl p-6 sm:p-8 space-y-6">
+            {/* Auth Method Tabs */}
+            <div className="grid grid-cols-2 gap-2 p-1 bg-[#0d1117] rounded-lg border border-[#30363d]">
               <button
                 type="button"
-                onClick={() => handleSignInWithToken(authToken)}
-                title="Refresh repositories"
-                className="text-slate-400 hover:text-white p-1 rounded cursor-pointer"
+                onClick={() => {
+                  setAuthTab('pat');
+                  setAuthError(null);
+                }}
+                className={`py-2 px-3 rounded-md text-xs font-semibold transition flex items-center justify-center gap-2 cursor-pointer ${
+                  authTab === 'pat'
+                    ? 'bg-blue-600 text-white shadow'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
               >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 ${reposLoading ? 'animate-spin' : ''}`}
-                />
+                <KeyRound className="w-3.5 h-3.5" />
+                GitHub Token (Instant)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('device');
+                  setAuthError(null);
+                }}
+                className={`py-2 px-3 rounded-md text-xs font-semibold transition flex items-center justify-center gap-2 cursor-pointer ${
+                  authTab === 'device'
+                    ? 'bg-blue-600 text-white shadow'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                OAuth Device Flow
               </button>
             </div>
-            <div className="relative">
-              <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={repoSearch}
-                onChange={(e) => setRepoSearch(e.target.value)}
-                placeholder="Filter repositories..."
-                className="w-full pl-8 pr-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
-              />
-            </div>
-          </div>
 
-          <div className="flex-1 overflow-y-auto divide-y divide-slate-800/50">
-            {filteredRepos.length === 0 ? (
-              <div className="p-6 text-center text-xs text-slate-500">
-                No matching repositories found.
+            {authError && (
+              <div className="p-3.5 rounded-md theme-error-banner text-xs flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{authError}</span>
               </div>
-            ) : (
-              filteredRepos.map((repo) => {
-                const isSelected = selectedRepo?.id === repo.id;
-                return (
-                  <button
-                    key={repo.id}
-                    type="button"
-                    onClick={() => setSelectedRepo(repo)}
-                    className={`w-full text-left p-3 transition flex items-start justify-between gap-2 cursor-pointer ${
-                      isSelected
-                        ? 'bg-indigo-600/15 border-l-2 border-l-indigo-500 text-white'
-                        : 'hover:bg-slate-800/50 text-slate-300'
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <div className="text-xs font-semibold truncate">
-                        {repo.full_name}
-                      </div>
-                      {repo.description && (
-                        <div className="text-[11px] text-slate-400 truncate mt-0.5">
-                          {repo.description}
-                        </div>
-                      )}
-                    </div>
-                    <span
-                      className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border ${
-                        repo.private
-                          ? 'bg-amber-950/60 border-amber-800/60 text-amber-300'
-                          : 'bg-slate-800 border-slate-700 text-slate-400'
-                      }`}
-                    >
-                      {repo.private ? 'Private' : 'Public'}
-                    </span>
-                  </button>
-                );
-              })
             )}
-          </div>
-        </aside>
 
-        {/* Right Column: Active Repo Workspace */}
-        <main className="lg:col-span-8 xl:col-span-9 flex flex-col gap-5">
-          {!selectedRepo ? (
-            <div className="flex-1 bg-slate-900/60 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center">
-              <Box className="w-10 h-10 text-slate-600 mb-3" />
-              <h3 className="text-base font-semibold text-slate-300">
-                Select a GitHub Repository
-              </h3>
-              <p className="text-xs text-slate-500 max-w-md mt-1">
-                Choose a repository from the sidebar to upload files, sync a desktop root
-                folder, or manage existing packages.
-              </p>
-            </div>
-          ) : (
-            <>
-              {/* Selected Repo Banner + Mode Switcher Tabs */}
-              <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="text-[11px] uppercase tracking-wider text-indigo-400 font-semibold">
-                      Target Repository
-                    </div>
-                    <div className="flex items-center gap-2 mt-0.5">
-                      <h2 className="text-lg font-bold text-white">
-                        {selectedRepo.full_name}
-                      </h2>
-                      <a
-                        href={`${selectedRepo.html_url}/packages`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs text-slate-400 hover:text-indigo-400 inline-flex items-center gap-1"
-                      >
-                        View on GitHub
-                        <ExternalLink className="w-3.5 h-3.5" />
-                      </a>
-                    </div>
+            {authTab === 'pat' ? (
+              <div className="space-y-5">
+                <div className="p-3.5 rounded-md bg-[#0d1117] border border-[#30363d] text-xs text-gray-300 space-y-2">
+                  <div className="font-semibold text-white flex items-center gap-1.5">
+                    <ShieldCheck className="w-4 h-4 header-logo" />
+                    Required GitHub Scopes:
                   </div>
-
-                  <div className="text-xs text-slate-400 bg-slate-950 px-3 py-1.5 rounded-xl border border-slate-800 font-mono">
-                    ghcr.io/{selectedRepo.owner.login.toLowerCase()}/&lt;image-name&gt;
-                  </div>
-                </div>
-
-                {/* 3 Workspace Tabs */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('upload-files')}
-                    className={`py-2.5 px-4 rounded-xl text-xs font-semibold transition flex items-center justify-center gap-2 cursor-pointer border ${
-                      activeTab === 'upload-files'
-                        ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-600/20'
-                        : 'bg-slate-950/80 text-slate-400 border-slate-800 hover:text-slate-200 hover:bg-slate-900'
-                    }`}
-                  >
-                    <Upload className="w-4 h-4" />
-                    Upload File(s)
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('sync-folder')}
-                    className={`py-2.5 px-4 rounded-xl text-xs font-semibold transition flex items-center justify-center gap-2 cursor-pointer border ${
-                      activeTab === 'sync-folder'
-                        ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-600/20'
-                        : 'bg-slate-950/80 text-slate-400 border-slate-800 hover:text-slate-200 hover:bg-slate-900'
-                    }`}
-                  >
-                    <FolderSync className="w-4 h-4" />
-                    Sync Root Folder (Desktop)
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('packages')}
-                    className={`py-2.5 px-4 rounded-xl text-xs font-semibold transition flex items-center justify-center gap-2 cursor-pointer border ${
-                      activeTab === 'packages'
-                        ? 'bg-indigo-600 text-white border-indigo-500 shadow-lg shadow-indigo-600/20'
-                        : 'bg-slate-950/80 text-slate-400 border-slate-800 hover:text-slate-200 hover:bg-slate-900'
-                    }`}
-                  >
-                    <Layers className="w-4 h-4" />
-                    Repo Packages ({repoPackages.length})
-                  </button>
-                </div>
-              </div>
-
-              {/* ==================== TAB 1: UPLOAD FILE(S) ==================== */}
-              {activeTab === 'upload-files' && (
-                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 sm:p-6 space-y-6">
-                  <div className="flex flex-wrap items-start justify-between gap-4">
-                    <div>
-                      <h3 className="text-base font-bold text-white flex items-center gap-2">
-                        <FilePlus2 className="w-5 h-5 text-indigo-400" />
-                        Upload Single or Multiple Files as an Image
-                      </h3>
-                      <p className="text-xs text-slate-400 mt-1">
-                        Works on Windows, Linux, macOS, Android, and iOS. Packages your
-                        selected file(s) into an OCI container image and pushes to{' '}
-                        <span className="text-slate-200 font-medium">
-                          {selectedRepo.full_name}
+                  <div className="flex flex-wrap gap-1.5">
+                    {['repo', 'write:packages', 'read:packages', 'delete:packages'].map(
+                      (scope) => (
+                        <span
+                          key={scope}
+                          className="px-2 py-0.5 rounded bg-[#161b22] border border-[#30363d] text-gray-200 font-mono text-[11px]"
+                        >
+                          {scope}
                         </span>
-                        .
-                      </p>
-                    </div>
+                      )
+                    )}
                   </div>
-
-                  {/* Naming Rules Callout */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                    <div
-                      className={`p-3.5 rounded-xl border ${
-                        pickedFiles.length === 1
-                          ? 'bg-indigo-950/40 border-indigo-500/50 text-indigo-200'
-                          : 'bg-slate-950/60 border-slate-800/80 text-slate-400'
-                      }`}
-                    >
-                      <div className="font-semibold text-slate-200 mb-0.5">
-                        • Single File Selected:
-                      </div>
-                      Keep the file&apos;s name as the image/package name, or enter a
-                      custom image name.
-                    </div>
-                    <div
-                      className={`p-3.5 rounded-xl border ${
-                        pickedFiles.length > 1
-                          ? 'bg-indigo-950/40 border-indigo-500/50 text-indigo-200'
-                          : 'bg-slate-950/60 border-slate-800/80 text-slate-400'
-                      }`}
-                    >
-                      <div className="font-semibold text-slate-200 mb-0.5">
-                        • Multiple Files Selected:
-                      </div>
-                      All files are bundled into one image, and you{' '}
-                      <span className="underline font-medium">must</span> enter a name for
-                      the image.
-                    </div>
-                  </div>
-
-                  {/* File Dropzone */}
-                  <div
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (e.dataTransfer.files?.length) {
-                        handleFilesAdded(e.dataTransfer.files);
-                      }
-                    }}
-                    onClick={() => fileInputRef.current?.click()}
-                    className="border-2 border-dashed border-slate-700 hover:border-indigo-500 bg-slate-950/50 hover:bg-slate-950 rounded-2xl p-8 text-center transition cursor-pointer"
+                  <a
+                    href={tokenGenUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 text-gray-300 hover:text-white font-semibold pt-1 underline"
                   >
+                    Open GitHub with scopes pre-selected
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-gray-300 mb-1.5">
+                    Personal Access Token (Classic `ghp_...`)
+                  </label>
+                  <div className="flex flex-col sm:flex-row gap-2">
                     <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      className="hidden"
-                      onChange={(e) => {
-                        if (e.target.files) {
-                          handleFilesAdded(e.target.files);
-                          e.target.value = '';
+                      type="password"
+                      value={tokenInput}
+                      onChange={(e) => setTokenInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          handleSignInWithToken(tokenInput, { source: 'pat' });
                         }
                       }}
+                      placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      className="flex-1 px-3.5 py-2.5 rounded-md bg-[#0d1117] border border-[#30363d] text-sm text-white focus:outline-none font-mono"
                     />
-                    <Upload className="w-8 h-8 text-indigo-400 mx-auto mb-2.5" />
-                    <div className="text-sm font-semibold text-slate-200">
-                      Click to choose file(s) or drag & drop here
-                    </div>
-                    <div className="text-xs text-slate-500 mt-1">
-                      Select 1 file or multiple files from your device
-                    </div>
-                  </div>
-
-                  {/* Picked Files List */}
-                  {pickedFiles.length > 0 && (
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-semibold text-slate-300">
-                          Selected Files ({pickedFiles.length}) — Total:{' '}
-                          {formatBytes(
-                            pickedFiles.reduce((acc, f) => acc + f.size, 0)
-                          )}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setPickedFiles([]);
-                            setCustomImageName('');
-                          }}
-                          className="text-xs text-rose-400 hover:text-rose-300 cursor-pointer"
-                        >
-                          Clear all
-                        </button>
-                      </div>
-
-                      <div className="max-h-48 overflow-y-auto divide-y divide-slate-800/60 bg-slate-950 rounded-xl border border-slate-800">
-                        {pickedFiles.map((file, idx) => (
-                          <div
-                            key={`${file.name}-${idx}`}
-                            className="px-3.5 py-2 flex items-center justify-between gap-2 text-xs"
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <FileIcon className="w-4 h-4 text-indigo-400 shrink-0" />
-                              <span className="truncate text-slate-200 font-medium">
-                                {file.name}
-                              </span>
-                              <span className="text-slate-500 shrink-0">
-                                ({formatBytes(file.size)})
-                              </span>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => handleRemovePickedFile(idx)}
-                              className="text-slate-500 hover:text-rose-400 p-1 cursor-pointer"
-                            >
-                              <X className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Image / Package Name Input */}
-                  {pickedFiles.length > 0 && (
-                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-4">
-                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                        <div className="sm:col-span-3">
-                          <label className="block text-xs font-semibold text-slate-200 mb-1">
-                            Image & Package Name{' '}
-                            {pickedFiles.length > 1 ? (
-                              <span className="text-amber-400 font-normal">
-                                (Required for multiple files)
-                              </span>
-                            ) : (
-                              <span className="text-slate-400 font-normal">
-                                (Defaults to file name — edit if you want another name)
-                              </span>
-                            )}
-                          </label>
-                          <input
-                            type="text"
-                            value={customImageName}
-                            onChange={(e) => setCustomImageName(e.target.value)}
-                            placeholder={
-                              pickedFiles.length === 1
-                                ? pickedFiles[0].name
-                                : 'Enter a name for this multi-file image (e.g. release-bundle)'
-                            }
-                            className={`w-full px-3.5 py-2 rounded-xl bg-slate-900 border text-sm text-white focus:outline-none ${
-                              !fileNamingValidation.valid
-                                ? 'border-amber-500/70 focus:border-amber-400'
-                                : 'border-slate-700 focus:border-indigo-500'
-                            }`}
-                          />
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-200 mb-1">
-                            Tag
-                          </label>
-                          <input
-                            type="text"
-                            value={imageTag}
-                            onChange={(e) => setImageTag(e.target.value)}
-                            placeholder="latest"
-                            className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white font-mono focus:outline-none focus:border-indigo-500"
-                          />
-                        </div>
-                      </div>
-
-                      {fileNamingValidation.valid ? (
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs bg-slate-900/90 px-3.5 py-2.5 rounded-lg border border-slate-800">
-                          <span className="text-slate-400">
-                            Resulting Package & Image Name:
-                          </span>
-                          <code className="text-indigo-300 font-mono font-semibold">
-                            ghcr.io/{selectedRepo.owner.login.toLowerCase()}/
-                            {fileNamingValidation.ociPackageName}:
-                            {imageTag.trim() || 'latest'}
-                          </code>
-                        </div>
-                      ) : (
-                        <div className="text-xs text-amber-400 flex items-center gap-1.5">
-                          <Info className="w-4 h-4 shrink-0" />
-                          {fileNamingValidation.error}
-                        </div>
-                      )}
-
-                      {uploadError && (
-                        <div className="p-3 rounded-lg bg-rose-950/70 border border-rose-800 text-rose-200 text-xs flex items-start gap-2">
-                          <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                          <span>{uploadError}</span>
-                        </div>
-                      )}
-
-                      {uploadProgress && (
-                        <div className="space-y-1.5">
-                          <div className="flex justify-between text-xs text-indigo-300">
-                            <span>{uploadProgress.message}</span>
-                            <span>{uploadProgress.percent}%</span>
-                          </div>
-                          <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-indigo-500 transition-all duration-300"
-                              style={{ width: `${uploadProgress.percent}%` }}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      {uploadSuccess && (
-                        <div className="p-3.5 rounded-xl bg-emerald-950/50 border border-emerald-800/70 text-emerald-200 text-xs flex items-center justify-between gap-3">
-                          <div className="flex items-center gap-2">
-                            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                            <div>
-                              <span className="font-semibold">
-                                Package &quot;{uploadSuccess.packageName}&quot; uploaded!
-                              </span>{' '}
-                              ({uploadSuccess.fileCount} file(s), compressed size{' '}
-                              {formatBytes(uploadSuccess.compressedSize)})
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => setActiveTab('packages')}
-                            className="px-2.5 py-1 rounded-lg bg-emerald-800/60 hover:bg-emerald-700/60 text-emerald-100 font-medium shrink-0 cursor-pointer"
-                          >
-                            View in Packages →
-                          </button>
-                        </div>
-                      )}
-
-                      <button
-                        type="button"
-                        disabled={!fileNamingValidation.valid || !!uploadProgress}
-                        onClick={handleUploadSelectedFiles}
-                        className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/20 cursor-pointer"
-                      >
-                        {uploadProgress ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Building & Uploading OCI Image...
-                          </>
-                        ) : (
-                          <>
-                            <Upload className="w-4 h-4" />
-                            Create Image &quot;
-                            {fileNamingValidation.ociPackageName || '...'}&quot; & Upload
-                            to Repo Packages
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* ==================== TAB 2: SYNC ROOT FOLDER (DESKTOP) ==================== */}
-              {activeTab === 'sync-folder' && (
-                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 sm:p-6 space-y-6">
-                  <div className="flex flex-wrap items-start justify-between gap-4">
-                    <div>
-                      <h3 className="text-base font-bold text-white flex items-center gap-2">
-                        <FolderSync className="w-5 h-5 text-indigo-400" />
-                        Root Folder Auto-Image Sync (Windows, Linux, macOS)
-                      </h3>
-                      <p className="text-xs text-slate-400 mt-1">
-                        Choose a root folder on your computer and press{' '}
-                        <span className="text-slate-200 font-semibold">Sync Folder</span>:
-                      </p>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      {/* Hidden fallback directory input */}
-                      <input
-                        ref={fallbackFolderInputRef}
-                        type="file"
-                        // @ts-expect-error webkitdirectory is standard across desktop browsers
-                        webkitdirectory="true"
-                        directory="true"
-                        multiple
-                        className="hidden"
-                        onChange={handleFallbackWebkitDirectory}
-                      />
-                      {rootScan && (
-                        <button
-                          type="button"
-                          disabled={isSyncingFolder}
-                          onClick={handleRescanRootFolder}
-                          className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <RefreshCw className="w-3.5 h-3.5" />
-                          Rescan
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        disabled={isSyncingFolder}
-                        onClick={handlePickRootFolder}
-                        className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white flex items-center gap-2 shadow-lg shadow-indigo-600/20 cursor-pointer"
-                      >
-                        <Folder className="w-4 h-4" />
-                        {rootScan ? 'Change Root Folder' : 'Choose Root Folder'}
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Explanation of the two Root Folder rules */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                    <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
-                      <div className="font-semibold text-indigo-300 flex items-center gap-1.5 mb-1">
-                        <FileIcon className="w-3.5 h-3.5" />
-                        Rule 1: Direct Files in Root Folder
-                      </div>
-                      <p className="text-slate-400">
-                        Each file placed directly inside the root folder creates its{' '}
-                        <strong className="text-slate-200">own separate image</strong>.
-                        The image/package name is the{' '}
-                        <strong className="text-slate-200">name of the file</strong>.
-                      </p>
-                    </div>
-
-                    <div className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800">
-                      <div className="font-semibold text-emerald-300 flex items-center gap-1.5 mb-1">
-                        <Folder className="w-3.5 h-3.5" />
-                        Rule 2: Sub-Folders in Root Folder
-                      </div>
-                      <p className="text-slate-400">
-                        Each sub-folder inside the root folder bundles{' '}
-                        <strong className="text-slate-200">
-                          all files in that sub-folder
-                        </strong>{' '}
-                        into a single image. The image/package name is the{' '}
-                        <strong className="text-slate-200">name of the sub-folder</strong>.
-                      </p>
-                    </div>
-                  </div>
-
-                  {syncError && (
-                    <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-800 text-rose-200 text-xs flex items-start gap-2">
-                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                      <span>{syncError}</span>
-                    </div>
-                  )}
-
-                  {!rootScan ? (
-                    <div
-                      onClick={handlePickRootFolder}
-                      className="border-2 border-dashed border-slate-700 hover:border-indigo-500 bg-slate-950/40 hover:bg-slate-950 rounded-2xl p-10 text-center transition cursor-pointer"
+                    <button
+                      type="button"
+                      disabled={authLoading || !tokenInput.trim()}
+                      onClick={() =>
+                        handleSignInWithToken(tokenInput, { source: 'pat' })
+                      }
+                      className="py-2.5 px-5 rounded-md bg-blue-600 font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer shrink-0"
                     >
-                      <HardDrive className="w-9 h-9 text-indigo-400 mx-auto mb-3" />
-                      <div className="text-sm font-semibold text-slate-200">
-                        Select a Root Folder to Scan
-                      </div>
-                      <p className="text-xs text-slate-500 max-w-md mx-auto mt-1">
-                        We will automatically detect all top-level files and sub-folders
-                        and prepare an OCI package image for each one.
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-950 px-4 py-3 rounded-xl border border-slate-800">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <Folder className="w-4 h-4 text-indigo-400 shrink-0" />
-                          <span className="text-xs text-slate-400">Root Folder:</span>
-                          <code className="text-xs text-white font-mono truncate">
-                            {rootScan.rootFolderPath}
-                          </code>
-                        </div>
-                        <div className="flex items-center gap-3 text-xs">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setSelectedSyncIndices(
-                                new Set(rootScan.items.map((_, i) => i))
-                              )
-                            }
-                            className="text-indigo-400 hover:text-indigo-300 cursor-pointer"
-                          >
-                            Select All ({rootScan.items.length})
-                          </button>
-                          <span className="text-slate-700">|</span>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedSyncIndices(new Set())}
-                            className="text-slate-400 hover:text-slate-200 cursor-pointer"
-                          >
-                            None
-                          </button>
-                        </div>
-                      </div>
-
-                      {rootScan.items.length === 0 ? (
-                        <div className="p-8 text-center text-xs text-slate-500 bg-slate-950 rounded-xl border border-slate-800">
-                          The selected root folder is empty. Add files or sub-folders and
-                          click Rescan.
-                        </div>
+                      {authLoading ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
                       ) : (
-                        <div className="divide-y divide-slate-800/70 bg-slate-950 rounded-xl border border-slate-800 overflow-hidden">
-                          {rootScan.items.map((item, idx) => {
-                            const ociName = toOciImageName(item.name);
-                            const isChecked = selectedSyncIndices.has(idx);
-                            const isExpanded = expandedSubfolders.has(idx);
-                            const status = syncStatuses[idx];
-
-                            return (
-                              <div key={`${item.kind}-${item.name}-${idx}`} className="p-3.5">
-                                <div className="flex flex-wrap items-center justify-between gap-3">
-                                  <div className="flex items-center gap-3 min-w-0">
-                                    <input
-                                      type="checkbox"
-                                      checked={isChecked}
-                                      disabled={isSyncingFolder}
-                                      onChange={() => {
-                                        const next = new Set(selectedSyncIndices);
-                                        if (next.has(idx)) next.delete(idx);
-                                        else next.add(idx);
-                                        setSelectedSyncIndices(next);
-                                      }}
-                                      className="w-4 h-4 rounded accent-indigo-600 cursor-pointer"
-                                    />
-
-                                    {item.kind === 'root-file' ? (
-                                      <FileIcon className="w-4 h-4 text-indigo-400 shrink-0" />
-                                    ) : (
-                                      <Folder className="w-4 h-4 text-emerald-400 shrink-0" />
-                                    )}
-
-                                    <div className="min-w-0">
-                                      <div className="flex items-center gap-2 flex-wrap">
-                                        <span className="text-xs font-semibold text-white">
-                                          {item.name}
-                                        </span>
-                                        <span
-                                          className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
-                                            item.kind === 'root-file'
-                                              ? 'bg-indigo-950 text-indigo-300 border border-indigo-800/60'
-                                              : 'bg-emerald-950 text-emerald-300 border border-emerald-800/60'
-                                          }`}
-                                        >
-                                          {item.kind === 'root-file'
-                                            ? 'Root File → 1 Image'
-                                            : `Sub-folder (${item.files.length} file${
-                                                item.files.length === 1 ? '' : 's'
-                                              }) → 1 Image`}
-                                        </span>
-                                        <span className="text-xs text-slate-500">
-                                          ({formatBytes(item.size)})
-                                        </span>
-                                      </div>
-
-                                      <div className="text-[11px] text-slate-400 font-mono mt-0.5">
-                                        Package / Image:{' '}
-                                        <span className="text-indigo-300 font-semibold">
-                                          {ociName}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  </div>
-
-                                  <div className="flex items-center gap-2">
-                                    {status?.state === 'uploading' && (
-                                      <span className="text-xs text-indigo-300 flex items-center gap-1.5">
-                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                        {status.percent ?? 0}%
-                                      </span>
-                                    )}
-                                    {status?.state === 'done' && (
-                                      <span className="text-xs text-emerald-400 flex items-center gap-1 font-medium">
-                                        <CheckCircle2 className="w-4 h-4" />
-                                        Synced
-                                      </span>
-                                    )}
-                                    {status?.state === 'error' && (
-                                      <span
-                                        title={status.message}
-                                        className="text-xs text-rose-400 flex items-center gap-1"
-                                      >
-                                        <AlertCircle className="w-4 h-4" />
-                                        Failed
-                                      </span>
-                                    )}
-
-                                    {item.kind === 'root-subfolder' && (
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          const next = new Set(expandedSubfolders);
-                                          if (next.has(idx)) next.delete(idx);
-                                          else next.add(idx);
-                                          setExpandedSubfolders(next);
-                                        }}
-                                        className="text-xs text-slate-400 hover:text-white px-2 py-1 rounded bg-slate-900 border border-slate-800 flex items-center gap-1 cursor-pointer"
-                                      >
-                                        {isExpanded ? (
-                                          <ChevronDown className="w-3.5 h-3.5" />
-                                        ) : (
-                                          <ChevronRight className="w-3.5 h-3.5" />
-                                        )}
-                                        Files
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-
-                                {status?.state === 'error' && status.message && (
-                                  <div className="mt-2 text-[11px] text-rose-300 bg-rose-950/50 px-3 py-1.5 rounded border border-rose-800/60">
-                                    {status.message}
-                                  </div>
-                                )}
-
-                                {item.kind === 'root-subfolder' && isExpanded && (
-                                  <div className="mt-3 pl-7 space-y-1 max-h-40 overflow-y-auto border-l border-slate-800 ml-2">
-                                    {item.files.map((f, fIdx) => (
-                                      <div
-                                        key={`${f.relativePath}-${fIdx}`}
-                                        className="text-[11px] text-slate-400 flex items-center justify-between pr-2 font-mono"
-                                      >
-                                        <span className="truncate">{f.relativePath}</span>
-                                        <span className="text-slate-500 shrink-0 ml-2">
-                                          {formatBytes(f.size)}
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
+                        <Github className="w-4 h-4" />
                       )}
-
-                      {rootScan.items.length > 0 && (
-                        <button
-                          type="button"
-                          disabled={isSyncingFolder || selectedSyncIndices.size === 0}
-                          onClick={handleSyncRootFolder}
-                          className="w-full py-3 px-5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/20 cursor-pointer"
-                        >
-                          {isSyncingFolder ? (
-                            <>
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                              Syncing Folder Images to {selectedRepo.full_name}...
-                            </>
-                          ) : (
-                            <>
-                              <FolderSync className="w-4 h-4" />
-                              Sync Folder — Create & Upload {selectedSyncIndices.size}{' '}
-                              Image{selectedSyncIndices.size === 1 ? '' : 's'} to Repo
-                              Packages
-                            </>
-                          )}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* ==================== TAB 3: REPO PACKAGES (VIEW, DOWNLOAD, REMOVE) ==================== */}
-              {activeTab === 'packages' && (
-                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 sm:p-6 space-y-5">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-base font-bold text-white flex items-center gap-2">
-                        <Layers className="w-5 h-5 text-indigo-400" />
-                        Packages in {selectedRepo.full_name}
-                      </h3>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        Inspect files inside any image, download & extract original files,
-                        or remove packages from GitHub.
-                      </p>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      {otherPackages.length > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => setShowOtherPackages(!showOtherPackages)}
-                          className="px-3 py-1.5 rounded-xl bg-slate-950 hover:bg-slate-800 text-xs text-slate-300 border border-slate-800 cursor-pointer"
-                        >
-                          {showOtherPackages
-                            ? 'Hide other owner packages'
-                            : `Show ${otherPackages.length} other account package(s)`}
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        disabled={packagesLoading}
-                        onClick={refreshPackages}
-                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-white flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <RefreshCw
-                          className={`w-3.5 h-3.5 ${
-                            packagesLoading ? 'animate-spin' : ''
-                          }`}
-                        />
-                        Refresh
-                      </button>
-                    </div>
+                      Sign In
+                    </button>
                   </div>
+                </div>
 
-                  {actionBanner && (
-                    <div
-                      className={`p-3.5 rounded-xl border text-xs flex items-center justify-between gap-2 ${
-                        actionBanner.type === 'success'
-                          ? 'bg-emerald-950/60 border-emerald-800 text-emerald-200'
-                          : 'bg-rose-950/60 border-rose-800 text-rose-200'
-                      }`}
-                    >
-                      <span>{actionBanner.text}</span>
-                      <button
-                        type="button"
-                        onClick={() => setActionBanner(null)}
-                        className="text-slate-400 hover:text-white cursor-pointer"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    </div>
-                  )}
-
-                  {packagesError && (
-                    <div className="p-3.5 rounded-xl bg-rose-950/60 border border-rose-800 text-rose-200 text-xs">
-                      {packagesError}
-                    </div>
-                  )}
-
-                  {/* Delete Confirmation Modal */}
-                  {confirmDeletePkg && (
-                    <div className="p-4 rounded-xl bg-rose-950/50 border border-rose-700/80 flex flex-wrap items-center justify-between gap-3">
-                      <div className="text-xs text-rose-100">
-                        Are you sure you want to permanently remove package{' '}
-                        <strong className="font-mono">{confirmDeletePkg.name}</strong> from
-                        GitHub Packages?
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDeletePkg(null)}
-                          className="px-3 py-1.5 rounded-lg bg-slate-800 text-xs text-slate-200 cursor-pointer"
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDeletePackageConfirmed(confirmDeletePkg)}
-                          className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-white cursor-pointer"
-                        >
-                          Confirm Remove
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {packagesLoading ? (
-                    <div className="p-12 flex flex-col items-center justify-center text-slate-400 gap-2">
-                      <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                      <span className="text-xs">Loading packages from GitHub...</span>
-                    </div>
-                  ) : repoPackages.length === 0 && !showOtherPackages ? (
-                    <div className="p-10 rounded-xl bg-slate-950/70 border border-slate-800 text-center space-y-2">
-                      <Package className="w-8 h-8 text-slate-600 mx-auto" />
-                      <div className="text-sm font-semibold text-slate-300">
-                        No packages linked to {selectedRepo.full_name} yet
-                      </div>
-                      <p className="text-xs text-slate-500 max-w-md mx-auto">
-                        Use the &quot;Upload File(s)&quot; or &quot;Sync Root Folder&quot;
-                        tabs to create and push your first container package image.
-                      </p>
-                    </div>
+                {/* Saved Personal Access Tokens List (Outside, directly below PAT textbox) */}
+                <div className="pt-2 border-t border-[#30363d]">
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block mb-2">
+                    Saved Personal Access Tokens:
+                  </span>
+                  {savedPats.length === 0 ? (
+                    <p className="text-xs text-gray-500 italic p-3 border border-dashed border-[#30363d] rounded-md text-center">
+                      No saved tokens yet. Sign in above and your token will be saved here as &lt;username&gt;/ghp_••••xxxx.
+                    </p>
                   ) : (
-                    <div className="space-y-3">
-                      {[
-                        ...repoPackages,
-                        ...(showOtherPackages ? otherPackages : []),
-                      ].map((pkg) => {
-                        const details = inspectedManifests[pkg.name];
-                        const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}:latest`;
+                    <div className="space-y-2 max-h-48 overflow-y-auto">
+                      {savedPats.map((entry, idx) => {
+                        const isEditing = editingPatIndex === idx;
+                        const displayTag = entry.customName
+                          ? `${entry.username}/${entry.customName}`
+                          : `${entry.username}/${entry.maskedSuffix}`;
 
                         return (
                           <div
-                            key={pkg.id}
-                            className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3"
+                            key={`${entry.username}-${entry.maskedSuffix}-${idx}`}
+                            onClick={() =>
+                              !isEditing &&
+                              handleSignInWithToken(entry.token, { source: 'pat' })
+                            }
+                            className="flex items-center justify-between p-2.5 rounded-md border border-[#30363d] bg-[#0d1117] hover:border-gray-500 cursor-pointer text-xs transition-all"
                           >
-                            <div className="flex flex-wrap items-start justify-between gap-3">
-                              <div className="space-y-1">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <Package className="w-4 h-4 text-indigo-400" />
-                                  <span className="text-sm font-bold text-white font-mono">
-                                    {pkg.name}
-                                  </span>
-                                  <span
-                                    className={`text-[10px] px-2 py-0.5 rounded-full border ${
-                                      pkg.visibility === 'private'
-                                        ? 'bg-amber-950/60 border-amber-800/60 text-amber-300'
-                                        : 'bg-emerald-950/60 border-emerald-800/60 text-emerald-300'
-                                    }`}
-                                  >
-                                    {pkg.visibility === 'private' && (
-                                      <Lock className="w-2.5 h-2.5 inline mr-1" />
-                                    )}
-                                    {pkg.visibility}
-                                  </span>
-                                  {pkg.repository && (
-                                    <span className="text-[11px] text-slate-400">
-                                      Linked to{' '}
-                                      <strong className="text-slate-300">
-                                        {pkg.repository.full_name}
-                                      </strong>
-                                    </span>
-                                  )}
-                                </div>
-
-                                <div className="flex items-center gap-2 text-[11px] text-slate-500 font-mono">
-                                  <span>{pullCmd}</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => copyToClipboard(pullCmd)}
-                                    className="text-slate-400 hover:text-indigo-400 cursor-pointer"
-                                    title="Copy docker pull command"
-                                  >
-                                    {copiedText === pullCmd ? (
-                                      <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                    ) : (
-                                      <Copy className="w-3.5 h-3.5" />
-                                    )}
-                                  </button>
-                                </div>
-                              </div>
-
-                              {/* Package Actions: Inspect, Download, Remove */}
-                              <div className="flex items-center gap-2 flex-wrap">
+                            {isEditing ? (
+                              <div
+                                className="flex items-center gap-1.5 flex-1 min-w-0 mr-2"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <span className="text-xs font-mono text-gray-400 shrink-0">
+                                  {entry.username}/
+                                </span>
+                                <input
+                                  type="text"
+                                  value={editingPatNameInput}
+                                  onChange={(e) =>
+                                    setEditingPatNameInput(e.target.value)
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      handleRenamePat(entry.token, editingPatNameInput);
+                                    }
+                                    if (e.key === 'Escape') {
+                                      setEditingPatIndex(null);
+                                    }
+                                  }}
+                                  placeholder={entry.maskedSuffix}
+                                  autoFocus
+                                  className="flex-1 bg-[#161b22] border border-[#30363d] rounded px-2 py-1 text-xs text-gray-200 focus:outline-none"
+                                />
                                 <button
                                   type="button"
-                                  disabled={inspectingPkgName === pkg.name}
-                                  onClick={() => handleInspectPackage(pkg.name)}
-                                  className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 cursor-pointer"
+                                  onClick={() =>
+                                    handleRenamePat(entry.token, editingPatNameInput)
+                                  }
+                                  className="p-1 btn-saved-action transition-colors cursor-pointer"
+                                  title="Save name"
                                 >
-                                  {inspectingPkgName === pkg.name ? (
-                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                  ) : (
-                                    <Info className="w-3.5 h-3.5 text-indigo-400" />
-                                  )}
-                                  Inspect Files
+                                  <Check className="w-3.5 h-3.5 rename-check-icon" />
                                 </button>
-
                                 <button
                                   type="button"
-                                  disabled={downloadingPkgName === pkg.name}
-                                  onClick={() => handleDownloadPackage(pkg.name)}
-                                  className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
+                                  onClick={() => setEditingPatIndex(null)}
+                                  className="p-1 btn-saved-action transition-colors cursor-pointer"
+                                  title="Cancel"
                                 >
-                                  {downloadingPkgName === pkg.name ? (
-                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                  ) : (
-                                    <Download className="w-3.5 h-3.5" />
-                                  )}
-                                  Download & Extract
-                                </button>
-
-                                <button
-                                  type="button"
-                                  disabled={deletingPkgName === pkg.name}
-                                  onClick={() => setConfirmDeletePkg(pkg)}
-                                  className="p-1.5 rounded-lg bg-slate-900 hover:bg-rose-950 border border-slate-800 hover:border-rose-800 text-slate-400 hover:text-rose-400 transition cursor-pointer"
-                                  title="Remove package from GitHub"
-                                >
-                                  {deletingPkgName === pkg.name ? (
-                                    <Loader2 className="w-4 h-4 animate-spin" />
-                                  ) : (
-                                    <Trash2 className="w-4 h-4" />
-                                  )}
+                                  <X className="w-3.5 h-3.5" />
                                 </button>
                               </div>
-                            </div>
-
-                            {/* Inspected OCI Manifest Details */}
-                            {details && (
-                              <div className="mt-3 pt-3 border-t border-slate-800/80 space-y-2 text-xs">
-                                <div className="flex flex-wrap gap-4 text-slate-400">
-                                  <span>
-                                    Original Name:{' '}
-                                    <strong className="text-slate-200">
-                                      {details.originalName}
-                                    </strong>
+                            ) : (
+                              <div className="flex items-center gap-2 truncate flex-1 min-w-0">
+                                <span className="w-2 h-2 rounded-full shrink-0 saved-item-dot"></span>
+                                <span className="font-semibold font-mono text-xs saved-item-name truncate">
+                                  {displayTag}
+                                </span>
+                                {entry.customName && (
+                                  <span className="text-[11px] font-mono text-gray-500 truncate">
+                                    ({entry.maskedSuffix})
                                   </span>
-                                  <span>
-                                    Mode:{' '}
-                                    <strong className="text-indigo-300">
-                                      {details.mode}
-                                    </strong>
-                                  </span>
-                                  <span>
-                                    Files:{' '}
-                                    <strong className="text-slate-200">
-                                      {details.fileCount}
-                                    </strong>
-                                  </span>
-                                  <span>
-                                    Layer Size:{' '}
-                                    <strong className="text-slate-200">
-                                      {formatBytes(details.compressedSize)}
-                                    </strong>{' '}
-                                    (Uncompressed:{' '}
-                                    {formatBytes(details.totalUncompressedBytes)})
-                                  </span>
-                                </div>
-
-                                {details.files.length > 0 && (
-                                  <div className="bg-slate-900/90 rounded-lg p-2.5 border border-slate-800 max-h-40 overflow-y-auto space-y-1">
-                                    <div className="text-[11px] font-semibold text-slate-400 mb-1">
-                                      Files inside image layer:
-                                    </div>
-                                    {details.files.map((f, i) => (
-                                      <div
-                                        key={`${f.path}-${i}`}
-                                        className="flex items-center justify-between text-[11px] font-mono text-slate-300"
-                                      >
-                                        <span className="truncate">{f.path}</span>
-                                        <span className="text-slate-500 shrink-0 ml-2">
-                                          {formatBytes(f.size)}
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
                                 )}
                               </div>
                             )}
+
+                            <div className="flex items-center gap-1 shrink-0 ml-2">
+                              {!isEditing && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingPatIndex(idx);
+                                    setEditingPatNameInput(entry.customName || '');
+                                  }}
+                                  className="p-1 btn-saved-action text-gray-500 transition-colors cursor-pointer"
+                                  title="Rename token"
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeletePat(entry.token);
+                                }}
+                                className="p-1 hover:text-red-400 text-gray-500 transition-colors cursor-pointer"
+                                title="Delete saved token"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </div>
                         );
                       })}
                     </div>
                   )}
                 </div>
-              )}
-            </>
-          )}
+              </div>
+            ) : (
+              <div className="space-y-5">
+                <p className="text-xs text-gray-400 leading-relaxed">
+                  Sign in via browser code using a GitHub OAuth App Client ID (with
+                  Device Flow enabled in your GitHub OAuth App settings).
+                </p>
+
+                <div>
+                  <label className="block text-xs font-semibold text-gray-300 mb-1.5">
+                    GitHub OAuth App Client ID
+                  </label>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      type="text"
+                      value={oauthClientId}
+                      onChange={(e) => setOauthClientId(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          handleStartDeviceFlowWithClientId(oauthClientId);
+                        }
+                      }}
+                      placeholder="Iv1.xxxxxxxxxxxxxxxx or Ov23lixxxxxxxxx"
+                      className="flex-1 px-3.5 py-2.5 rounded-md bg-[#0d1117] border border-[#30363d] text-sm text-white focus:outline-none font-mono"
+                    />
+                    {!deviceFlowInfo && (
+                      <button
+                        type="button"
+                        disabled={authLoading || !oauthClientId.trim()}
+                        onClick={() =>
+                          handleStartDeviceFlowWithClientId(oauthClientId)
+                        }
+                        className="py-2.5 px-4 rounded-md bg-blue-600 font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer shrink-0"
+                      >
+                        {authLoading ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Github className="w-4 h-4" />
+                        )}
+                        Get Login Code
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {deviceFlowInfo && (
+                  <div className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-3">
+                    <div className="text-xs text-gray-400">
+                      Enter this code on GitHub to authorize:
+                    </div>
+                    <div className="text-2xl font-mono font-bold tracking-widest text-white bg-[#161b22] py-2 px-4 rounded-md inline-block border border-[#30363d]">
+                      {deviceFlowInfo.user_code}
+                    </div>
+                    <div>
+                      <a
+                        href={deviceFlowInfo.verification_uri}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-white bg-blue-600 px-3.5 py-2 rounded-md"
+                      >
+                        Open {deviceFlowInfo.verification_uri}
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                    <div className="flex items-center justify-center gap-2 text-xs text-gray-400 pt-1">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
+                      Waiting for authorization in browser...
+                    </div>
+                  </div>
+                )}
+
+                {/* Saved OAuth App Client IDs List (Outside, directly below Client ID textbox) */}
+                <div className="pt-2 border-t border-[#30363d]">
+                  <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block mb-2">
+                    Saved OAuth Client IDs:
+                  </span>
+                  {savedOAuths.length === 0 ? (
+                    <p className="text-xs text-gray-500 italic p-3 border border-dashed border-[#30363d] rounded-md text-center">
+                      No saved OAuth Client IDs yet. Authorize above and your Client ID will be saved here as &lt;username&gt;/Ov23••••xxxx.
+                    </p>
+                  ) : (
+                    <div className="space-y-2 max-h-48 overflow-y-auto">
+                      {savedOAuths.map((entry, idx) => {
+                        const isEditing = editingOAuthIndex === idx;
+                        const displayTag = entry.customName
+                          ? `${entry.username}/${entry.customName}`
+                          : `${entry.username}/${entry.maskedSuffix}`;
+
+                        return (
+                          <div
+                            key={`${entry.username}-${entry.clientId}-${idx}`}
+                            onClick={() =>
+                              !isEditing && handleSelectSavedOAuth(entry)
+                            }
+                            className="flex items-center justify-between p-2.5 rounded-md border border-[#30363d] bg-[#0d1117] hover:border-gray-500 cursor-pointer text-xs transition-all"
+                          >
+                            {isEditing ? (
+                              <div
+                                className="flex items-center gap-1.5 flex-1 min-w-0 mr-2"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <span className="text-xs font-mono text-gray-400 shrink-0">
+                                  {entry.username}/
+                                </span>
+                                <input
+                                  type="text"
+                                  value={editingOAuthNameInput}
+                                  onChange={(e) =>
+                                    setEditingOAuthNameInput(e.target.value)
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      handleRenameOAuth(
+                                        entry.clientId,
+                                        editingOAuthNameInput
+                                      );
+                                    }
+                                    if (e.key === 'Escape') {
+                                      setEditingOAuthIndex(null);
+                                    }
+                                  }}
+                                  placeholder={entry.maskedSuffix}
+                                  autoFocus
+                                  className="flex-1 bg-[#161b22] border border-[#30363d] rounded px-2 py-1 text-xs text-gray-200 focus:outline-none"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleRenameOAuth(
+                                      entry.clientId,
+                                      editingOAuthNameInput
+                                    )
+                                  }
+                                  className="p-1 btn-saved-action transition-colors cursor-pointer"
+                                  title="Save name"
+                                >
+                                  <Check className="w-3.5 h-3.5 rename-check-icon" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingOAuthIndex(null)}
+                                  className="p-1 btn-saved-action transition-colors cursor-pointer"
+                                  title="Cancel"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2 truncate flex-1 min-w-0">
+                                <span className="w-2 h-2 rounded-full shrink-0 saved-item-dot"></span>
+                                <span className="font-semibold font-mono text-xs saved-item-name truncate">
+                                  {displayTag}
+                                </span>
+                                {entry.customName && (
+                                  <span className="text-[11px] font-mono text-gray-500 truncate">
+                                    ({entry.maskedSuffix})
+                                  </span>
+                                )}
+                              </div>
+                            )}
+
+                            <div className="flex items-center gap-1 shrink-0 ml-2">
+                              {!isEditing && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingOAuthIndex(idx);
+                                    setEditingOAuthNameInput(entry.customName || '');
+                                  }}
+                                  className="p-1 btn-saved-action text-gray-500 transition-colors cursor-pointer"
+                                  title="Rename Client ID"
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteOAuth(entry.clientId);
+                                }}
+                                className="p-1 hover:text-red-400 text-gray-500 transition-colors cursor-pointer"
+                                title="Delete saved Client ID"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
         </main>
-      </div>
+      ) : (
+        /* ==================== AUTHENTICATED WORKSPACE ==================== */
+        <>
+          <TabNav
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            packageCount={repoPackages.length}
+            isDesktop={isDesktopEnv}
+          />
+
+          <main className="w-full max-w-4xl relative z-10 space-y-6">
+            {/* Compact Repository Selector Card */}
+            <div
+              className="bg-[#161b22] border border-[#30363d] rounded-xl p-4 sm:p-5 shadow-md"
+              ref={repoDropdownRef}
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="relative flex-1 sm:w-80">
+                    <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-400 mb-1">
+                      Target GitHub Repository ({repos.length})
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowRepoDropdown(!showRepoDropdown)}
+                      className="w-full px-3.5 py-2 rounded-md bg-[#0d1117] border border-[#30363d] text-left text-xs font-semibold text-white flex items-center justify-between gap-2 cursor-pointer"
+                    >
+                      <span className="truncate">
+                        {selectedRepo
+                          ? selectedRepo.full_name
+                          : 'Select a repository...'}
+                      </span>
+                      <ChevronDown className="w-4 h-4 text-gray-400 shrink-0" />
+                    </button>
+
+                    {showRepoDropdown && (
+                      <div className="absolute left-0 top-full mt-1.5 w-full sm:w-96 bg-[#161b22] border border-[#30363d] rounded-md shadow-2xl z-40 overflow-hidden">
+                        <div className="p-2 border-b border-[#30363d] bg-[#0d1117]">
+                          <div className="relative">
+                            <Search className="w-3.5 h-3.5 text-gray-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                            <input
+                              type="text"
+                              value={repoSearch}
+                              onChange={(e) => setRepoSearch(e.target.value)}
+                              placeholder="Filter repositories..."
+                              autoFocus
+                              className="w-full pl-8 pr-3 py-1.5 rounded bg-[#161b22] border border-[#30363d] text-xs text-white focus:outline-none"
+                            />
+                          </div>
+                        </div>
+                        <div className="max-h-64 overflow-y-auto divide-y divide-[#30363d]">
+                          {filteredRepos.length === 0 ? (
+                            <div className="p-4 text-center text-xs text-gray-500">
+                              No matching repositories.
+                            </div>
+                          ) : (
+                            filteredRepos.map((repo) => {
+                              const isSelected = selectedRepo?.id === repo.id;
+                              return (
+                                <button
+                                  key={repo.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedRepo(repo);
+                                    setShowRepoDropdown(false);
+                                  }}
+                                  className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 cursor-pointer transition ${
+                                    isSelected
+                                      ? 'active-variant font-bold'
+                                      : 'hover:bg-[#21262d] text-gray-300'
+                                  }`}
+                                >
+                                  <div className="min-w-0">
+                                    <div className="truncate">{repo.full_name}</div>
+                                    {repo.description && (
+                                      <div className="text-[11px] text-gray-500 truncate">
+                                        {repo.description}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
+                                    {repo.private ? 'Private' : 'Public'}
+                                  </span>
+                                </button>
+                              );
+                            })
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {selectedRepo && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <a
+                      href={`${selectedRepo.html_url}/packages`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5"
+                    >
+                      View Repo Packages on GitHub
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleSignInWithToken(authToken, { source: 'restore' })
+                      }
+                      title="Refresh repositories"
+                      className="btn-modal-action p-2 rounded-md cursor-pointer"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${
+                          reposLoading ? 'animate-spin' : ''
+                        }`}
+                      />
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {selectedRepo && (
+              <>
+                {/* ==================== TAB 1: UPLOAD FILE(S) ==================== */}
+                {activeTab === 'upload-files' && (
+                  <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-6">
+                    <div>
+                      <h3 className="text-base font-bold text-white flex items-center gap-2">
+                        <FilePlus2 className="w-5 h-5 icon-upload" />
+                        Upload Single or Multiple Files as an Image
+                      </h3>
+                      <p className="text-xs text-gray-400 mt-1">
+                        Select file(s) to package into an OCI container image and push to{' '}
+                        <span className="text-white font-semibold">
+                          {selectedRepo.full_name}
+                        </span>
+                        .
+                      </p>
+                    </div>
+
+                    {/* File Dropzone */}
+                    <div
+                      onDragEnter={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        fileDragCounter.current += 1;
+                        if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+                          setIsDraggingFiles(true);
+                        }
+                      }}
+                      onDragLeave={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        fileDragCounter.current -= 1;
+                        if (fileDragCounter.current <= 0) {
+                          fileDragCounter.current = 0;
+                          setIsDraggingFiles(false);
+                        }
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.dataTransfer.dropEffect = 'copy';
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        fileDragCounter.current = 0;
+                        setIsDraggingFiles(false);
+                        if (e.dataTransfer.files?.length) {
+                          handleFilesAdded(e.dataTransfer.files);
+                        }
+                      }}
+                      onClick={() => fileInputRef.current?.click()}
+                      className={`dropzone-container rounded-xl p-8 text-center transition cursor-pointer select-none ${
+                        isDraggingFiles ? 'is-drag-over' : ''
+                      }`}
+                    >
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={(e) => {
+                          if (e.target.files) {
+                            handleFilesAdded(e.target.files);
+                            e.target.value = '';
+                          }
+                        }}
+                      />
+                      <Upload className="w-8 h-8 icon-upload mx-auto mb-2.5 dropzone-icon transition-transform pointer-events-none" />
+                      <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
+                        {isDraggingFiles
+                          ? 'Drop file(s) here to select'
+                          : 'Click to choose file(s) or drag & drop here'}
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1 pointer-events-none">
+                        Select 1 file or multiple files from your device
+                      </div>
+                    </div>
+
+                    {/* Picked Files List */}
+                    {pickedFiles.length > 0 && (
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-semibold text-gray-300">
+                            Selected Files ({pickedFiles.length}) — Total:{' '}
+                            {formatBytes(
+                              pickedFiles.reduce((acc, f) => acc + f.size, 0)
+                            )}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPickedFiles([]);
+                              setCustomImageName('');
+                            }}
+                            className="text-xs text-gray-400 hover:text-white cursor-pointer"
+                          >
+                            Clear all
+                          </button>
+                        </div>
+
+                        <div className="max-h-48 overflow-y-auto divide-y divide-[#30363d] bg-[#0d1117] rounded-md border border-[#30363d]">
+                          {pickedFiles.map((file, idx) => (
+                            <div
+                              key={`${file.name}-${idx}`}
+                              className="px-3.5 py-2 flex items-center justify-between gap-2 text-xs"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <FileIcon className="w-4 h-4 icon-upload shrink-0" />
+                                <span className="truncate text-white font-medium">
+                                  {file.name}
+                                </span>
+                                <span className="text-gray-500 shrink-0">
+                                  ({formatBytes(file.size)})
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleRemovePickedFile(idx)}
+                                className="modal-close-btn p-1"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Image / Package Name Input */}
+                    {pickedFiles.length > 0 && (
+                      <div className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-4">
+                        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                          <div className="sm:col-span-3">
+                            <label className="block text-xs font-semibold text-gray-200 mb-1">
+                              Image & Package Name{' '}
+                              {pickedFiles.length > 1 ? (
+                                <span className="text-gray-400 font-normal">
+                                  (Required for multiple files)
+                                </span>
+                              ) : (
+                                <span className="text-gray-400 font-normal">
+                                  (Defaults to file name — edit if you want another name)
+                                </span>
+                              )}
+                            </label>
+                            <input
+                              type="text"
+                              value={customImageName}
+                              onChange={(e) => setCustomImageName(e.target.value)}
+                              placeholder={
+                                pickedFiles.length === 1
+                                  ? pickedFiles[0].name
+                                  : 'Enter a name for this multi-file image (e.g. release-bundle)'
+                              }
+                              className="w-full px-3.5 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white focus:outline-none"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-xs font-semibold text-gray-200 mb-1">
+                              Tag
+                            </label>
+                            <input
+                              type="text"
+                              value={imageTag}
+                              onChange={(e) => setImageTag(e.target.value)}
+                              placeholder="latest"
+                              className="w-full px-3 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white font-mono focus:outline-none"
+                            />
+                          </div>
+                        </div>
+
+                        {fileNamingValidation.valid ? (
+                          <div className="flex flex-wrap items-center gap-2 text-xs bg-[#161b22] px-3.5 py-2.5 rounded-md border border-[#30363d]">
+                            <span className="text-gray-400 shrink-0">
+                              Resulting Package & Image Name:
+                            </span>
+                            <code className="text-white font-mono font-semibold break-all">
+                              ghcr.io/{selectedRepo.owner.login.toLowerCase()}/
+                              {fileNamingValidation.ociPackageName}:
+                              {imageTag.trim() || 'latest'}
+                            </code>
+                          </div>
+                        ) : (
+                          <div className="text-xs text-gray-400 flex items-center gap-1.5">
+                            <Info className="w-4 h-4 shrink-0" />
+                            {fileNamingValidation.error}
+                          </div>
+                        )}
+
+                        {uploadError && (
+                          <div className="p-3 rounded-md theme-error-banner text-xs flex items-start gap-2">
+                            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                            <span>{uploadError}</span>
+                          </div>
+                        )}
+
+                        {uploadProgress && (
+                          <div className="space-y-1.5">
+                            <div className="flex justify-between text-xs text-gray-300">
+                              <span>{uploadProgress.message}</span>
+                              <span>{uploadProgress.percent}%</span>
+                            </div>
+                            <div className="w-full h-2 bg-[#161b22] rounded-full overflow-hidden border border-[#30363d]">
+                              <div
+                                className="h-full tab-indicator transition-all duration-300"
+                                style={{ width: `${uploadProgress.percent}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        {uploadSuccess && (
+                          <div className="p-3.5 rounded-md theme-success-banner text-xs flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <CheckCircle2 className="w-4 h-4 shrink-0" />
+                              <div>
+                                <span className="font-semibold">
+                                  Package &quot;{uploadSuccess.packageName}&quot; uploaded!
+                                </span>{' '}
+                                ({uploadSuccess.fileCount} file(s), compressed size{' '}
+                                {formatBytes(uploadSuccess.compressedSize)})
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setActiveTab('packages')}
+                              className="btn-modal-action px-2.5 py-1 rounded-md font-medium shrink-0 cursor-pointer"
+                            >
+                              View in Packages →
+                            </button>
+                          </div>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={!fileNamingValidation.valid || !!uploadProgress}
+                          onClick={handleUploadSelectedFiles}
+                          className="w-full py-2.5 px-4 rounded-md bg-blue-600 font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          {uploadProgress ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              Building & Uploading OCI Image...
+                            </>
+                          ) : (
+                            <>
+                              <Upload className="w-4 h-4" />
+                              Create Image &quot;
+                              {fileNamingValidation.ociPackageName || '...'}&quot; &
+                              Upload to Repo Packages
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ==================== TAB 2: SYNC ROOT FOLDER (DESKTOP) ==================== */}
+                {activeTab === 'sync-folder' && (
+                  <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-6">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div>
+                        <h3 className="text-base font-bold text-white flex items-center gap-2">
+                          <FolderSync className="w-5 h-5 icon-sync" />
+                          Root Folder Auto-Image Sync (Windows, Linux, macOS)
+                        </h3>
+                        <p className="text-xs text-gray-400 mt-1">
+                          Choose a root folder on your computer and press{' '}
+                          <span className="text-white font-semibold">Sync Folder</span>.
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <input
+                          ref={fallbackFolderInputRef}
+                          type="file"
+                          // @ts-expect-error webkitdirectory is standard across desktop browsers
+                          webkitdirectory="true"
+                          directory="true"
+                          multiple
+                          className="hidden"
+                          onChange={handleFallbackWebkitDirectory}
+                        />
+                        {rootScan && (
+                          <button
+                            type="button"
+                            disabled={isSyncingFolder}
+                            onClick={handleRescanRootFolder}
+                            className="btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            Rescan
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={isSyncingFolder}
+                          onClick={handlePickRootFolder}
+                          className="px-4 py-2 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-2 cursor-pointer"
+                        >
+                          <Folder className="w-4 h-4" />
+                          {rootScan ? 'Change Root Folder' : 'Choose Root Folder'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {syncError && (
+                      <div className="p-3.5 rounded-md theme-error-banner text-xs flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>{syncError}</span>
+                      </div>
+                    )}
+
+                    {!rootScan ? (
+                      <div
+                        onClick={handlePickRootFolder}
+                        className="border-2 border-dashed border-[#30363d] hover:border-gray-500 bg-[#0d1117] rounded-xl p-10 text-center transition cursor-pointer"
+                      >
+                        <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3" />
+                        <div className="text-sm font-semibold text-white">
+                          Select a Root Folder to Scan
+                        </div>
+                        <p className="text-xs text-gray-500 max-w-md mx-auto mt-1">
+                          Detects all direct files and immediate sub-folders and prepares
+                          an OCI package image for each one.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-[#0d1117] px-4 py-3 rounded-md border border-[#30363d]">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Folder className="w-4 h-4 icon-sync shrink-0" />
+                            <span className="text-xs text-gray-400">Root Folder:</span>
+                            <code className="text-xs text-white font-mono truncate">
+                              {rootScan.rootFolderPath}
+                            </code>
+                          </div>
+                          <div className="flex items-center gap-3 text-xs">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSelectedSyncIndices(
+                                  new Set(rootScan.items.map((_, i) => i))
+                                )
+                              }
+                              className="text-gray-300 hover:text-white font-semibold cursor-pointer"
+                            >
+                              Select All ({rootScan.items.length})
+                            </button>
+                            <span className="text-gray-600">|</span>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedSyncIndices(new Set())}
+                              className="text-gray-400 hover:text-gray-200 cursor-pointer"
+                            >
+                              None
+                            </button>
+                          </div>
+                        </div>
+
+                        {rootScan.items.length === 0 ? (
+                          <div className="p-8 text-center text-xs text-gray-500 bg-[#0d1117] rounded-md border border-[#30363d]">
+                            The selected root folder is empty. Add files or sub-folders
+                            and click Rescan.
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-[#30363d] bg-[#0d1117] rounded-md border border-[#30363d] overflow-hidden">
+                            {rootScan.items.map((item, idx) => {
+                              const ociName = toOciImageName(item.name);
+                              const isChecked = selectedSyncIndices.has(idx);
+                              const isExpanded = expandedSubfolders.has(idx);
+                              const status = syncStatuses[idx];
+
+                              return (
+                                <div
+                                  key={`${item.kind}-${item.name}-${idx}`}
+                                  className="p-3.5"
+                                >
+                                  <div className="flex flex-wrap items-center justify-between gap-3">
+                                    <div className="flex items-center gap-3 min-w-0">
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        disabled={isSyncingFolder}
+                                        onChange={() => {
+                                          const next = new Set(selectedSyncIndices);
+                                          if (next.has(idx)) next.delete(idx);
+                                          else next.add(idx);
+                                          setSelectedSyncIndices(next);
+                                        }}
+                                        className="custom-checkbox shrink-0"
+                                      />
+
+                                      {item.kind === 'root-file' ? (
+                                        <FileIcon className="w-4 h-4 icon-upload shrink-0" />
+                                      ) : (
+                                        <Folder className="w-4 h-4 icon-sync shrink-0" />
+                                      )}
+
+                                      <div className="min-w-0">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                          <span className="text-xs font-semibold text-white">
+                                            {item.name}
+                                          </span>
+                                          <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
+                                            {item.kind === 'root-file'
+                                              ? 'Root File → 1 Image'
+                                              : `Sub-folder (${item.files.length} file${
+                                                  item.files.length === 1 ? '' : 's'
+                                                }) → 1 Image`}
+                                          </span>
+                                          <span className="text-xs text-gray-500">
+                                            ({formatBytes(item.size)})
+                                          </span>
+                                        </div>
+
+                                        <div className="text-[11px] text-gray-400 font-mono mt-0.5">
+                                          Package / Image:{' '}
+                                          <span className="text-white font-semibold">
+                                            {ociName}
+                                          </span>
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-2">
+                                      {status?.state === 'uploading' && (
+                                        <span className="text-xs text-gray-300 flex items-center gap-1.5">
+                                          <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
+                                          {status.percent ?? 0}%
+                                        </span>
+                                      )}
+                                      {status?.state === 'done' && (
+                                        <span className="text-xs status-badge-valid px-2 py-0.5 rounded flex items-center gap-1 font-medium">
+                                          <CheckCircle2 className="w-3.5 h-3.5" />
+                                          Synced
+                                        </span>
+                                      )}
+                                      {status?.state === 'error' && (
+                                        <span
+                                          title={status.message}
+                                          className="text-xs status-badge-error px-2 py-0.5 rounded flex items-center gap-1"
+                                        >
+                                          <AlertCircle className="w-3.5 h-3.5" />
+                                          Failed
+                                        </span>
+                                      )}
+
+                                      {item.kind === 'root-subfolder' && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const next = new Set(expandedSubfolders);
+                                            if (next.has(idx)) next.delete(idx);
+                                            else next.add(idx);
+                                            setExpandedSubfolders(next);
+                                          }}
+                                          className="btn-modal-action text-xs px-2 py-1 rounded flex items-center gap-1 cursor-pointer"
+                                        >
+                                          {isExpanded ? (
+                                            <ChevronDown className="w-3.5 h-3.5" />
+                                          ) : (
+                                            <ChevronRight className="w-3.5 h-3.5" />
+                                          )}
+                                          Files
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {status?.state === 'error' && status.message && (
+                                    <div className="mt-2 text-[11px] theme-error-banner px-3 py-1.5 rounded">
+                                      {status.message}
+                                    </div>
+                                  )}
+
+                                  {item.kind === 'root-subfolder' && isExpanded && (
+                                    <div className="mt-3 pl-7 space-y-1 max-h-40 overflow-y-auto border-l border-[#30363d] ml-2">
+                                      {item.files.map((f, fIdx) => (
+                                        <div
+                                          key={`${f.relativePath}-${fIdx}`}
+                                          className="text-[11px] text-gray-400 flex items-center justify-between pr-2 font-mono"
+                                        >
+                                          <span className="truncate">
+                                            {f.relativePath}
+                                          </span>
+                                          <span className="text-gray-500 shrink-0 ml-2">
+                                            {formatBytes(f.size)}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {rootScan.items.length > 0 && (
+                          <button
+                            type="button"
+                            disabled={isSyncingFolder || selectedSyncIndices.size === 0}
+                            onClick={handleSyncRootFolder}
+                            className="w-full py-3 px-5 rounded-md bg-blue-600 font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
+                          >
+                            {isSyncingFolder ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Syncing Folder Images to {selectedRepo.full_name}...
+                              </>
+                            ) : (
+                              <>
+                                <FolderSync className="w-4 h-4" />
+                                Sync Folder — Create & Upload {selectedSyncIndices.size}{' '}
+                                Image{selectedSyncIndices.size === 1 ? '' : 's'} to Repo
+                                Packages
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ==================== TAB 3: REPO PACKAGES ==================== */}
+                {activeTab === 'packages' && (
+                  <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-base font-bold text-white flex items-center gap-2">
+                          <Layers className="w-5 h-5 icon-packages" />
+                          Packages in {selectedRepo.full_name}
+                        </h3>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Search packages or files inside images, inspect layers, download &
+                          extract, or remove packages.
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {otherPackages.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowOtherPackages(!showOtherPackages)}
+                            className="btn-modal-action px-3 py-1.5 rounded-md text-xs cursor-pointer"
+                          >
+                            {showOtherPackages
+                              ? 'Hide other owner packages'
+                              : `Show ${otherPackages.length} other account package(s)`}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={packagesLoading}
+                          onClick={refreshPackages}
+                          className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${
+                              packagesLoading ? 'animate-spin' : ''
+                            }`}
+                          />
+                          Refresh
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Search Bar (Searches Package Names, Original Names, and Files Inside Images) */}
+                    {(repoPackages.length > 0 ||
+                      (showOtherPackages && otherPackages.length > 0)) && (
+                      <div className="relative">
+                        <Search className="w-4 h-4 text-gray-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={packageSearch}
+                          onChange={(e) => setPackageSearch(e.target.value)}
+                          placeholder="Search by package name or file name inside images (e.g. config.json, .pdf)..."
+                          className="w-full pl-10 pr-9 py-2 rounded-md bg-[#0d1117] border border-[#30363d] text-xs text-white focus:outline-none"
+                        />
+                        {packageSearch && (
+                          <button
+                            type="button"
+                            onClick={() => setPackageSearch('')}
+                            className="modal-close-btn absolute right-2.5 top-1/2 -translate-y-1/2 p-1"
+                            title="Clear search"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {actionBanner && (
+                      <div
+                        className={`p-3.5 rounded-md text-xs flex items-center justify-between gap-2 ${
+                          actionBanner.type === 'success'
+                            ? 'theme-success-banner'
+                            : 'theme-error-banner'
+                        }`}
+                      >
+                        <span>{actionBanner.text}</span>
+                        <button
+                          type="button"
+                          onClick={() => setActionBanner(null)}
+                          className="modal-close-btn p-1"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+
+                    {packagesError && (
+                      <div className="p-3.5 rounded-md theme-error-banner text-xs">
+                        {packagesError}
+                      </div>
+                    )}
+
+                    {confirmDeletePkg && (
+                      <div className="p-4 rounded-md theme-error-banner flex flex-wrap items-center justify-between gap-3">
+                        <div className="text-xs">
+                          Are you sure you want to permanently remove package{' '}
+                          <strong className="font-mono">{confirmDeletePkg.name}</strong>{' '}
+                          from GitHub Packages?
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeletePkg(null)}
+                            className="btn-modal-action px-3 py-1.5 rounded-md text-xs cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleDeletePackageConfirmed(confirmDeletePkg)
+                            }
+                            className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
+                          >
+                            Confirm Remove
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {packagesLoading ? (
+                      <div className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2">
+                        <Loader2 className="w-6 h-6 animate-spin theme-spinner" />
+                        <span className="text-xs">Loading packages from GitHub...</span>
+                      </div>
+                    ) : repoPackages.length === 0 && !showOtherPackages ? (
+                      <div className="p-10 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-2">
+                        <Package className="w-8 h-8 text-gray-500 mx-auto" />
+                        <div className="text-sm font-semibold text-gray-300">
+                          No packages linked to {selectedRepo.full_name} yet
+                        </div>
+                        <p className="text-xs text-gray-500 max-w-md mx-auto">
+                          Use the &quot;Upload File(s)&quot; or &quot;Sync Root
+                          Folder&quot; tabs to create and push your first container
+                          package image.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {[
+                          ...repoPackages,
+                          ...(showOtherPackages ? otherPackages : []),
+                        ]
+                          .filter((pkg) => {
+                            const q = packageSearch.trim().toLowerCase();
+                            if (!q) return true;
+                            const details = inspectedManifests[pkg.name];
+                            const nameMatch = pkg.name.toLowerCase().includes(q);
+                            const origMatch = details?.originalName
+                              ?.toLowerCase()
+                              .includes(q);
+                            const fileMatch = details?.files?.some((f) =>
+                              f.path.toLowerCase().includes(q)
+                            );
+                            return Boolean(nameMatch || origMatch || fileMatch);
+                          })
+                          .map((pkg) => {
+                            const details = inspectedManifests[pkg.name];
+                            const q = packageSearch.trim().toLowerCase();
+                            const hasMatchingInnerFile = Boolean(
+                              q &&
+                                details?.files?.some((f) =>
+                                  f.path.toLowerCase().includes(q)
+                                )
+                            );
+                            const isDetailsExpanded =
+                              expandedPackages.has(pkg.name) || hasMatchingInnerFile;
+                            const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}:latest`;
+                            const settingsUrl = `${pkg.html_url}/settings`;
+
+                            return (
+                              <div
+                                key={pkg.id}
+                                className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3"
+                              >
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Package className="w-4 h-4 icon-packages" />
+                                      <span className="text-sm font-bold text-white font-mono">
+                                        {pkg.name}
+                                      </span>
+                                      <span
+                                        className={`text-[10px] px-2 py-0.5 rounded border ${
+                                          pkg.visibility === 'private'
+                                            ? 'status-badge-warning'
+                                            : 'status-badge-valid'
+                                        }`}
+                                      >
+                                        {pkg.visibility === 'private' && (
+                                          <Lock className="w-2.5 h-2.5 inline mr-1" />
+                                        )}
+                                        {pkg.visibility}
+                                      </span>
+                                      <a
+                                        href={settingsUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
+                                        className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
+                                      >
+                                        Visibility Settings
+                                        <ExternalLink className="w-3 h-3" />
+                                      </a>
+                                    </div>
+
+                                    <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
+                                      <span>{pullCmd}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => copyToClipboard(pullCmd)}
+                                        className="text-gray-400 hover:text-white cursor-pointer"
+                                        title="Copy docker pull command"
+                                      >
+                                        {copiedText === pullCmd ? (
+                                          <Check className="w-3.5 h-3.5 rename-check-icon" />
+                                        ) : (
+                                          <Copy className="w-3.5 h-3.5" />
+                                        )}
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    {indexingPkgNames.has(pkg.name) && !details ? (
+                                      <button
+                                        type="button"
+                                        disabled
+                                        className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5"
+                                      >
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        Indexing...
+                                      </button>
+                                    ) : details?.needsManualLargeLayerLoad ? (
+                                      inspectingPkgName === pkg.name ? (
+                                        <div className="flex items-center gap-1.5">
+                                          <span className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5">
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                            Scanning ({inspectProgress}%)
+                                          </span>
+                                          <button
+                                            type="button"
+                                            onClick={handleCancelInspect}
+                                            className="btn-modal-action px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center gap-1 cursor-pointer"
+                                            title="Cancel scanning layer headers"
+                                          >
+                                            <X className="w-3.5 h-3.5" />
+                                            Cancel
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <button
+                                          type="button"
+                                          disabled={inspectingPkgName !== null}
+                                          onClick={() =>
+                                            handleLoadLargeExternalPackage(
+                                              pkg.name,
+                                              pkg.owner.login
+                                            )
+                                          }
+                                          className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                                          title="External image over 50 MB: click to stream file headers without loading full file contents into RAM"
+                                        >
+                                          <ChevronRight className="w-3.5 h-3.5" />
+                                          Load Files ({formatBytes(details.compressedSize)})
+                                        </button>
+                                      )
+                                    ) : details ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleTogglePackageFiles(pkg.name)}
+                                        className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                                      >
+                                        {isDetailsExpanded ? (
+                                          <ChevronDown className="w-3.5 h-3.5" />
+                                        ) : (
+                                          <ChevronRight className="w-3.5 h-3.5" />
+                                        )}
+                                        {isDetailsExpanded
+                                          ? 'Hide Files'
+                                          : `Files (${details.files.length})`}
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        disabled={inspectingPkgName !== null}
+                                        onClick={() =>
+                                          handleLoadLargeExternalPackage(
+                                            pkg.name,
+                                            pkg.owner.login
+                                          )
+                                        }
+                                        className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                                      >
+                                        {inspectingPkgName === pkg.name ? (
+                                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        ) : (
+                                          <ChevronRight className="w-3.5 h-3.5" />
+                                        )}
+                                        Load Files
+                                      </button>
+                                    )}
+
+                                    <button
+                                      type="button"
+                                      disabled={downloadingPkgName === pkg.name}
+                                      onClick={() => handleDownloadPackage(pkg.name)}
+                                      className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
+                                    >
+                                      {downloadingPkgName === pkg.name ? (
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                      ) : (
+                                        <Download className="w-3.5 h-3.5" />
+                                      )}
+                                      Download & Extract
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={deletingPkgName === pkg.name}
+                                      onClick={() => setConfirmDeletePkg(pkg)}
+                                      className="btn-modal-action p-1.5 rounded-md hover:text-red-400 transition cursor-pointer"
+                                      title="Remove package from GitHub"
+                                    >
+                                      {deletingPkgName === pkg.name ? (
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                      ) : (
+                                        <Trash2 className="w-4 h-4" />
+                                      )}
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {details && isDetailsExpanded && (
+                                  <div className="mt-3 pt-3 border-t border-[#30363d] space-y-2 text-xs">
+                                    <div className="flex flex-wrap gap-4 text-gray-400">
+                                      <span>
+                                        Original Name:{' '}
+                                        <strong className="text-gray-200">
+                                          {details.originalName}
+                                        </strong>
+                                      </span>
+                                      <span>
+                                        Mode:{' '}
+                                        <strong className="text-white">
+                                          {details.mode}
+                                        </strong>
+                                      </span>
+                                      <span>
+                                        Files:{' '}
+                                        <strong className="text-gray-200">
+                                          {details.fileCount}
+                                        </strong>
+                                      </span>
+                                      <span>
+                                        Layer Size:{' '}
+                                        <strong className="text-gray-200">
+                                          {formatBytes(details.compressedSize)}
+                                        </strong>{' '}
+                                        (Uncompressed:{' '}
+                                        {formatBytes(details.totalUncompressedBytes)})
+                                      </span>
+                                    </div>
+
+                                    {details.files.length > 0 && (
+                                      <div className="bg-[#161b22] rounded-md p-2.5 border border-[#30363d] max-h-40 overflow-y-auto space-y-1">
+                                        <div className="text-[11px] font-semibold text-gray-400 mb-1">
+                                          Files inside image layer:
+                                        </div>
+                                        {details.files.map((f, i) => {
+                                          const matchesQuery =
+                                            q && f.path.toLowerCase().includes(q);
+                                          return (
+                                            <div
+                                              key={`${f.path}-${i}`}
+                                              className={`flex items-center justify-between text-[11px] font-mono px-1.5 py-0.5 rounded ${
+                                                matchesQuery
+                                                  ? 'active-variant font-bold'
+                                                  : 'text-gray-300'
+                                              }`}
+                                            >
+                                              <span className="truncate">{f.path}</span>
+                                              <span className="text-gray-500 shrink-0 ml-2">
+                                                {formatBytes(f.size)}
+                                              </span>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </main>
+        </>
+      )}
+
+      {/* Modals */}
+      <SettingsModal
+        isOpen={showSettingsModal}
+        onClose={() => setShowSettingsModal(false)}
+        settings={settings}
+        setSettings={setSettings}
+        isDarkMode={isDarkMode}
+        setIsDarkMode={setIsDarkMode}
+      />
+
+      <HelpModal
+        isOpen={showHelpModal}
+        onClose={() => setShowHelpModal(false)}
+      />
+
+      <AboutModal
+        isOpen={showAboutModal}
+        onClose={() => setShowAboutModal(false)}
+      />
     </div>
   );
 }

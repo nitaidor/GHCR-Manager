@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { toOciImageName, validateFilesSelectionName } from '../src/lib/naming.ts';
 import {
   buildOciLayerFromFiles,
+  extractFileMetaListStreaming,
   extractFilesFromOciLayer,
   type TarInputFile,
 } from '../src/lib/tar.ts';
@@ -67,6 +68,30 @@ async function runTests() {
     version: 1,
     ok: true,
   });
+
+  console.log('4. Testing streaming .tar.gz header meta extractor (multi-file + PAX long path + large payload skip)...');
+  const longSubPath =
+    'very/deeply/nested/folder/structure/that/exceeds/standard/ustar/ninety-nine/byte/filename/limit/payload.bin';
+  const largePayload = new Uint8Array(150 * 1024); // > 2x 64KB chunk size to span multiple chunks
+  largePayload.fill(0x41);
+  const multiFiles: TarInputFile[] = [
+    { relativePath: 'alpha.txt', data: encoder.encode('Alpha content'), mtime: 1700000000 },
+    { relativePath: longSubPath, data: largePayload, mtime: 1700000010 },
+    { relativePath: 'omega/final.json', data: encoder.encode('{"ok":true}'), mtime: 1700000020 },
+  ];
+  const multiLayer = await buildOciLayerFromFiles(multiFiles);
+  const progressValues: number[] = [];
+  const streamedMeta = await extractFileMetaListStreaming(multiLayer.targzBytes, {
+    onProgress: (pct) => progressValues.push(pct),
+  });
+  assert.equal(streamedMeta.length, 3);
+  assert.deepEqual(streamedMeta, [
+    { path: 'alpha.txt', size: 13 },
+    { path: longSubPath, size: largePayload.byteLength },
+    { path: 'omega/final.json', size: 11 },
+  ]);
+  assert.ok(progressValues.length > 0);
+  assert.equal(progressValues[progressValues.length - 1], 100);
 
   console.log('All tests passed successfully!');
 }

@@ -1,4 +1,4 @@
-import { gzipSync, gunzipSync, zipSync } from 'fflate';
+import { gzipSync, gunzipSync, Gunzip, zipSync } from 'fflate';
 
 export interface TarInputFile {
   /** Path inside the image layer (e.g. "report.pdf" or "subfolder/nested/file.txt") */
@@ -264,6 +264,194 @@ export function extractFilesFromOciLayer(layerBytes: Uint8Array): TarInputFile[]
   }
 
   return extracted;
+}
+
+/**
+ * Creates a streaming .tar metadata parser that extracts only file paths and sizes
+ * from 512-byte USTAR/PAX/GNU headers while discarding all file content bytes as chunks arrive.
+ */
+export function createStreamingTarMetaParser(): {
+  feed: (chunk: Uint8Array) => void;
+  getFiles: () => Array<{ path: string; size: number }>;
+  isDone: () => boolean;
+} {
+  const files: Array<{ path: string; size: number }> = [];
+  let pendingBuf = new Uint8Array(4096);
+  let pendingLen = 0;
+  let skipRemaining = 0;
+  let metaNeededBlocks = 0;
+  let metaExactSize = 0;
+  let metaType: 'x' | 'g' | 'L' | null = null;
+  let pendingPaxPath: string | null = null;
+  let done = false;
+
+  function appendToPending(slice: Uint8Array) {
+    const needed = pendingLen + slice.byteLength;
+    if (needed > pendingBuf.byteLength) {
+      const next = new Uint8Array(Math.max(pendingBuf.byteLength * 2, needed));
+      next.set(pendingBuf.subarray(0, pendingLen));
+      pendingBuf = next;
+    }
+    pendingBuf.set(slice, pendingLen);
+    pendingLen += slice.byteLength;
+  }
+
+  function feed(chunk: Uint8Array) {
+    if (done || chunk.byteLength === 0) return;
+    let pos = 0;
+
+    while (pos < chunk.byteLength && !done) {
+      if (skipRemaining > 0) {
+        const avail = chunk.byteLength - pos;
+        const toSkip = Math.min(avail, skipRemaining);
+        pos += toSkip;
+        skipRemaining -= toSkip;
+        continue;
+      }
+
+      if (metaNeededBlocks > 0) {
+        const need = metaNeededBlocks - pendingLen;
+        const take = Math.min(need, chunk.byteLength - pos);
+        appendToPending(chunk.subarray(pos, pos + take));
+        pos += take;
+
+        if (pendingLen === metaNeededBlocks) {
+          const payload = pendingBuf.subarray(0, metaExactSize);
+          if (metaType === 'x' || metaType === 'g') {
+            const paxText = decoder.decode(payload);
+            const lines = paxText.split('\n');
+            for (const line of lines) {
+              const spaceIdx = line.indexOf(' ');
+              if (spaceIdx > 0) {
+                const kv = line.slice(spaceIdx + 1);
+                if (kv.startsWith('path=')) {
+                  pendingPaxPath = kv.slice(5);
+                }
+              }
+            }
+          } else if (metaType === 'L') {
+            pendingPaxPath = readNullTerminatedString(payload, 0, payload.byteLength);
+          }
+          pendingLen = 0;
+          metaNeededBlocks = 0;
+          metaExactSize = 0;
+          metaType = null;
+        }
+        continue;
+      }
+
+      // Reading a 512-byte tar header
+      const need = 512 - pendingLen;
+      const take = Math.min(need, chunk.byteLength - pos);
+      appendToPending(chunk.subarray(pos, pos + take));
+      pos += take;
+
+      if (pendingLen === 512) {
+        const header = pendingBuf.subarray(0, 512);
+        pendingLen = 0;
+
+        let allZero = true;
+        for (let i = 0; i < 512; i++) {
+          if (header[i] !== 0) {
+            allZero = false;
+            break;
+          }
+        }
+        if (allZero) {
+          done = true;
+          break;
+        }
+
+        const name = readNullTerminatedString(header, 0, 100);
+        const prefix = readNullTerminatedString(header, 345, 155);
+        const size = readOctalField(header, 124, 12);
+        const typeflag = header[156] === 0 ? '0' : String.fromCharCode(header[156]);
+        const blocks = Math.ceil(size / 512) * 512;
+
+        if (typeflag === 'x' || typeflag === 'g' || typeflag === 'L') {
+          if (blocks > 0) {
+            metaType = typeflag;
+            metaExactSize = size;
+            metaNeededBlocks = blocks;
+          }
+        } else if (typeflag === '0' || typeflag === '\0') {
+          const fullPath = (
+            pendingPaxPath || (prefix ? `${prefix}/${name}` : name)
+          ).replace(/^\/+/, '');
+          pendingPaxPath = null;
+          if (fullPath) {
+            files.push({ path: fullPath, size });
+          }
+          skipRemaining = blocks;
+        } else {
+          pendingPaxPath = null;
+          skipRemaining = blocks;
+        }
+      }
+    }
+  }
+
+  return {
+    feed,
+    getFiles: () => files,
+    isDone: () => done,
+  };
+}
+
+/**
+ * Streams a .tar or .tar.gz OCI layer in 64 KB chunks through fflate's Gunzip state machine,
+ * yielding periodically to keep UI responsive on Android, iOS, and Web while holding only
+ * 512-byte headers in memory and discarding file body bytes immediately.
+ */
+export async function extractFileMetaListStreaming(
+  layerBytes: Uint8Array,
+  opts?: {
+    onProgress?: (percent: number) => void;
+    signal?: AbortSignal;
+  }
+): Promise<Array<{ path: string; size: number }>> {
+  const parser = createStreamingTarMetaParser();
+  const total = layerBytes.byteLength;
+  if (total === 0) return [];
+
+  const isGzip = total >= 2 && layerBytes[0] === 0x1f && layerBytes[1] === 0x8b;
+  const CHUNK_SIZE = 65536;
+  const gunzip = isGzip
+    ? new Gunzip((decompressed) => {
+        parser.feed(decompressed);
+      })
+    : null;
+
+  let chunkIdx = 0;
+  for (let offset = 0; offset < total; offset += CHUNK_SIZE) {
+    if (opts?.signal?.aborted) {
+      throw new DOMException('Layer scan aborted', 'AbortError');
+    }
+
+    const end = Math.min(offset + CHUNK_SIZE, total);
+    const slice = layerBytes.subarray(offset, end);
+    const isFinal = end >= total;
+
+    if (gunzip) {
+      gunzip.push(slice, isFinal);
+    } else {
+      parser.feed(slice);
+    }
+
+    if (opts?.onProgress) {
+      const pct = Math.min(100, Math.round((end / total) * 100));
+      opts.onProgress(pct);
+    }
+
+    if (parser.isDone()) break;
+
+    chunkIdx++;
+    if (chunkIdx % 4 === 0 && !isFinal) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  return parser.getFiles();
 }
 
 /**

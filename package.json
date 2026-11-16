@@ -1,6 +1,8 @@
 {
   "name": "ghcr-manager",
+  "productName": "GHCR Manager",
   "version": "0.1.0",
+  "author": "Nitai",
   "description": "Cross-platform GHCR Manager (Windows, Linux, macOS, Android, iOS) for creating, syncing, viewing, downloading, and removing OCI container packages on ghcr.io.",
   "main": "electron/main.cjs",
   "scripts": {
@@ -37,5 +39,59 @@
     "typescript": "^5.7.3",
     "vite": "^6.1.0",
     "wait-on": "^8.0.2"
+  },
+  "build": {
+    "appId": "io.ghcr.manager",
+    "productName": "GHCR Manager",
+    "directories": {
+      "output": "dist-exe"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "signAndEditExecutable": true,
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "GHCR Manager",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "artifactName": "${productName} Setup ${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName} ${version}.${ext}"
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "category": "Development",
+      "maintainer": "Nitai <nitai@users.noreply.github.com>",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}"
+    },
+    "mac": {
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
+    }
   }
 }
