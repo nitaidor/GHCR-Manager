@@ -2390,19 +2390,6 @@ export default function App() {
                           <div className="text-xs text-gray-500 mt-1 pointer-events-none">
                             Select one or multiple files or folders from your device
                           </div>
-                          <div className="mt-3 flex items-center justify-center gap-2">
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handlePickUploadFolders();
-                              }}
-                              className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
-                            >
-                              <Folder className="w-3.5 h-3.5 icon-upload" />
-                              Choose Folder
-                            </button>
-                          </div>
                         </>
                       )}
                     </div>

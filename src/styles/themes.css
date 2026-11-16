@@ -290,6 +290,10 @@ html.theme-light:not(.theme-monochrome) .btn-modal-action {
   border: 1px solid #d1d5db !important;
   color: #111827 !important;
 }
+html.theme-light:not(.theme-monochrome) .btn-modal-action:hover,
+.theme-light:not(.theme-monochrome) .btn-modal-action:hover {
+  border-color: #000000 !important;
+}
 
 /* Header Settings Button & Dropdown */
 .header-settings-btn {
