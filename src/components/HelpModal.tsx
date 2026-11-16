@@ -92,34 +92,34 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
             </div>
           </section>
 
-          {/* 2. Upload File(s) Tab */}
+          {/* 2. Upload Files Tab */}
           <section className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md">
             <h2 className="text-xl font-semibold mb-4 flex items-center gap-2 icon-upload">
-              <Upload className="w-5 h-5 icon-upload" /> 2. Upload File(s) Tab — Image & Package Naming Rules
+              <Upload className="w-5 h-5 icon-upload" /> 2. Upload Files Tab — Naming, Tags &amp; Version Replace
             </h2>
             <p className="text-sm text-gray-400 mb-4">
-              Available on Windows, Linux, macOS, Android, and iOS. Select your target repository at the top, then pick or drag-and-drop one or more files:
+              Available on Windows, Linux, macOS, Android, and iOS. Select your target repository at the top, pick or drag-and-drop one or more files or folders, then click <strong>Create Image</strong>:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
                 <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-                  Single File Selected
+                  Single Item Selected
                 </h4>
                 <p className="text-sm text-gray-300">
-                  When you pick <strong>1 file</strong>, the Image & Package Name field automatically defaults to the file&apos;s name. You can either keep the file&apos;s name as-is or type a custom name for the image.
+                  When you pick <strong>1 file or folder</strong>, the Image &amp; Package Name field automatically defaults to its name. You can either keep it as-is or type a custom name for the image.
                 </p>
               </div>
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
                 <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-                  Multiple Files Selected
+                  Multiple Items Selected
                 </h4>
                 <p className="text-sm text-gray-300">
-                  When you pick <strong>2 or more files</strong>, all selected files are bundled together into a single OCI image, and you <strong>must</strong> enter a name for the image before uploading.
+                  When you pick <strong>2 or more items</strong>, they are bundled together into a single OCI image, and you <strong>must</strong> enter a name for the image before creating it.
                 </p>
               </div>
             </div>
             <p className="text-xs text-gray-400 mt-4 font-mono bg-[#0d1117] p-3 rounded border border-[#30363d]">
-              Note: The name of the package on GitHub Packages is always the name of the image (normalized to lowercase OCI format, e.g. &quot;My File.zip&quot; → &quot;my-file.zip&quot;, while preserving the exact original filenames inside the archive).
+              Clicking Create Image verifies the package name live on GitHub, lets you inspect or replace any existing tagged versions of that package (or keep all existing versions with New Image), and defaults the tag to a live timestamp (configurable as 24h/12h and YYYY-MM-DD / YY-MM-DD / DD-MM-YYYY / DD-MM-YY in App Settings).
             </p>
           </section>
 
@@ -161,13 +161,13 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                 <strong>Automatic Repository Linking:</strong> Every uploaded image includes the <code>org.opencontainers.image.source</code> label and annotation so it automatically links to your selected GitHub repository.
               </li>
               <li>
-                <strong>Automatic File Indexing & Deep Search:</strong> Switching to the <strong>Repo Packages</strong> tab or clicking <strong>Refresh</strong> automatically fetches the lightweight OCI manifests for your packages and indexes their file lists—checking each image&apos;s SHA-256 <code>layerDigest</code> so newly pushed versions are always detected. External packages under 50 MB are streamed automatically in the background (with larger external images over 50 MB available via an on-demand <strong>Load Files</strong> streaming scan that reads only tar headers without loading file contents into RAM). Typing in the search bar filters both package names and files inside images, automatically expanding matching packages.
+                <strong>Automatic File Indexing & Deep Search Across Versions:</strong> Switching to the <strong>Repo Packages</strong> tab or clicking <strong>Refresh</strong> lists all versions and tags for every package and indexes their file lists by SHA-256 digest—so every timestamped upload and tag is visible and searchable in nested folder trees. External images under 50 MB are streamed automatically in the background (with images over 50 MB available via on-demand <strong>Load Files</strong> header streaming without loading full contents into RAM). Typing in the search bar filters package names, version tags, and inner files, automatically expanding matching folders.
               </li>
               <li>
-                <strong>Download & Extract:</strong> Pulls the <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts your original files—saving them directly to a destination folder on Desktop, or downloading the original file / <code>.zip</code> bundle on Web and Mobile.
+                <strong>Download & Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts your original files—saving them directly to a destination folder on Desktop, or downloading the original file / <code>.zip</code> bundle on Web and Mobile.
               </li>
               <li>
-                <strong>Remove Package:</strong> Permanently deletes the container package from GitHub Packages using the <code>delete:packages</code> scope.
+                <strong>Remove Version or Package:</strong> Permanently delete an individual tagged/untagged version, or remove an entire package and all of its versions using the <code>delete:packages</code> scope.
               </li>
             </ul>
           </section>

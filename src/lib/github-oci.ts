@@ -52,6 +52,55 @@ export interface GitHubPackageItem {
   } | null;
 }
 
+export interface GitHubPackageVersion {
+  id: number;
+  /** Manifest digest string returned by GitHub Packages API (e.g. "sha256:...") */
+  name: string;
+  url?: string;
+  package_html_url?: string;
+  html_url?: string;
+  created_at: string;
+  updated_at: string;
+  metadata?: {
+    package_type?: string;
+    container?: {
+      tags?: string[];
+    };
+  };
+}
+
+export interface LivePackageState {
+  exists: boolean;
+  packageItem: GitHubPackageItem | null;
+  versions: GitHubPackageVersion[];
+}
+
+export interface GitHubAuthInfo {
+  user: GitHubUser;
+  /** Lower-cased OAuth scopes reported by GitHub, or null when omitted (e.g. fine-grained PAT). */
+  oauthScopes: string[] | null;
+}
+
+export function getVersionReferenceInfo(version: GitHubPackageVersion): {
+  tags: string[];
+  primaryTag: string;
+  isUntagged: boolean;
+  shortDigest: string;
+  inspectRef: string;
+  pullSuffix: string;
+} {
+  const tags = (version.metadata?.container?.tags || []).filter(Boolean);
+  const primaryTag = tags[0] || '';
+  const isUntagged = tags.length === 0;
+  const digest = version.name || '';
+  const shortDigest = digest.startsWith('sha256:')
+    ? `${digest.slice(0, 19)}…`
+    : digest.slice(0, 16);
+  const inspectRef = digest.startsWith('sha256:') ? digest : primaryTag || digest;
+  const pullSuffix = primaryTag ? `:${primaryTag}` : `@${digest}`;
+  return { tags, primaryTag, isUntagged, shortDigest, inspectRef, pullSuffix };
+}
+
 export const AUTO_INSPECT_EXTERNAL_MAX_BYTES = 50 * 1024 * 1024;
 const EXTERNAL_LAYER_CACHE_KEY = 'ghpm_external_layer_cache_v1';
 
@@ -111,9 +160,9 @@ function githubApiHeaders(token: string): Record<string, string> {
 }
 
 /**
- * Verifies the GitHub token and fetches the authenticated user profile.
+ * Verifies the GitHub token, fetches the authenticated user profile, and reads reported OAuth scopes.
  */
-export async function fetchGitHubUser(token: string): Promise<GitHubUser> {
+export async function fetchGitHubAuthInfo(token: string): Promise<GitHubAuthInfo> {
   const res = await crossPlatformHttpRequest({
     url: 'https://api.github.com/user',
     method: 'GET',
@@ -131,7 +180,27 @@ export async function fetchGitHubUser(token: string): Promise<GitHubUser> {
     throw new Error(msg);
   }
 
-  return decodeJson<GitHubUser>(res.body);
+  const rawScopes = res.headers['x-oauth-scopes'];
+  const oauthScopes =
+    typeof rawScopes === 'string'
+      ? rawScopes
+          .split(',')
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean)
+      : null;
+
+  return {
+    user: decodeJson<GitHubUser>(res.body),
+    oauthScopes,
+  };
+}
+
+/**
+ * Verifies the GitHub token and fetches the authenticated user profile.
+ */
+export async function fetchGitHubUser(token: string): Promise<GitHubUser> {
+  const { user } = await fetchGitHubAuthInfo(token);
+  return user;
 }
 
 /**
@@ -540,7 +609,8 @@ export async function buildAndPushOciImage(opts: {
     );
   }
 
-  const manifestDigest = manifestRes.headers['docker-content-digest'];
+  const manifestDigest =
+    manifestRes.headers['docker-content-digest'] || `sha256:${await sha256Hex(manifestBytes)}`;
 
   onProgress?.({
     stage: 'done',
@@ -670,6 +740,7 @@ export async function inspectPackageManifest(opts: {
   owner: string;
   packageName: string;
   tag?: string;
+  reference?: string;
   forceLoadLargeExternal?: boolean;
   skipLayerScan?: boolean;
   onProgress?: (percent: number) => void;
@@ -682,6 +753,7 @@ export async function inspectPackageManifest(opts: {
     owner,
     packageName,
     tag = 'latest',
+    reference,
     forceLoadLargeExternal = false,
     skipLayerScan = false,
     onProgress,
@@ -690,6 +762,7 @@ export async function inspectPackageManifest(opts: {
   } = opts;
   const ownerLower = owner.toLowerCase();
   const pkgLower = packageName.toLowerCase();
+  const manifestRef = reference || tag;
 
   if (signal?.aborted) {
     throw new DOMException('Layer scan aborted', 'AbortError');
@@ -704,7 +777,7 @@ export async function inspectPackageManifest(opts: {
   );
 
   const res = await crossPlatformHttpRequest({
-    url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/manifests/${encodeURIComponent(tag)}`,
+    url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/manifests/${encodeURIComponent(manifestRef)}`,
     method: 'GET',
     headers: {
       Authorization: `Bearer ${registryToken}`,
@@ -714,7 +787,9 @@ export async function inspectPackageManifest(opts: {
   });
 
   if (res.status !== 200) {
-    throw new Error(`Could not fetch manifest for ${pkgLower}:${tag} (HTTP ${res.status})`);
+    throw new Error(
+      `Could not fetch manifest for ${pkgLower}:${tag || manifestRef} (HTTP ${res.status})`
+    );
   }
 
   const manifest = decodeJson<{
@@ -819,7 +894,9 @@ export async function inspectPackageManifest(opts: {
   return {
     packageName: pkgLower,
     tag,
-    manifestDigest: res.headers['docker-content-digest'],
+    manifestDigest:
+      res.headers['docker-content-digest'] ||
+      (manifestRef.startsWith('sha256:') ? manifestRef : undefined),
     layerDigest,
     compressedSize,
     totalUncompressedBytes,
@@ -842,6 +919,7 @@ export async function downloadAndExtractPackage(opts: {
   owner: string;
   packageName: string;
   tag?: string;
+  reference?: string;
 }): Promise<{
   details: OciPackageDetails;
   extractedFiles: TarInputFile[];
@@ -888,8 +966,139 @@ export async function downloadAndExtractPackage(opts: {
   return { details, extractedFiles };
 }
 
+function buildPackageApiUrl(opts: {
+  currentUserLogin: string;
+  owner: string;
+  ownerType: 'User' | 'Organization';
+  packageName: string;
+}): string {
+  const encodedPkg = encodeURIComponent(opts.packageName);
+  const isCurrentUser =
+    opts.owner.toLowerCase() === opts.currentUserLogin.toLowerCase();
+  if (isCurrentUser) {
+    return `https://api.github.com/user/packages/container/${encodedPkg}`;
+  }
+  return opts.ownerType === 'Organization'
+    ? `https://api.github.com/orgs/${encodeURIComponent(opts.owner)}/packages/container/${encodedPkg}`
+    : `https://api.github.com/users/${encodeURIComponent(opts.owner)}/packages/container/${encodedPkg}`;
+}
+
+function extractGitHubApiErrorDetail(body: Uint8Array, status: number): string {
+  let detail = `HTTP ${status}`;
+  try {
+    const errObj = decodeJson<{ message?: string }>(body);
+    if (errObj.message) detail = errObj.message;
+  } catch {
+    // ignore
+  }
+  return detail;
+}
+
 /**
- * Deletes a container package from GitHub Packages.
+ * Fetches all versions for a given container package directly from the GitHub Packages REST API.
+ */
+export async function listPackageVersions(opts: {
+  githubToken: string;
+  currentUserLogin: string;
+  owner: string;
+  ownerType: 'User' | 'Organization';
+  packageName: string;
+}): Promise<GitHubPackageVersion[]> {
+  const baseUrl = buildPackageApiUrl(opts);
+  const allVersions: GitHubPackageVersion[] = [];
+
+  for (let page = 1; page <= 10; page++) {
+    const res = await crossPlatformHttpRequest({
+      url: `${baseUrl}/versions?per_page=100&page=${page}`,
+      method: 'GET',
+      headers: githubApiHeaders(opts.githubToken),
+    });
+
+    if (res.status === 404) {
+      return [];
+    }
+    if (res.status !== 200) {
+      const detail = extractGitHubApiErrorDetail(res.body, res.status);
+      throw new Error(
+        `Failed to fetch versions for package "${opts.packageName}" (${detail}).`
+      );
+    }
+
+    const batch = decodeJson<GitHubPackageVersion[]>(res.body);
+    allVersions.push(...batch);
+    if (batch.length < 100) break;
+  }
+
+  return allVersions;
+}
+
+/**
+ * Checks GitHub live (not local caches) whether the normalized package name exists under `owner`
+ * and retrieves its linked repository info and all existing versions.
+ */
+export async function fetchLivePackageState(opts: {
+  githubToken: string;
+  currentUserLogin: string;
+  owner: string;
+  ownerType: 'User' | 'Organization';
+  packageName: string;
+}): Promise<LivePackageState> {
+  const baseUrl = buildPackageApiUrl(opts);
+  const res = await crossPlatformHttpRequest({
+    url: baseUrl,
+    method: 'GET',
+    headers: githubApiHeaders(opts.githubToken),
+  });
+
+  if (res.status === 404) {
+    return { exists: false, packageItem: null, versions: [] };
+  }
+  if (res.status !== 200) {
+    const detail = extractGitHubApiErrorDetail(res.body, res.status);
+    throw new Error(
+      `Failed to verify package "${opts.packageName}" on GitHub (${detail}).`
+    );
+  }
+
+  const packageItem = decodeJson<GitHubPackageItem>(res.body);
+  const versions = await listPackageVersions(opts);
+  return { exists: true, packageItem, versions };
+}
+
+/**
+ * Deletes a specific version of a container package from GitHub Packages.
+ * GitHub forbids deleting the last remaining version directly; caller pushes replacement first
+ * or deletes the whole package when removing the final version.
+ */
+export async function deletePackageVersion(opts: {
+  githubToken: string;
+  currentUserLogin: string;
+  owner: string;
+  ownerType: 'User' | 'Organization';
+  packageName: string;
+  versionId: number;
+}): Promise<{ alreadyDeleted: boolean }> {
+  const baseUrl = buildPackageApiUrl(opts);
+  const res = await crossPlatformHttpRequest({
+    url: `${baseUrl}/versions/${encodeURIComponent(String(opts.versionId))}`,
+    method: 'DELETE',
+    headers: githubApiHeaders(opts.githubToken),
+  });
+
+  if (res.status === 404) {
+    return { alreadyDeleted: true };
+  }
+  if (res.status !== 204 && res.status !== 200) {
+    const detail = extractGitHubApiErrorDetail(res.body, res.status);
+    throw new Error(
+      `Failed to delete version ${opts.versionId} of "${opts.packageName}" (${detail}). Ensure your token has the 'delete:packages' scope.`
+    );
+  }
+  return { alreadyDeleted: false };
+}
+
+/**
+ * Deletes an entire container package from GitHub Packages.
  * Requires the 'delete:packages' scope on the GitHub token.
  */
 export async function deleteGitHubPackage(opts: {
@@ -899,34 +1108,18 @@ export async function deleteGitHubPackage(opts: {
   ownerType: 'User' | 'Organization';
   packageName: string;
 }): Promise<void> {
-  const { githubToken, currentUserLogin, owner, ownerType, packageName } = opts;
-  const encodedPkg = encodeURIComponent(packageName);
-  const isCurrentUser = owner.toLowerCase() === currentUserLogin.toLowerCase();
-
-  let url = `https://api.github.com/user/packages/container/${encodedPkg}`;
-  if (!isCurrentUser) {
-    url =
-      ownerType === 'Organization'
-        ? `https://api.github.com/orgs/${encodeURIComponent(owner)}/packages/container/${encodedPkg}`
-        : `https://api.github.com/users/${encodeURIComponent(owner)}/packages/container/${encodedPkg}`;
-  }
+  const url = buildPackageApiUrl(opts);
 
   const res = await crossPlatformHttpRequest({
     url,
     method: 'DELETE',
-    headers: githubApiHeaders(githubToken),
+    headers: githubApiHeaders(opts.githubToken),
   });
 
   if (res.status !== 204 && res.status !== 200) {
-    let detail = `HTTP ${res.status}`;
-    try {
-      const errObj = decodeJson<{ message?: string }>(res.body);
-      if (errObj.message) detail = errObj.message;
-    } catch {
-      // ignore
-    }
+    const detail = extractGitHubApiErrorDetail(res.body, res.status);
     throw new Error(
-      `Failed to delete package "${packageName}" (${detail}). Ensure your token has the 'delete:packages' scope.`
+      `Failed to delete package "${opts.packageName}" (${detail}). Ensure your token has the 'delete:packages' scope.`
     );
   }
 }

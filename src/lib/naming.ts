@@ -10,6 +10,99 @@
  */
 
 export type UploadMode = 'files' | 'folder-sync';
+export type ClockFormat = '24h' | '12h';
+export type DateFormat = 'YYYY-MM-DD' | 'YY-MM-DD' | 'DD-MM-YYYY' | 'DD-MM-YY';
+
+const OCI_TAG_REGEX = /^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$/;
+
+/**
+ * Formats a Date in local time into a valid OCI tag using the user's preferred date and clock formats.
+ * Dots separate HH.MM.SS (since ':' and '/' are invalid in OCI tags), e.g. "2026-11-16_13.05.09".
+ */
+export function formatTimestampTag(
+  date: Date,
+  clockFormat: ClockFormat = '24h',
+  dateFormat: DateFormat = 'YYYY-MM-DD'
+): string {
+  const fullYear = String(date.getFullYear());
+  const shortYear = fullYear.slice(-2);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+
+  let datePart: string;
+  switch (dateFormat) {
+    case 'YY-MM-DD':
+      datePart = `${shortYear}-${month}-${day}`;
+      break;
+    case 'DD-MM-YYYY':
+      datePart = `${day}-${month}-${fullYear}`;
+      break;
+    case 'DD-MM-YY':
+      datePart = `${day}-${month}-${shortYear}`;
+      break;
+    case 'YYYY-MM-DD':
+    default:
+      datePart = `${fullYear}-${month}-${day}`;
+      break;
+  }
+
+  const h24 = date.getHours();
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const sec = String(date.getSeconds()).padStart(2, '0');
+
+  let timePart: string;
+  if (clockFormat === '12h') {
+    const suffix = h24 >= 12 ? 'pm' : 'am';
+    const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+    timePart = `${String(h12).padStart(2, '0')}.${min}.${sec}${suffix}`;
+  } else {
+    timePart = `${String(h24).padStart(2, '0')}.${min}.${sec}`;
+  }
+
+  return `${datePart}_${timePart}`;
+}
+
+/**
+ * Validates an OCI image tag according to the OCI Distribution Specification / ghcr.io rules:
+ * `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+ */
+export function validateOciTag(rawTag: string): {
+  valid: boolean;
+  tag: string;
+  error?: string;
+} {
+  const trimmed = rawTag.trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      tag: '',
+      error: 'Please enter a tag for the image.',
+    };
+  }
+  if (trimmed.length > 128) {
+    return {
+      valid: false,
+      tag: trimmed,
+      error: 'Tag must be 128 characters or fewer.',
+    };
+  }
+  if (trimmed.startsWith('.') || trimmed.startsWith('-')) {
+    return {
+      valid: false,
+      tag: trimmed,
+      error: 'Tag cannot start with "." or "-".',
+    };
+  }
+  if (!OCI_TAG_REGEX.test(trimmed)) {
+    return {
+      valid: false,
+      tag: trimmed,
+      error:
+        'Tag may only contain letters, numbers, "_", ".", and "-" (no spaces, ":", or "/").',
+    };
+  }
+  return { valid: true, tag: trimmed };
+}
 
 /**
  * Normalizes any raw file name, folder name, or custom image name into a valid

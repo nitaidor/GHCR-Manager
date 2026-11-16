@@ -9,10 +9,13 @@ import {
   LogOut,
 } from 'lucide-react';
 import type { GitHubUser } from '../lib/github-oci';
+import type { ClockFormat, DateFormat } from '../lib/naming';
 
 export interface AppSettings {
   darkTheme: 'default' | 'green' | 'red';
   lightTheme: 'default' | 'monochrome';
+  clockFormat: ClockFormat;
+  dateFormat: DateFormat;
 }
 
 interface HeaderProps {

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   AlertCircle,
   Check,
@@ -35,18 +36,30 @@ import SettingsModal from './components/SettingsModal';
 import HelpModal from './components/HelpModal';
 import AboutModal from './components/AboutModal';
 import SubfolderFileTree from './components/SubfolderFileTree';
+import UploadVersionModal, {
+  makeVersionStateKey,
+} from './components/UploadVersionModal';
+import {
+  VersionFileDetailsPanel,
+  VersionInspectButton,
+} from './components/VersionInspectButton';
 import {
   buildAndPushOciImage,
   deleteGitHubPackage,
+  deletePackageVersion,
   downloadAndExtractPackage,
-  fetchGitHubUser,
+  fetchGitHubAuthInfo,
+  fetchLivePackageState,
   formatBytes,
+  getVersionReferenceInfo,
   inspectPackageManifest,
+  listPackageVersions,
   listPackagesForRepo,
   listUserRepositories,
   pollGitHubDeviceFlowToken,
   startGitHubDeviceFlow,
   type GitHubPackageItem,
+  type GitHubPackageVersion,
   type GitHubRepo,
   type GitHubUser,
   type OciPackageDetails,
@@ -60,7 +73,11 @@ import {
   type DesktopRootFolderScanResult,
   type UploadSelectionItem,
 } from './lib/http';
-import { toOciImageName, validateFilesSelectionName } from './lib/naming';
+import {
+  toOciImageName,
+  validateFilesSelectionName,
+  type DateFormat,
+} from './lib/naming';
 import { createZipFromExtractedFiles, type TarInputFile } from './lib/tar';
 
 interface SyncItemStatus {
@@ -101,6 +118,13 @@ function formatMaskedSecret(secret: string): string {
   return `${prefix}••••${suffix}`;
 }
 
+const VALID_DATE_FORMATS: ReadonlyArray<DateFormat> = [
+  'YYYY-MM-DD',
+  'YY-MM-DD',
+  'DD-MM-YYYY',
+  'DD-MM-YY',
+];
+
 export default function App() {
   // --- Theme & Appearance State (Matches ShellAssist) ---
   const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
@@ -124,6 +148,10 @@ export default function App() {
         return {
           darkTheme: parsed.darkTheme || 'default',
           lightTheme: parsed.lightTheme || 'default',
+          clockFormat: parsed.clockFormat === '12h' ? '12h' : '24h',
+          dateFormat: VALID_DATE_FORMATS.includes(parsed.dateFormat)
+            ? parsed.dateFormat
+            : 'YYYY-MM-DD',
         };
       }
     } catch {
@@ -132,6 +160,8 @@ export default function App() {
     return {
       darkTheme: 'default',
       lightTheme: 'default',
+      clockFormat: '24h',
+      dateFormat: 'YYYY-MM-DD',
     };
   });
 
@@ -183,7 +213,12 @@ export default function App() {
     typeof window !== 'undefined' && Boolean(window.electronAPI?.isDesktop);
 
   // Lock background page scroll whenever any modal is open
-  const isAnyModalOpen = showSettingsModal || showHelpModal || showAboutModal;
+  const isAnyModalOpen =
+    showSettingsModal ||
+    showHelpModal ||
+    showAboutModal ||
+    showUploadPickerPrompt ||
+    showUploadVersionModal;
   useEffect(() => {
     if (isAnyModalOpen) {
       document.documentElement.classList.add('modal-open');
@@ -234,6 +269,7 @@ export default function App() {
   const [tokenInput, setTokenInput] = useState<string>('');
   const [authToken, setAuthToken] = useState<string>('');
   const [user, setUser] = useState<GitHubUser | null>(null);
+  const [oauthScopes, setOauthScopes] = useState<string[] | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authTab, setAuthTab] = useState<'pat' | 'device'>('pat');
@@ -286,7 +322,6 @@ export default function App() {
   const uploadScanIdRef = useRef<string | null>(null);
   const uploadScanAbortRef = useRef<AbortController | null>(null);
   const [customImageName, setCustomImageName] = useState<string>('');
-  const [imageTag, setImageTag] = useState<string>('latest');
   const [uploadProgress, setUploadProgress] = useState<PushProgressUpdate | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadSuccess, setUploadSuccess] = useState<OciPackageDetails | null>(null);
@@ -295,6 +330,12 @@ export default function App() {
   const fileDragCounter = useRef<number>(0);
   const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
   const [showUploadPickerPrompt, setShowUploadPickerPrompt] = useState<boolean>(false);
+  const [showUploadVersionModal, setShowUploadVersionModal] = useState<boolean>(false);
+  const [modalLookupLoading, setModalLookupLoading] = useState<boolean>(false);
+  const [modalLookupError, setModalLookupError] = useState<string | null>(null);
+  const [modalLivePkg, setModalLivePkg] = useState<GitHubPackageItem | null>(null);
+  const [modalExistingVersions, setModalExistingVersions] = useState<GitHubPackageVersion[]>([]);
+  const modalLookupSeqRef = useRef<number>(0);
 
   // --- TAB 2: Root Folder Sync state (Windows / Linux / macOS) ---
   const [rootScan, setRootScan] = useState<DesktopRootFolderScanResult | null>(null);
@@ -312,24 +353,33 @@ export default function App() {
   const fallbackFolderInputRef = useRef<HTMLInputElement | null>(null);
   const fallbackFileMapRef = useRef<Map<string, File>>(new Map());
 
-  // --- TAB 3: Repo Packages state ---
+  // --- TAB 3: Repo Packages state (Digest-keyed versions) ---
   const [repoPackages, setRepoPackages] = useState<GitHubPackageItem[]>([]);
   const [otherPackages, setOtherPackages] = useState<GitHubPackageItem[]>([]);
   const [showOtherPackages, setShowOtherPackages] = useState<boolean>(false);
   const [packageSearch, setPackageSearch] = useState<string>('');
-  const [expandedPackages, setExpandedPackages] = useState<Set<string>>(new Set());
+  const [packageVersionsMap, setPackageVersionsMap] = useState<
+    Record<string, GitHubPackageVersion[]>
+  >({});
+  const [expandedVersionKeys, setExpandedVersionKeys] = useState<Set<string>>(new Set());
   const [packagesLoading, setPackagesLoading] = useState<boolean>(false);
   const [packagesError, setPackagesError] = useState<string | null>(null);
-  const [inspectedManifests, setInspectedManifests] = useState<
-    Record<string, OciPackageDetails>
-  >({});
-  const [indexingPkgNames, setIndexingPkgNames] = useState<Set<string>>(new Set());
-  const [inspectingPkgName, setInspectingPkgName] = useState<string | null>(null);
+  const [inspectedByKey, setInspectedByKey] = useState<Record<string, OciPackageDetails>>({});
+  const inspectedByKeyRef = useRef<Record<string, OciPackageDetails>>({});
+  inspectedByKeyRef.current = inspectedByKey;
+  const [indexingKeys, setIndexingKeys] = useState<Set<string>>(new Set());
+  const [inspectingKey, setInspectingKey] = useState<string | null>(null);
   const [inspectProgress, setInspectProgress] = useState<number>(0);
   const inspectAbortRef = useRef<AbortController | null>(null);
-  const [downloadingPkgName, setDownloadingPkgName] = useState<string | null>(null);
+  const refreshSeqRef = useRef<number>(0);
+  const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [deletingPkgName, setDeletingPkgName] = useState<string | null>(null);
+  const [deletingVersionKey, setDeletingVersionKey] = useState<string | null>(null);
   const [confirmDeletePkg, setConfirmDeletePkg] = useState<GitHubPackageItem | null>(null);
+  const [confirmDeleteVersion, setConfirmDeleteVersion] = useState<{
+    pkg: GitHubPackageItem;
+    version: GitHubPackageVersion;
+  } | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [actionBanner, setActionBanner] = useState<{
     type: 'success' | 'error';
@@ -356,8 +406,9 @@ export default function App() {
     setAuthLoading(true);
     setAuthError(null);
     try {
-      const ghUser = await fetchGitHubUser(clean);
+      const { user: ghUser, oauthScopes: reportedScopes } = await fetchGitHubAuthInfo(clean);
       setUser(ghUser);
+      setOauthScopes(reportedScopes);
       setAuthToken(clean);
       localStorage.setItem(STORAGE_ACTIVE_TOKEN_KEY, clean);
 
@@ -421,6 +472,7 @@ export default function App() {
     } catch (err: unknown) {
       setAuthError(err instanceof Error ? err.message : String(err));
       setUser(null);
+      setOauthScopes(null);
       setAuthToken('');
       localStorage.removeItem(STORAGE_ACTIVE_TOKEN_KEY);
     } finally {
@@ -433,6 +485,7 @@ export default function App() {
     handleCancelInspect();
     localStorage.removeItem(STORAGE_ACTIVE_TOKEN_KEY);
     setUser(null);
+    setOauthScopes(null);
     setAuthToken('');
     setTokenInput('');
     setDeviceFlowInfo(null);
@@ -441,8 +494,13 @@ export default function App() {
     setSelectedRepo(null);
     setRepoPackages([]);
     setOtherPackages([]);
-    setInspectedManifests({});
-    setIndexingPkgNames(new Set());
+    setPackageVersionsMap({});
+    setInspectedByKey({});
+    setIndexingKeys(new Set());
+    setExpandedVersionKeys(new Set());
+    setShowUploadVersionModal(false);
+    setConfirmDeletePkg(null);
+    setConfirmDeleteVersion(null);
   }
 
   // Saved PAT handlers
@@ -549,7 +607,9 @@ export default function App() {
   useEffect(() => {
     if (selectedRepo && authToken && user) {
       handleCancelInspect();
-      setExpandedPackages(new Set());
+      setExpandedVersionKeys(new Set());
+      setConfirmDeletePkg(null);
+      setConfirmDeleteVersion(null);
       localStorage.setItem(STORAGE_REPO_KEY, String(selectedRepo.id));
       refreshPackages();
     }
@@ -557,57 +617,107 @@ export default function App() {
 
   useEffect(() => {
     if (activeTab === 'packages' && selectedRepo && authToken && user) {
-      setExpandedPackages(new Set());
+      setExpandedVersionKeys(new Set());
       refreshPackages();
     }
   }, [activeTab]);
 
+  /**
+   * Background-indexes manifest metadata / <=50MB external tar headers for any versions
+   * not yet present in the digest cache. Shared between Repo Packages and UploadVersionModal.
+   */
+  function indexVersionList(
+    pkgName: string,
+    ownerLogin: string,
+    versions: GitHubPackageVersion[]
+  ) {
+    if (!user || !authToken || versions.length === 0) return;
+    const toFetch = versions.filter(
+      (v) => !inspectedByKeyRef.current[makeVersionStateKey(pkgName, v.name)]
+    );
+    if (toFetch.length === 0) return;
+
+    setIndexingKeys((prev) => {
+      const next = new Set(prev);
+      for (const v of toFetch) {
+        next.add(makeVersionStateKey(pkgName, v.name));
+      }
+      return next;
+    });
+
+    for (const v of toFetch) {
+      const vKey = makeVersionStateKey(pkgName, v.name);
+      const info = getVersionReferenceInfo(v);
+      inspectPackageManifest({
+        username: user.login,
+        githubToken: authToken,
+        owner: ownerLogin,
+        packageName: pkgName,
+        tag: info.primaryTag || info.shortDigest,
+        reference: info.inspectRef,
+        forceLoadLargeExternal: false,
+      })
+        .then((details) => {
+          setInspectedByKey((prev) => ({
+            ...prev,
+            [vKey]: details,
+          }));
+        })
+        .catch(() => {
+          // ignore individual manifest background fetch errors
+        })
+        .finally(() => {
+          setIndexingKeys((prev) => {
+            const next = new Set(prev);
+            next.delete(vKey);
+            return next;
+          });
+        });
+    }
+  }
+
   async function refreshPackages() {
     if (!selectedRepo || !authToken || !user) return;
+    const seq = ++refreshSeqRef.current;
     setPackagesLoading(true);
     setPackagesError(null);
     try {
       const { repoPackages: linked, otherOwnerPackages: others } =
         await listPackagesForRepo(authToken, user.login, selectedRepo);
+      if (refreshSeqRef.current !== seq) return;
       setRepoPackages(linked);
       setOtherPackages(others);
 
-      // Automatically inspect manifests for all packages on refresh so:
-      // 1. Any newly pushed versions (changed layerDigest) are always detected.
-      // 2. All GHCR Manager packages and external packages <= 50 MB are auto-indexed.
-      // 3. External packages > 50 MB skip auto-download and wait for user click.
-      const allToIndex = [...linked, ...others];
-      setIndexingPkgNames(new Set(allToIndex.map((p) => p.name)));
-
-      for (const pkg of allToIndex) {
-        inspectPackageManifest({
-          username: user.login,
-          githubToken: authToken,
-          owner: pkg.owner.login,
-          packageName: pkg.name,
-          forceLoadLargeExternal: false,
-        })
-          .then((details) => {
-            setInspectedManifests((prev) => ({
-              ...prev,
-              [pkg.name]: details,
-            }));
-          })
-          .catch(() => {
-            // ignore individual manifest background fetch errors
-          })
-          .finally(() => {
-            setIndexingPkgNames((prev) => {
-              const next = new Set(prev);
-              next.delete(pkg.name);
-              return next;
+      const allToLoad = [...linked, ...others];
+      await Promise.all(
+        allToLoad.map(async (pkg) => {
+          try {
+            const versions = await listPackageVersions({
+              githubToken: authToken,
+              currentUserLogin: user.login,
+              owner: pkg.owner.login,
+              ownerType: pkg.owner.type,
+              packageName: pkg.name,
             });
-          });
-      }
+            if (refreshSeqRef.current !== seq) return;
+            setPackageVersionsMap((prev) => ({
+              ...prev,
+              [pkg.name.toLowerCase()]: versions,
+            }));
+            indexVersionList(pkg.name, pkg.owner.login, versions);
+          } catch {
+            // ignore individual package version list failure during bulk refresh
+          }
+        })
+      );
     } catch (err: unknown) {
-      setPackagesError(err instanceof Error ? err.message : String(err));
+      if (refreshSeqRef.current === seq) {
+        setPackagesError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setPackagesLoading(false);
+      if (refreshSeqRef.current === seq) {
+        setPackagesLoading(false);
+      }
     }
   }
 
@@ -862,7 +972,59 @@ export default function App() {
     throw new Error(`Unable to read bytes for file: ${entry.relativePath}`);
   }
 
-  async function handleUploadSelectedFiles() {
+  async function runLivePackageCheckForModal(pkgName: string) {
+    if (!selectedRepo || !user || !authToken || !pkgName) return;
+    const seq = ++modalLookupSeqRef.current;
+    setModalLookupLoading(true);
+    setModalLookupError(null);
+    setModalLivePkg(null);
+    setModalExistingVersions([]);
+
+    try {
+      const liveState = await fetchLivePackageState({
+        githubToken: authToken,
+        currentUserLogin: user.login,
+        owner: selectedRepo.owner.login,
+        ownerType: selectedRepo.owner.type,
+        packageName: pkgName,
+      });
+      if (modalLookupSeqRef.current !== seq) return;
+      if (liveState.exists) {
+        setModalLivePkg(liveState.packageItem);
+        setModalExistingVersions(liveState.versions);
+        indexVersionList(
+          pkgName,
+          liveState.packageItem?.owner.login || selectedRepo.owner.login,
+          liveState.versions
+        );
+      }
+    } catch (err: unknown) {
+      if (modalLookupSeqRef.current === seq) {
+        setModalLookupError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (modalLookupSeqRef.current === seq) {
+        setModalLookupLoading(false);
+      }
+    }
+  }
+
+  function handleOpenUploadVersionModal() {
+    if (!selectedRepo || !user || !authToken) return;
+    if (!fileNamingValidation.valid) {
+      setUploadError(fileNamingValidation.error || 'Invalid image name.');
+      return;
+    }
+    setUploadError(null);
+    setUploadSuccess(null);
+    setShowUploadVersionModal(true);
+    runLivePackageCheckForModal(fileNamingValidation.ociPackageName);
+  }
+
+  async function handleExecuteVersionedUpload(opts: {
+    tag: string;
+    replaceVersions: GitHubPackageVersion[];
+  }) {
     if (!selectedRepo || !user || !authToken) return;
     if (!fileNamingValidation.valid) {
       setUploadError(fileNamingValidation.error || 'Invalid image name.');
@@ -908,7 +1070,7 @@ export default function App() {
         githubToken: authToken,
         repo: selectedRepo,
         rawImageName: fileNamingValidation.effectiveRawName,
-        tag: imageTag.trim() || 'latest',
+        tag: opts.tag,
         mode:
           pickedItems.length === 1 && pickedItems[0].kind === 'file'
             ? 'single-file'
@@ -917,12 +1079,60 @@ export default function App() {
         onProgress: (p) => setUploadProgress(p),
       });
 
+      if (details.manifestDigest) {
+        const vKey = makeVersionStateKey(details.packageName, details.manifestDigest);
+        setInspectedByKey((prev) => ({
+          ...prev,
+          [vKey]: details,
+        }));
+      }
+
+      // Delete checked old versions ONLY after the new image push succeeded
+      const toDelete = opts.replaceVersions.filter(
+        (v) => v.name !== details.manifestDigest
+      );
+      const deleteErrors: string[] = [];
+
+      if (toDelete.length > 0) {
+        const pkgOwnerLogin =
+          modalLivePkg?.owner.login || selectedRepo.owner.login;
+        const pkgOwnerType =
+          modalLivePkg?.owner.type || selectedRepo.owner.type;
+
+        setUploadProgress({
+          stage: 'publishing-manifest',
+          message: `Removing ${toDelete.length} replaced version(s)...`,
+          percent: 96,
+        });
+
+        for (const oldVer of toDelete) {
+          try {
+            await deletePackageVersion({
+              githubToken: authToken,
+              currentUserLogin: user.login,
+              owner: pkgOwnerLogin,
+              ownerType: pkgOwnerType,
+              packageName: details.packageName,
+              versionId: oldVer.id,
+            });
+          } catch (delErr: unknown) {
+            const info = getVersionReferenceInfo(oldVer);
+            const label = info.primaryTag || info.shortDigest;
+            deleteErrors.push(
+              `${label}: ${delErr instanceof Error ? delErr.message : String(delErr)}`
+            );
+          }
+        }
+      }
+
       setUploadSuccess(details);
-      setInspectedManifests((prev) => ({
-        ...prev,
-        [details.packageName]: details,
-      }));
-      refreshPackages();
+      if (deleteErrors.length > 0) {
+        setUploadError(
+          `Uploaded ${details.packageName}:${details.tag}, but failed to remove ${deleteErrors.length} old version(s): ${deleteErrors.join('; ')}`
+        );
+      }
+      setShowUploadVersionModal(false);
+      await refreshPackages();
     } catch (err: unknown) {
       setUploadError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1292,10 +1502,13 @@ export default function App() {
           },
         });
 
-        setInspectedManifests((prev) => ({
-          ...prev,
-          [details.packageName]: details,
-        }));
+        if (details.manifestDigest) {
+          const vKey = makeVersionStateKey(details.packageName, details.manifestDigest);
+          setInspectedByKey((prev) => ({
+            ...prev,
+            [vKey]: details,
+          }));
+        }
 
         setSyncStatuses((prev) => ({
           ...prev,
@@ -1320,15 +1533,15 @@ export default function App() {
     refreshPackages();
   }
 
-  // --- TAB 3: Package Inspect, Download, and Delete handlers ---
-  function handleTogglePackageFiles(pkgName: string) {
-    const next = new Set(expandedPackages);
-    if (next.has(pkgName)) {
-      next.delete(pkgName);
+  // --- TAB 3 & MODAL: Version Inspect, Download, and Delete handlers ---
+  function handleToggleVersionExpand(versionKey: string) {
+    const next = new Set(expandedVersionKeys);
+    if (next.has(versionKey)) {
+      next.delete(versionKey);
     } else {
-      next.add(pkgName);
+      next.add(versionKey);
     }
-    setExpandedPackages(next);
+    setExpandedVersionKeys(next);
   }
 
   function handleCancelInspect() {
@@ -1336,18 +1549,24 @@ export default function App() {
       inspectAbortRef.current.abort();
       inspectAbortRef.current = null;
     }
-    setInspectingPkgName(null);
+    setInspectingKey(null);
     setInspectProgress(0);
   }
 
-  async function handleLoadLargeExternalPackage(pkgName: string, ownerLogin?: string) {
+  async function handleLoadVersionFiles(
+    pkgName: string,
+    ownerLogin: string,
+    version: GitHubPackageVersion
+  ) {
     if (!selectedRepo || !user || !authToken) return;
     if (inspectAbortRef.current) {
       inspectAbortRef.current.abort();
     }
+    const vKey = makeVersionStateKey(pkgName, version.name);
+    const info = getVersionReferenceInfo(version);
     const ac = new AbortController();
     inspectAbortRef.current = ac;
-    setInspectingPkgName(pkgName);
+    setInspectingKey(vKey);
     setInspectProgress(0);
     setActionBanner(null);
 
@@ -1357,15 +1576,17 @@ export default function App() {
         githubToken: authToken,
         owner: ownerLogin || selectedRepo.owner.login,
         packageName: pkgName,
+        tag: info.primaryTag || info.shortDigest,
+        reference: info.inspectRef,
         forceLoadLargeExternal: true,
         onProgress: (pct) => setInspectProgress(pct),
         signal: ac.signal,
       });
-      setInspectedManifests((prev) => ({
+      setInspectedByKey((prev) => ({
         ...prev,
-        [pkgName]: details,
+        [vKey]: details,
       }));
-      setExpandedPackages((prev) => new Set(prev).add(pkgName));
+      setExpandedVersionKeys((prev) => new Set(prev).add(vKey));
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') {
         return;
@@ -1378,7 +1599,7 @@ export default function App() {
       if (inspectAbortRef.current === ac) {
         inspectAbortRef.current = null;
       }
-      setInspectingPkgName(null);
+      setInspectingKey(null);
       setInspectProgress(0);
     }
   }
@@ -1397,36 +1618,44 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
-  async function handleDownloadPackage(pkgName: string) {
+  async function handleDownloadVersion(
+    pkg: GitHubPackageItem,
+    version: GitHubPackageVersion
+  ) {
     if (!selectedRepo || !user || !authToken) return;
-    setDownloadingPkgName(pkgName);
+    const vKey = makeVersionStateKey(pkg.name, version.name);
+    const info = getVersionReferenceInfo(version);
+    setDownloadingKey(vKey);
     setActionBanner(null);
     try {
       const { details, extractedFiles } = await downloadAndExtractPackage({
         username: user.login,
         githubToken: authToken,
-        owner: selectedRepo.owner.login,
-        packageName: pkgName,
+        owner: pkg.owner.login,
+        packageName: pkg.name,
+        tag: info.primaryTag || info.shortDigest,
+        reference: info.inspectRef,
       });
 
-      setInspectedManifests((prev) => ({
+      setInspectedByKey((prev) => ({
         ...prev,
-        [pkgName]: details,
+        [vKey]: details,
       }));
 
       if (extractedFiles.length === 0) {
-        throw new Error('No files were found inside the package layer.');
+        throw new Error('No files were found inside the image layer.');
       }
 
+      const displayLabel = `${pkg.name}${info.pullSuffix}`;
       if (window.electronAPI?.saveExtractedFiles) {
         const res = await window.electronAPI.saveExtractedFiles(
-          details.originalName || pkgName,
+          details.originalName || pkg.name,
           extractedFiles
         );
         if (res.saved) {
           setActionBanner({
             type: 'success',
-            text: `Extracted ${extractedFiles.length} file(s) from "${pkgName}" to ${res.outputPath}`,
+            text: `Extracted ${extractedFiles.length} file(s) from "${displayLabel}" to ${res.outputPath}`,
           });
         }
         return;
@@ -1434,7 +1663,7 @@ export default function App() {
 
       if (extractedFiles.length === 1) {
         const single = extractedFiles[0];
-        const fileName = single.relativePath.split('/').pop() || pkgName;
+        const fileName = single.relativePath.split('/').pop() || pkg.name;
         triggerBrowserDownload(single.data, fileName);
         setActionBanner({
           type: 'success',
@@ -1442,11 +1671,11 @@ export default function App() {
         });
       } else {
         const zipBytes = createZipFromExtractedFiles(extractedFiles);
-        const zipName = `${details.originalName || pkgName}.zip`;
+        const zipName = `${details.originalName || pkg.name}.zip`;
         triggerBrowserDownload(zipBytes, zipName);
         setActionBanner({
           type: 'success',
-          text: `Downloaded ${extractedFiles.length} files as "${zipName}" (${formatBytes(zipBytes.byteLength)})`,
+          text: `Downloaded ${extractedFiles.length} files from "${displayLabel}" as "${zipName}" (${formatBytes(zipBytes.byteLength)})`,
         });
       }
     } catch (err: unknown) {
@@ -1455,7 +1684,60 @@ export default function App() {
         text: err instanceof Error ? err.message : String(err),
       });
     } finally {
-      setDownloadingPkgName(null);
+      setDownloadingKey(null);
+    }
+  }
+
+  async function handleDeleteVersionConfirmed(target: {
+    pkg: GitHubPackageItem;
+    version: GitHubPackageVersion;
+  }) {
+    if (!selectedRepo || !user || !authToken) return;
+    const { pkg, version } = target;
+    const vKey = makeVersionStateKey(pkg.name, version.name);
+    const info = getVersionReferenceInfo(version);
+    const siblingVersions = packageVersionsMap[pkg.name.toLowerCase()] || [];
+
+    setDeletingVersionKey(vKey);
+    setConfirmDeleteVersion(null);
+    setConfirmDeletePkg(null);
+    setActionBanner(null);
+
+    try {
+      if (siblingVersions.length <= 1) {
+        await deleteGitHubPackage({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: pkg.owner.login,
+          ownerType: pkg.owner.type,
+          packageName: pkg.name,
+        });
+        setActionBanner({
+          type: 'success',
+          text: `Removed "${pkg.name}" (last remaining version deleted) from GitHub Packages.`,
+        });
+      } else {
+        await deletePackageVersion({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: pkg.owner.login,
+          ownerType: pkg.owner.type,
+          packageName: pkg.name,
+          versionId: version.id,
+        });
+        setActionBanner({
+          type: 'success',
+          text: `Removed version "${pkg.name}${info.pullSuffix}" from GitHub Packages.`,
+        });
+      }
+      await refreshPackages();
+    } catch (err: unknown) {
+      setActionBanner({
+        type: 'error',
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setDeletingVersionKey(null);
     }
   }
 
@@ -2428,10 +2710,10 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* Upload Choice Modal (Triggered by Clicking Dropzone Area) */}
-                    {showUploadPickerPrompt && (
+                    {/* Upload Choice Modal (Triggered by Clicking Dropzone Area) — portaled to <body> so it covers the header too */}
+                    {showUploadPickerPrompt && createPortal(
                       <div
-                        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4"
+                        className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 backdrop-blur-xs p-4"
                         onClick={() => setShowUploadPickerPrompt(false)}
                       >
                         <div
@@ -2483,7 +2765,8 @@ export default function App() {
                             </button>
                           </div>
                         </div>
-                      </div>
+                      </div>,
+                      document.body
                     )}
 
                     {/* Picked Files & Folders List */}
@@ -2585,36 +2868,21 @@ export default function App() {
                     {/* Image / Package Name Input */}
                     {pickedItems.length > 0 && (
                       <div className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-4">
-                        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                          <div className="sm:col-span-3">
-                            <label className="block text-xs font-semibold text-gray-200 mb-1">
-                              Image & Package Name
-                            </label>
-                            <input
-                              type="text"
-                              value={customImageName}
-                              onChange={(e) => setCustomImageName(e.target.value)}
-                              placeholder={
-                                pickedItems.length === 1
-                                  ? pickedItems[0].name
-                                  : 'Enter a name for this multi-item image (e.g. release-bundle)'
-                              }
-                              className="w-full px-3.5 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white focus:outline-none"
-                            />
-                          </div>
-
-                          <div>
-                            <label className="block text-xs font-semibold text-gray-200 mb-1">
-                              Tag
-                            </label>
-                            <input
-                              type="text"
-                              value={imageTag}
-                              onChange={(e) => setImageTag(e.target.value)}
-                              placeholder="latest"
-                              className="w-full px-3 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white font-mono focus:outline-none"
-                            />
-                          </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-gray-200 mb-1">
+                            Image & Package Name
+                          </label>
+                          <input
+                            type="text"
+                            value={customImageName}
+                            onChange={(e) => setCustomImageName(e.target.value)}
+                            placeholder={
+                              pickedItems.length === 1
+                                ? pickedItems[0].name
+                                : 'Enter a name for this multi-item image (e.g. release-bundle)'
+                            }
+                            className="w-full px-3.5 py-2 rounded-md bg-[#161b22] border border-[#30363d] text-sm text-white focus:outline-none"
+                          />
                         </div>
 
                         {fileNamingValidation.valid ? (
@@ -2624,8 +2892,7 @@ export default function App() {
                             </span>
                             <code className="text-white font-mono font-semibold break-all">
                               ghcr.io/{selectedRepo.owner.login.toLowerCase()}/
-                              {fileNamingValidation.ociPackageName}:
-                              {imageTag.trim() || 'latest'}
+                              {fileNamingValidation.ociPackageName}
                             </code>
                           </div>
                         ) : (
@@ -2635,25 +2902,10 @@ export default function App() {
                           </div>
                         )}
 
-                        {uploadError && (
+                        {uploadError && !showUploadVersionModal && (
                           <div className="p-3 rounded-md theme-error-banner text-xs flex items-start gap-2">
                             <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                             <span>{uploadError}</span>
-                          </div>
-                        )}
-
-                        {uploadProgress && (
-                          <div className="space-y-1.5">
-                            <div className="flex justify-between text-xs text-gray-300">
-                              <span>{uploadProgress.message}</span>
-                              <span>{uploadProgress.percent}%</span>
-                            </div>
-                            <div className="w-full h-2 bg-[#161b22] rounded-full overflow-hidden border border-[#30363d]">
-                              <div
-                                className="h-full tab-indicator transition-all duration-300"
-                                style={{ width: `${uploadProgress.percent}%` }}
-                              />
-                            </div>
                           </div>
                         )}
 
@@ -2663,7 +2915,7 @@ export default function App() {
                               <CheckCircle2 className="w-4 h-4 shrink-0" />
                               <div>
                                 <span className="font-semibold">
-                                  Package &quot;{uploadSuccess.packageName}&quot; uploaded!
+                                  Image &quot;{uploadSuccess.packageName}:{uploadSuccess.tag}&quot; uploaded!
                                 </span>{' '}
                                 ({uploadSuccess.fileCount} file(s), compressed size{' '}
                                 {formatBytes(uploadSuccess.compressedSize)})
@@ -2682,22 +2934,12 @@ export default function App() {
                         <button
                           type="button"
                           disabled={!fileNamingValidation.valid || !!uploadProgress}
-                          onClick={handleUploadSelectedFiles}
+                          onClick={handleOpenUploadVersionModal}
                           className="w-full py-2.5 px-4 rounded-md bg-blue-600 font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
                         >
-                          {uploadProgress ? (
-                            <>
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                              Building & Uploading OCI Image...
-                            </>
-                          ) : (
-                            <>
-                              <Upload className="w-4 h-4" />
-                              Create Image &quot;
-                              {fileNamingValidation.ociPackageName || '...'}&quot; &
-                              Upload to Repo Packages
-                            </>
-                          )}
+                          <Upload className="w-4 h-4" />
+                          Create Image &quot;
+                          {fileNamingValidation.ociPackageName || '...'}&quot;
                         </button>
                       </div>
                     )}
@@ -3133,9 +3375,9 @@ export default function App() {
                     {confirmDeletePkg && (
                       <div className="p-4 rounded-md theme-error-banner flex flex-wrap items-center justify-between gap-3">
                         <div className="text-xs">
-                          Are you sure you want to permanently remove package{' '}
+                          Are you sure you want to permanently remove the entire package{' '}
                           <strong className="font-mono">{confirmDeletePkg.name}</strong>{' '}
-                          from GitHub Packages?
+                          and all of its versions from GitHub Packages?
                         </div>
                         <div className="flex items-center gap-2">
                           <button
@@ -3157,6 +3399,49 @@ export default function App() {
                         </div>
                       </div>
                     )}
+
+                    {confirmDeleteVersion && (() => {
+                      const info = getVersionReferenceInfo(confirmDeleteVersion.version);
+                      const siblingCount = (
+                        packageVersionsMap[confirmDeleteVersion.pkg.name.toLowerCase()] ||
+                        []
+                      ).length;
+                      return (
+                        <div className="p-4 rounded-md theme-error-banner flex flex-wrap items-center justify-between gap-3">
+                          <div className="text-xs">
+                            Are you sure you want to permanently remove{' '}
+                            <strong className="font-mono">
+                              {confirmDeleteVersion.pkg.name}
+                              {info.pullSuffix}
+                            </strong>
+                            ?{' '}
+                            {siblingCount <= 1 && (
+                              <span>
+                                Since this is the only version remaining, this will delete the package from GitHub Packages.
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteVersion(null)}
+                              className="btn-modal-action px-3 py-1.5 rounded-md text-xs cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleDeleteVersionConfirmed(confirmDeleteVersion)
+                              }
+                              className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
+                            >
+                              Confirm Remove
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {packagesLoading ? (
                       <div className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2">
@@ -3184,28 +3469,53 @@ export default function App() {
                           .filter((pkg) => {
                             const q = packageSearch.trim().toLowerCase();
                             if (!q) return true;
-                            const details = inspectedManifests[pkg.name];
-                            const nameMatch = pkg.name.toLowerCase().includes(q);
-                            const origMatch = details?.originalName
-                              ?.toLowerCase()
-                              .includes(q);
-                            const fileMatch = details?.files?.some((f) =>
-                              f.path.toLowerCase().includes(q)
-                            );
-                            return Boolean(nameMatch || origMatch || fileMatch);
-                          })
-                          .map((pkg) => {
-                            const details = inspectedManifests[pkg.name];
-                            const q = packageSearch.trim().toLowerCase();
-                            const hasMatchingInnerFile = Boolean(
-                              q &&
-                                details?.files?.some((f) =>
+                            if (pkg.name.toLowerCase().includes(q)) return true;
+                            const versions =
+                              packageVersionsMap[pkg.name.toLowerCase()] || [];
+                            return versions.some((v) => {
+                              const tags = v.metadata?.container?.tags || [];
+                              if (tags.some((t) => t.toLowerCase().includes(q))) {
+                                return true;
+                              }
+                              if (v.name.toLowerCase().includes(q)) return true;
+                              const details =
+                                inspectedByKey[
+                                  makeVersionStateKey(pkg.name, v.name)
+                                ];
+                              if (!details) return false;
+                              return (
+                                details.originalName?.toLowerCase().includes(q) ||
+                                details.files?.some((f) =>
                                   f.path.toLowerCase().includes(q)
                                 )
-                            );
-                            const isDetailsExpanded =
-                              expandedPackages.has(pkg.name) || hasMatchingInnerFile;
-                            const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}:latest`;
+                              );
+                            });
+                          })
+                          .map((pkg) => {
+                            const q = packageSearch.trim().toLowerCase();
+                            const pkgMatchesDirectly =
+                              !q || pkg.name.toLowerCase().includes(q);
+                            const allVersions =
+                              packageVersionsMap[pkg.name.toLowerCase()] || [];
+                            const displayedVersions = pkgMatchesDirectly
+                              ? allVersions
+                              : allVersions.filter((v) => {
+                                  const tags = v.metadata?.container?.tags || [];
+                                  if (tags.some((t) => t.toLowerCase().includes(q))) {
+                                    return true;
+                                  }
+                                  if (v.name.toLowerCase().includes(q)) return true;
+                                  const details =
+                                    inspectedByKey[
+                                      makeVersionStateKey(pkg.name, v.name)
+                                    ];
+                                  return Boolean(
+                                    details?.originalName?.toLowerCase().includes(q) ||
+                                      details?.files?.some((f) =>
+                                        f.path.toLowerCase().includes(q)
+                                      )
+                                  );
+                                });
                             const settingsUrl = `${pkg.html_url}/settings`;
 
                             return (
@@ -3213,221 +3523,197 @@ export default function App() {
                                 key={pkg.id}
                                 className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3"
                               >
-                                <div className="flex flex-wrap items-start justify-between gap-3">
-                                  <div className="space-y-1">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <Package className="w-4 h-4 icon-packages" />
-                                      <span className="text-sm font-bold text-white font-mono">
-                                        {pkg.name}
-                                      </span>
-                                      <span
-                                        className={`text-[10px] px-2 py-0.5 rounded border ${
-                                          pkg.visibility === 'private'
-                                            ? 'status-badge-warning'
-                                            : 'status-badge-valid'
-                                        }`}
-                                      >
-                                        {pkg.visibility === 'private' && (
-                                          <Lock className="w-2.5 h-2.5 inline mr-1" />
-                                        )}
-                                        {pkg.visibility}
-                                      </span>
-                                      <a
-                                        href={settingsUrl}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
-                                        className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
-                                      >
-                                        Visibility Settings
-                                        <ExternalLink className="w-3 h-3" />
-                                      </a>
-                                    </div>
-
-                                    <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
-                                      <span>{pullCmd}</span>
-                                      <button
-                                        type="button"
-                                        onClick={() => copyToClipboard(pullCmd)}
-                                        className="text-gray-400 hover:text-white cursor-pointer"
-                                        title="Copy docker pull command"
-                                      >
-                                        {copiedText === pullCmd ? (
-                                          <Check className="w-3.5 h-3.5 rename-check-icon" />
-                                        ) : (
-                                          <Copy className="w-3.5 h-3.5" />
-                                        )}
-                                      </button>
-                                    </div>
-                                  </div>
-
+                                <div className="flex flex-wrap items-center justify-between gap-3">
                                   <div className="flex items-center gap-2 flex-wrap">
-                                    {indexingPkgNames.has(pkg.name) && !details ? (
-                                      <button
-                                        type="button"
-                                        disabled
-                                        className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5"
-                                      >
-                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                        Indexing...
-                                      </button>
-                                    ) : details?.needsManualLargeLayerLoad ? (
-                                      inspectingPkgName === pkg.name ? (
-                                        <div className="flex items-center gap-1.5">
-                                          <span className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5">
-                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                            Scanning ({inspectProgress}%)
-                                          </span>
-                                          <button
-                                            type="button"
-                                            onClick={handleCancelInspect}
-                                            className="btn-modal-action px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center gap-1 cursor-pointer"
-                                            title="Cancel scanning layer headers"
-                                          >
-                                            <X className="w-3.5 h-3.5" />
-                                            Cancel
-                                          </button>
-                                        </div>
-                                      ) : (
-                                        <button
-                                          type="button"
-                                          disabled={inspectingPkgName !== null}
-                                          onClick={() =>
-                                            handleLoadLargeExternalPackage(
-                                              pkg.name,
-                                              pkg.owner.login
-                                            )
-                                          }
-                                          className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-                                          title="External image over 50 MB: click to stream file headers without loading full file contents into RAM"
-                                        >
-                                          <ChevronRight className="w-3.5 h-3.5" />
-                                          Load Files ({formatBytes(details.compressedSize)})
-                                        </button>
-                                      )
-                                    ) : details ? (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleTogglePackageFiles(pkg.name)}
-                                        className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-                                      >
-                                        {isDetailsExpanded ? (
-                                          <ChevronDown className="w-3.5 h-3.5" />
-                                        ) : (
-                                          <ChevronRight className="w-3.5 h-3.5" />
-                                        )}
-                                        {isDetailsExpanded
-                                          ? 'Hide Files'
-                                          : `Files (${details.files.length})`}
-                                      </button>
-                                    ) : (
-                                      <button
-                                        type="button"
-                                        disabled={inspectingPkgName !== null}
-                                        onClick={() =>
-                                          handleLoadLargeExternalPackage(
-                                            pkg.name,
-                                            pkg.owner.login
-                                          )
-                                        }
-                                        className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-                                      >
-                                        {inspectingPkgName === pkg.name ? (
-                                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                        ) : (
-                                          <ChevronRight className="w-3.5 h-3.5" />
-                                        )}
-                                        Load Files
-                                      </button>
-                                    )}
-
-                                    <button
-                                      type="button"
-                                      disabled={downloadingPkgName === pkg.name}
-                                      onClick={() => handleDownloadPackage(pkg.name)}
-                                      className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
+                                    <Package className="w-4 h-4 icon-packages" />
+                                    <span className="text-sm font-bold text-white font-mono">
+                                      {pkg.name}
+                                    </span>
+                                    <span
+                                      className={`text-[10px] px-2 py-0.5 rounded border ${
+                                        pkg.visibility === 'private'
+                                          ? 'status-badge-warning'
+                                          : 'status-badge-valid'
+                                      }`}
                                     >
-                                      {downloadingPkgName === pkg.name ? (
-                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                      ) : (
-                                        <Download className="w-3.5 h-3.5" />
+                                      {pkg.visibility === 'private' && (
+                                        <Lock className="w-2.5 h-2.5 inline mr-1" />
                                       )}
-                                      Download & Extract
-                                    </button>
-
-                                    <button
-                                      type="button"
-                                      disabled={deletingPkgName === pkg.name}
-                                      onClick={() => setConfirmDeletePkg(pkg)}
-                                      className="btn-modal-action p-1.5 rounded-md hover:text-red-400 transition cursor-pointer"
-                                      title="Remove package from GitHub"
+                                      {pkg.visibility}
+                                    </span>
+                                    <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
+                                      {allVersions.length} version
+                                      {allVersions.length === 1 ? '' : 's'}
+                                    </span>
+                                    <a
+                                      href={settingsUrl}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
+                                      className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
                                     >
-                                      {deletingPkgName === pkg.name ? (
-                                        <Loader2 className="w-4 h-4 animate-spin" />
-                                      ) : (
-                                        <Trash2 className="w-4 h-4" />
-                                      )}
-                                    </button>
+                                      Visibility Settings
+                                      <ExternalLink className="w-3 h-3" />
+                                    </a>
                                   </div>
+
+                                  <button
+                                    type="button"
+                                    disabled={deletingPkgName === pkg.name}
+                                    onClick={() => {
+                                      setConfirmDeleteVersion(null);
+                                      setConfirmDeletePkg(pkg);
+                                    }}
+                                    className="btn-modal-action px-2.5 py-1 rounded-md text-xs hover:text-red-400 transition cursor-pointer flex items-center gap-1.5"
+                                    title="Remove entire package and all its versions from GitHub"
+                                  >
+                                    {deletingPkgName === pkg.name ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    ) : (
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    )}
+                                    Remove Package
+                                  </button>
                                 </div>
 
-                                {details && isDetailsExpanded && (
-                                  <div className="mt-3 pt-3 border-t border-[#30363d] space-y-2 text-xs">
-                                    <div className="flex flex-wrap gap-4 text-gray-400">
-                                      <span>
-                                        Original Name:{' '}
-                                        <strong className="text-gray-200">
-                                          {details.originalName}
-                                        </strong>
-                                      </span>
-                                      <span>
-                                        Mode:{' '}
-                                        <strong className="text-white">
-                                          {details.mode}
-                                        </strong>
-                                      </span>
-                                      <span>
-                                        Files:{' '}
-                                        <strong className="text-gray-200">
-                                          {details.fileCount}
-                                        </strong>
-                                      </span>
-                                      <span>
-                                        Layer Size:{' '}
-                                        <strong className="text-gray-200">
-                                          {formatBytes(details.compressedSize)}
-                                        </strong>{' '}
-                                        (Uncompressed:{' '}
-                                        {formatBytes(details.totalUncompressedBytes)})
-                                      </span>
-                                    </div>
+                                {displayedVersions.length === 0 ? (
+                                  <div className="p-3 rounded-md bg-[#161b22] border border-[#30363d] text-xs text-gray-500">
+                                    No tagged or untagged versions returned for this package.
+                                  </div>
+                                ) : (
+                                  <div className="space-y-2">
+                                    {displayedVersions.map((version) => {
+                                      const vKey = makeVersionStateKey(
+                                        pkg.name,
+                                        version.name
+                                      );
+                                      const info = getVersionReferenceInfo(version);
+                                      const details = inspectedByKey[vKey];
+                                      const hasMatchingInnerFile = Boolean(
+                                        q &&
+                                          details?.files?.some((f) =>
+                                            f.path.toLowerCase().includes(q)
+                                          )
+                                      );
+                                      const isDetailsExpanded =
+                                        expandedVersionKeys.has(vKey) ||
+                                        hasMatchingInnerFile;
+                                      const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.pullSuffix}`;
+                                      const uploadedAt = version.created_at
+                                        ? new Date(version.created_at).toLocaleString(
+                                            undefined,
+                                            { hour12: settings.clockFormat === '12h' }
+                                          )
+                                        : '';
 
-                                    {details.files.length > 0 && (
-                                      <div className="bg-[#161b22] rounded-md p-2.5 border border-[#30363d] max-h-40 overflow-y-auto space-y-1">
-                                        <div className="text-[11px] font-semibold text-gray-400 mb-1">
-                                          Files inside image layer:
-                                        </div>
-                                        {details.files.map((f, i) => {
-                                          const matchesQuery =
-                                            q && f.path.toLowerCase().includes(q);
-                                          return (
-                                            <div
-                                              key={`${f.path}-${i}`}
-                                              className={`flex items-center justify-between text-[11px] font-mono px-1.5 py-0.5 rounded ${
-                                                matchesQuery
-                                                  ? 'active-variant font-bold'
-                                                  : 'text-gray-300'
-                                              }`}
-                                            >
-                                              <span className="truncate">{f.path}</span>
-                                              <span className="text-gray-500 shrink-0 ml-2">
-                                                {formatBytes(f.size)}
-                                              </span>
+                                      return (
+                                        <div
+                                          key={version.id}
+                                          className="p-3 rounded-md bg-[#161b22] border border-[#30363d] space-y-2.5"
+                                        >
+                                          <div className="flex flex-wrap items-start justify-between gap-3">
+                                            <div className="space-y-1 min-w-0">
+                                              <div className="flex items-center gap-2 flex-wrap">
+                                                <code className="text-xs font-bold text-white font-mono break-all">
+                                                  {info.isUntagged
+                                                    ? `${pkg.name} (untagged · ${info.shortDigest})`
+                                                    : `${pkg.name}:${info.tags.join(', ')}`}
+                                                </code>
+                                                {uploadedAt && (
+                                                  <span className="text-[11px] text-gray-500">
+                                                    {uploadedAt}
+                                                  </span>
+                                                )}
+                                              </div>
+
+                                              <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
+                                                <span className="break-all">
+                                                  {pullCmd}
+                                                </span>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => copyToClipboard(pullCmd)}
+                                                  className="text-gray-400 hover:text-white cursor-pointer shrink-0"
+                                                  title="Copy docker pull command"
+                                                >
+                                                  {copiedText === pullCmd ? (
+                                                    <Check className="w-3.5 h-3.5 rename-check-icon" />
+                                                  ) : (
+                                                    <Copy className="w-3.5 h-3.5" />
+                                                  )}
+                                                </button>
+                                              </div>
                                             </div>
-                                          );
-                                        })}
-                                      </div>
-                                    )}
+
+                                            <div className="flex items-center gap-2 flex-wrap shrink-0">
+                                              <VersionInspectButton
+                                                details={details}
+                                                isIndexing={indexingKeys.has(vKey)}
+                                                isScanning={inspectingKey === vKey}
+                                                scanProgress={inspectProgress}
+                                                isExpanded={isDetailsExpanded}
+                                                disableLoad={inspectingKey !== null}
+                                                onToggleExpand={() =>
+                                                  handleToggleVersionExpand(vKey)
+                                                }
+                                                onLoadFiles={() =>
+                                                  handleLoadVersionFiles(
+                                                    pkg.name,
+                                                    pkg.owner.login,
+                                                    version
+                                                  )
+                                                }
+                                                onCancelScan={handleCancelInspect}
+                                              />
+
+                                              <button
+                                                type="button"
+                                                disabled={downloadingKey === vKey}
+                                                onClick={() =>
+                                                  handleDownloadVersion(pkg, version)
+                                                }
+                                                className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
+                                              >
+                                                {downloadingKey === vKey ? (
+                                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                ) : (
+                                                  <Download className="w-3.5 h-3.5" />
+                                                )}
+                                                Download & Extract
+                                              </button>
+
+                                              <button
+                                                type="button"
+                                                disabled={deletingVersionKey === vKey}
+                                                onClick={() => {
+                                                  setConfirmDeletePkg(null);
+                                                  setConfirmDeleteVersion({
+                                                    pkg,
+                                                    version,
+                                                  });
+                                                }}
+                                                className="btn-modal-action p-1.5 rounded-md hover:text-red-400 transition cursor-pointer"
+                                                title="Remove this version from GitHub"
+                                              >
+                                                {deletingVersionKey === vKey ? (
+                                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                                ) : (
+                                                  <Trash2 className="w-4 h-4" />
+                                                )}
+                                              </button>
+                                            </div>
+                                          </div>
+
+                                          {details && isDetailsExpanded && (
+                                            <VersionFileDetailsPanel
+                                              details={details}
+                                              highlightQuery={q}
+                                              containerBgClass="bg-[#0d1117]"
+                                            />
+                                          )}
+                                        </div>
+                                      );
+                                    })}
                                   </div>
                                 )}
                               </div>
@@ -3444,6 +3730,43 @@ export default function App() {
       )}
 
       {/* Modals */}
+      {selectedRepo && (
+        <UploadVersionModal
+          isOpen={showUploadVersionModal}
+          onClose={() => {
+            if (!uploadProgress) {
+              handleCancelInspect();
+              setShowUploadVersionModal(false);
+            }
+          }}
+          repo={selectedRepo}
+          packageName={fileNamingValidation.ociPackageName}
+          rawImageName={fileNamingValidation.effectiveRawName}
+          clockFormat={settings.clockFormat}
+          dateFormat={settings.dateFormat}
+          canDeletePackages={
+            oauthScopes === null || oauthScopes.includes('delete:packages')
+          }
+          lookupLoading={modalLookupLoading}
+          lookupError={modalLookupError}
+          livePackageItem={modalLivePkg}
+          existingVersions={modalExistingVersions}
+          onRetryLookup={() =>
+            runLivePackageCheckForModal(fileNamingValidation.ociPackageName)
+          }
+          inspectedByKey={inspectedByKey}
+          indexingKeys={indexingKeys}
+          inspectingKey={inspectingKey}
+          inspectProgress={inspectProgress}
+          onLoadVersionFiles={handleLoadVersionFiles}
+          onCancelInspect={handleCancelInspect}
+          isUploading={!!uploadProgress}
+          uploadProgress={uploadProgress}
+          uploadError={uploadError}
+          onConfirmUpload={handleExecuteVersionedUpload}
+        />
+      )}
+
       <SettingsModal
         isOpen={showSettingsModal}
         onClose={() => setShowSettingsModal(false)}

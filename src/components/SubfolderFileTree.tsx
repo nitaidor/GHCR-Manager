@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Folder,
   FolderOpen,
@@ -19,6 +19,10 @@ interface TreeNode {
   files: DesktopRootFolderFileEntry[];
 }
 
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
 function buildTree(files: DesktopRootFolderFileEntry[]): TreeNode {
   const root: TreeNode = {
     name: '',
@@ -31,7 +35,7 @@ function buildTree(files: DesktopRootFolderFileEntry[]): TreeNode {
 
   for (let idx = 0; idx < files.length; idx++) {
     const f = files[idx];
-    const cleanPath = f.relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const cleanPath = normalizePath(f.relativePath);
     const segments = cleanPath.split('/').filter(Boolean);
     root.size += f.size;
     root.fileCount += 1;
@@ -67,23 +71,52 @@ function buildTree(files: DesktopRootFolderFileEntry[]): TreeNode {
   return root;
 }
 
+/** Collect every folder path that contains (at any depth) a file matching the query */
+function collectMatchedFolders(
+  files: DesktopRootFolderFileEntry[],
+  query: string
+): Set<string> {
+  const matched = new Set<string>();
+  if (!query) return matched;
+  for (const f of files) {
+    const clean = normalizePath(f.relativePath);
+    if (!clean.toLowerCase().includes(query)) continue;
+    const segments = clean.split('/').filter(Boolean);
+    for (let i = 1; i < segments.length; i++) {
+      matched.add(segments.slice(0, i).join('/'));
+    }
+  }
+  return matched;
+}
+
 const PAGE_BATCH_SIZE = 100;
 
 interface TreeNodeViewProps {
   node: TreeNode;
   depth: number;
   iconClassName: string;
+  query: string;
+  matchedFolders: Set<string>;
 }
 
 const TreeNodeView: React.FC<TreeNodeViewProps> = ({
   node,
   depth,
   iconClassName,
+  query,
+  matchedFolders,
 }) => {
+  const containsMatch = depth > 0 && matchedFolders.has(node.path);
+
   // Only top-level container (depth === 0) is open initially so deeply nested folders never freeze the DOM
-  const [isExpanded, setIsExpanded] = useState<boolean>(depth === 0);
+  const [isExpanded, setIsExpanded] = useState<boolean>(depth === 0 || containsMatch);
   const [isExpandingNode, setIsExpandingNode] = useState<boolean>(false);
   const [visibleLimit, setVisibleLimit] = useState<number>(PAGE_BATCH_SIZE);
+
+  // Auto-expand folders that contain search matches
+  useEffect(() => {
+    if (containsMatch) setIsExpanded(true);
+  }, [containsMatch]);
 
   const subfolderList = useMemo(
     () =>
@@ -168,23 +201,32 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
               node={child}
               depth={depth + 1}
               iconClassName={iconClassName}
+              query={query}
+              matchedFolders={matchedFolders}
             />
           ))}
 
-          {visibleFiles.map((file, idx) => (
-            <div
-              key={`${file.relativePath}-${idx}`}
-              className="tree-node-row flex items-center justify-between py-0.5 px-1.5 rounded text-[11px] font-mono transition"
-            >
-              <div className="flex items-center gap-1.5 min-w-0">
-                <FileText className="w-3 h-3 text-gray-500 shrink-0" />
-                <span className="truncate tree-node-label">{file.name}</span>
+          {visibleFiles.map((file, idx) => {
+            const isMatch =
+              !!query &&
+              normalizePath(file.relativePath).toLowerCase().includes(query);
+            return (
+              <div
+                key={`${file.relativePath}-${idx}`}
+                className={`tree-node-row flex items-center justify-between py-0.5 px-1.5 rounded text-[11px] font-mono transition ${
+                  isMatch ? 'active-variant font-bold' : ''
+                }`}
+              >
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <FileText className="w-3 h-3 text-gray-500 shrink-0" />
+                  <span className="truncate tree-node-label">{file.name}</span>
+                </div>
+                <span className="shrink-0 ml-2 text-[10px] tree-node-sub">
+                  {formatBytes(file.size)}
+                </span>
               </div>
-              <span className="shrink-0 ml-2 text-[10px] tree-node-sub">
-                {formatBytes(file.size)}
-              </span>
-            </div>
-          ))}
+            );
+          })}
 
           {hiddenCount > 0 && (
             <button
@@ -207,19 +249,72 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
 export interface SubfolderFileTreeProps {
   files: DesktopRootFolderFileEntry[];
   iconClassName?: string;
+  /** Lower-cased search text: matching files get highlighted and their folders auto-expand */
+  highlightQuery?: string;
+  /** Optional heading rendered above the tree */
+  title?: string;
+  /** Override the outer container classes */
+  containerClassName?: string;
 }
 
 export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
   files,
   iconClassName = 'icon-sync',
+  highlightQuery = '',
+  title,
+  containerClassName,
 }) => {
   const root = useMemo(() => buildTree(files), [files]);
+  const query = highlightQuery.trim().toLowerCase();
+  const matchedFolders = useMemo(
+    () => collectMatchedFolders(files, query),
+    [files, query]
+  );
 
   return (
-    <div className="mt-3 pl-3 pr-2 py-2 max-h-60 overflow-y-auto border-l-2 border-[#30363d] ml-3 bg-[#0d1117] rounded-r-md">
-      <TreeNodeView node={root} depth={0} iconClassName={iconClassName} />
+    <div
+      className={
+        containerClassName ??
+        'mt-3 pl-3 pr-2 py-2 max-h-60 overflow-y-auto border-l-2 border-[#30363d] ml-3 bg-[#0d1117] rounded-r-md'
+      }
+    >
+      {title && (
+        <div className="text-[11px] font-semibold text-gray-400 mb-1">{title}</div>
+      )}
+      <TreeNodeView
+        node={root}
+        depth={0}
+        iconClassName={iconClassName}
+        query={query}
+        matchedFolders={matchedFolders}
+      />
     </div>
   );
 };
+
+const treeEntriesCache = new WeakMap<
+  ReadonlyArray<{ path: string; size: number }>,
+  DesktopRootFolderFileEntry[]
+>();
+
+/**
+ * Converts a flat manifest file list into cached entries for SubfolderFileTree.
+ */
+export function toTreeEntries(
+  files: ReadonlyArray<{ path: string; size: number }>
+): DesktopRootFolderFileEntry[] {
+  const cached = treeEntriesCache.get(files);
+  if (cached) return cached;
+  const entries = files.map((f) => {
+    const clean = normalizePath(f.path);
+    return {
+      relativePath: clean,
+      name: clean.split('/').pop() || clean,
+      size: f.size,
+    };
+  });
+  treeEntriesCache.set(files, entries);
+  return entries;
+}
 
 export default SubfolderFileTree;

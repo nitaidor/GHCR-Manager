@@ -718,6 +718,46 @@ html.theme-light:not(.theme-monochrome) .theme-error-banner {
   color: #7f1d1d !important;
 }
 
+.theme-warning-banner {
+  background-color: rgba(234, 179, 8, 0.12) !important;
+  border: 1px solid rgba(234, 179, 8, 0.45) !important;
+  color: #fde047 !important;
+}
+.theme-terminal-green .theme-warning-banner {
+  background-color: #000000 !important;
+  border: 1px solid #22c55e !important;
+  color: #4ade80 !important;
+}
+.theme-terminal-green .theme-warning-banner * {
+  color: #4ade80 !important;
+  stroke: #4ade80 !important;
+}
+.theme-terminal-red .theme-warning-banner {
+  background-color: #000000 !important;
+  border: 1px solid #ef4444 !important;
+  color: #f87171 !important;
+}
+.theme-terminal-red .theme-warning-banner * {
+  color: #f87171 !important;
+  stroke: #f87171 !important;
+}
+.theme-monochrome .theme-warning-banner,
+html.theme-monochrome .theme-warning-banner {
+  background-color: #f3f4f6 !important;
+  border: 2px solid #111827 !important;
+  color: #111827 !important;
+}
+.theme-monochrome .theme-warning-banner *,
+html.theme-monochrome .theme-warning-banner * {
+  color: #111827 !important;
+  stroke: #111827 !important;
+}
+html.theme-light:not(.theme-monochrome) .theme-warning-banner {
+  background-color: #fffbeb !important;
+  border: 1px solid #d97706 !important;
+  color: #92400e !important;
+}
+
 /* Custom Checkbox & Toggle Switch */
 .custom-checkbox {
   appearance: none;

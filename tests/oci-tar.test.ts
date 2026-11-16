@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { toOciImageName, validateFilesSelectionName } from '../src/lib/naming.ts';
+import {
+  formatTimestampTag,
+  toOciImageName,
+  validateFilesSelectionName,
+  validateOciTag,
+} from '../src/lib/naming.ts';
 import {
   buildOciLayerFromFiles,
   extractFileMetaListStreaming,
@@ -92,6 +97,28 @@ async function runTests() {
   ]);
   assert.ok(progressValues.length > 0);
   assert.equal(progressValues[progressValues.length - 1], 100);
+
+  console.log('5. Testing timestamp tag formatting and OCI tag validation...');
+  const sampleDate = new Date(2026, 10, 16, 13, 5, 9); // 2026-11-16 13:05:09 local
+  assert.equal(formatTimestampTag(sampleDate, '24h', 'YYYY-MM-DD'), '2026-11-16_13.05.09');
+  assert.equal(formatTimestampTag(sampleDate, '24h', 'YY-MM-DD'), '26-11-16_13.05.09');
+  assert.equal(formatTimestampTag(sampleDate, '24h', 'DD-MM-YYYY'), '16-11-2026_13.05.09');
+  assert.equal(formatTimestampTag(sampleDate, '24h', 'DD-MM-YY'), '16-11-26_13.05.09');
+  assert.equal(formatTimestampTag(sampleDate, '12h', 'YYYY-MM-DD'), '2026-11-16_01.05.09pm');
+  assert.equal(
+    formatTimestampTag(new Date(2026, 0, 5, 0, 4, 2), '12h', 'DD-MM-YYYY'),
+    '05-01-2026_12.04.02am'
+  );
+
+  assert.equal(validateOciTag('2026-11-16_13.05.09').valid, true);
+  assert.equal(validateOciTag('v1.0-rc_2').valid, true);
+  assert.equal(validateOciTag('').valid, false);
+  assert.equal(validateOciTag('.hidden').valid, false);
+  assert.equal(validateOciTag('-dash').valid, false);
+  assert.equal(validateOciTag('12:30:00').valid, false);
+  assert.equal(validateOciTag('2026/11/16').valid, false);
+  assert.equal(validateOciTag('a b').valid, false);
+  assert.equal(validateOciTag('a'.repeat(129)).valid, false);
 
   console.log('All tests passed successfully!');
 }
