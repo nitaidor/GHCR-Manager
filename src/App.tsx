@@ -212,24 +212,6 @@ export default function App() {
   const isDesktopEnv =
     typeof window !== 'undefined' && Boolean(window.electronAPI?.isDesktop);
 
-  // Lock background page scroll whenever any modal is open
-  const isAnyModalOpen =
-    showSettingsModal ||
-    showHelpModal ||
-    showAboutModal ||
-    showUploadPickerPrompt ||
-    showUploadVersionModal;
-  useEffect(() => {
-    if (isAnyModalOpen) {
-      document.documentElement.classList.add('modal-open');
-    } else {
-      document.documentElement.classList.remove('modal-open');
-    }
-    return () => {
-      document.documentElement.classList.remove('modal-open');
-    };
-  }, [isAnyModalOpen]);
-
   // --- Saved Credentials State (Displayed on Sign-In screen below each option's textbox) ---
   const [savedPats, setSavedPats] = useState<SavedPatCredential[]>(() => {
     try {
@@ -336,6 +318,24 @@ export default function App() {
   const [modalLivePkg, setModalLivePkg] = useState<GitHubPackageItem | null>(null);
   const [modalExistingVersions, setModalExistingVersions] = useState<GitHubPackageVersion[]>([]);
   const modalLookupSeqRef = useRef<number>(0);
+
+  // Lock background page scroll whenever any modal is open
+  const isAnyModalOpen =
+    showSettingsModal ||
+    showHelpModal ||
+    showAboutModal ||
+    showUploadPickerPrompt ||
+    showUploadVersionModal;
+  useEffect(() => {
+    if (isAnyModalOpen) {
+      document.documentElement.classList.add('modal-open');
+    } else {
+      document.documentElement.classList.remove('modal-open');
+    }
+    return () => {
+      document.documentElement.classList.remove('modal-open');
+    };
+  }, [isAnyModalOpen]);
 
   // --- TAB 2: Root Folder Sync state (Windows / Linux / macOS) ---
   const [rootScan, setRootScan] = useState<DesktopRootFolderScanResult | null>(null);
