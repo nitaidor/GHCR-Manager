@@ -64,7 +64,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         className="bg-[#161b22] border border-[#30363d] w-full max-w-2xl rounded-xl shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 flex flex-col max-h-[90vh]"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between p-6 border-b border-[#30363d] bg-[#0d1117]">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#30363d] bg-[#0d1117]">
           <h2 className="text-xl font-bold text-white flex items-center gap-2">
             <Settings className="w-6 h-6 text-gray-400" /> Application Settings
           </h2>
@@ -78,13 +78,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
 
-        <div className="p-6 overflow-y-auto space-y-8 flex-1">
+        <div className="p-5 overflow-y-auto space-y-6 flex-1">
           {/* Appearance Section (5 Themes + Clock & Date Format) */}
           <section>
-            <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 border-b border-[#30363d] pb-2">
+            <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-3 border-b border-[#30363d] pb-2">
               Appearance
             </h3>
-            <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-3">
               <div className="flex items-center justify-between bg-[#0d1117] p-4 rounded-md border border-[#30363d]">
                 <div>
                   <p className="font-medium text-gray-200">Application Theme</p>
@@ -209,10 +209,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {/* Timestamp Tags Section (Clock & Date Formats) */}
           <section>
-            <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 border-b border-[#30363d] pb-2">
+            <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-3 border-b border-[#30363d] pb-2">
               Default Timestamp Tags
             </h3>
-            <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-3">
               <div className="bg-[#0d1117] p-4 rounded-md border border-[#30363d]">
                 <div className="flex items-center gap-2 mb-1">
                   <Clock className="w-4 h-4 text-gray-400" />
@@ -243,13 +243,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
 
               <div className="bg-[#0d1117] p-4 rounded-md border border-[#30363d]">
-                <div className="flex items-center gap-2 mb-1">
-                  <Calendar className="w-4 h-4 text-gray-400" />
-                  <p className="font-medium text-gray-200 text-sm">Date Format</p>
+                <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
+                  <div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <Calendar className="w-4 h-4 text-gray-400" />
+                      <p className="font-medium text-gray-200 text-sm">Date Format</p>
+                    </div>
+                    <p className="text-xs text-gray-500">
+                      Date layout used when generating default upload tags.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs shrink-0">
+                    <span className="text-gray-400">Preview:</span>
+                    <code className="px-2 py-0.5 rounded bg-[#161b22] border border-[#30363d] text-white font-mono font-semibold">
+                      {formatTimestampTag(
+                        previewNow,
+                        settings.clockFormat,
+                        settings.dateFormat
+                      )}
+                    </code>
+                  </div>
                 </div>
-                <p className="text-xs text-gray-500 mb-3">
-                  Date layout used when generating default upload tags.
-                </p>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {DATE_FORMAT_OPTIONS.map((opt) => (
                     <button
@@ -268,17 +282,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <span className="text-[10px] opacity-75 font-mono">{opt.sample}</span>
                     </button>
                   ))}
-                </div>
-
-                <div className="mt-3 pt-3 border-t border-[#30363d] flex flex-wrap items-center gap-2 text-xs">
-                  <span className="text-gray-400">Live default tag preview:</span>
-                  <code className="px-2 py-0.5 rounded bg-[#161b22] border border-[#30363d] text-white font-mono font-semibold">
-                    {formatTimestampTag(
-                      previewNow,
-                      settings.clockFormat,
-                      settings.dateFormat
-                    )}
-                  </code>
                 </div>
               </div>
             </div>
