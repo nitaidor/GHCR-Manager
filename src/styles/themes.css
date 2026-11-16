@@ -708,3 +708,48 @@ html.theme-terminal-red .dropzone-container.is-drag-over,
 .dropzone-container.is-drag-over .dropzone-title {
   color: var(--theme-text-heading) !important;
 }
+
+/* Tab 2: Root Folder Dropzone/Picker - Green Highlight in Default Dark & Light Themes */
+.dropzone-container-sync:hover {
+  border-color: #22c55e !important;
+}
+html.theme-light:not(.theme-monochrome) .dropzone-container-sync:hover {
+  border-color: #16a34a !important;
+}
+html.theme-monochrome .dropzone-container-sync:hover,
+.theme-monochrome .dropzone-container-sync:hover {
+  border-color: #111827 !important;
+}
+html.theme-terminal-red .dropzone-container-sync:hover,
+.theme-terminal-red .dropzone-container-sync:hover {
+  border-color: #ef4444 !important;
+}
+html.theme-terminal-green .dropzone-container-sync:hover,
+.theme-terminal-green .dropzone-container-sync:hover {
+  border-color: #22c55e !important;
+}
+
+.dropzone-container-sync.is-drag-over {
+  border-color: #22c55e !important;
+  background-color: rgba(34, 197, 94, 0.12) !important;
+  box-shadow: none !important;
+}
+html.theme-light:not(.theme-monochrome) .dropzone-container-sync.is-drag-over {
+  border-color: #16a34a !important;
+  background-color: rgba(22, 163, 74, 0.1) !important;
+}
+html.theme-monochrome .dropzone-container-sync.is-drag-over,
+.theme-monochrome .dropzone-container-sync.is-drag-over {
+  border-color: #111827 !important;
+  background-color: #e5e7eb !important;
+}
+html.theme-terminal-red .dropzone-container-sync.is-drag-over,
+.theme-terminal-red .dropzone-container-sync.is-drag-over {
+  border-color: #ef4444 !important;
+  background-color: rgba(153, 27, 27, 0.25) !important;
+}
+html.theme-terminal-green .dropzone-container-sync.is-drag-over,
+.theme-terminal-green .dropzone-container-sync.is-drag-over {
+  border-color: #22c55e !important;
+  background-color: rgba(21, 128, 61, 0.25) !important;
+}

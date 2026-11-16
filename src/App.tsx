@@ -34,6 +34,7 @@ import TabNav, { type ActiveTab } from './components/TabNav';
 import SettingsModal from './components/SettingsModal';
 import HelpModal from './components/HelpModal';
 import AboutModal from './components/AboutModal';
+import SubfolderFileTree from './components/SubfolderFileTree';
 import {
   buildAndPushOciImage,
   deleteGitHubPackage,
@@ -286,7 +287,13 @@ export default function App() {
   const [expandedSubfolders, setExpandedSubfolders] = useState<Set<number>>(new Set());
   const [syncStatuses, setSyncStatuses] = useState<Record<number, SyncItemStatus>>({});
   const [isSyncingFolder, setIsSyncingFolder] = useState<boolean>(false);
+  const [isScanningFolder, setIsScanningFolder] = useState<boolean>(false);
+  const [isHoveringScanAbort, setIsHoveringScanAbort] = useState<boolean>(false);
+  const scanSequenceRef = useRef<number>(0);
+  const scanAbortControllerRef = useRef<AbortController | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [isDraggingRootFolder, setIsDraggingRootFolder] = useState<boolean>(false);
+  const rootFolderDragCounter = useRef<number>(0);
   const fallbackFolderInputRef = useRef<HTMLInputElement | null>(null);
   const fallbackFileMapRef = useRef<Map<string, File>>(new Map());
 
@@ -686,11 +693,35 @@ export default function App() {
   }
 
   // --- TAB 2: Root Folder Sync handlers (Windows, Linux, macOS) ---
-  async function handlePickRootFolder() {
+  function handleAbortScan() {
+    scanSequenceRef.current += 1;
+    if (scanAbortControllerRef.current) {
+      scanAbortControllerRef.current.abort();
+      scanAbortControllerRef.current = null;
+    }
+    setIsScanningFolder(false);
+    setIsHoveringScanAbort(false);
+  }
+
+  function handleRemoveRootFolder() {
+    handleAbortScan();
+    setRootScan(null);
+    setSelectedSyncIndices(new Set());
+    setExpandedSubfolders(new Set());
+    setSyncStatuses({});
     setSyncError(null);
+    fallbackFileMapRef.current.clear();
+  }
+
+  async function handlePickRootFolder() {
+    if (isScanningFolder || isSyncingFolder) return;
+    setSyncError(null);
+    const seq = ++scanSequenceRef.current;
     try {
       if (window.electronAPI?.pickRootFolder) {
+        setIsScanningFolder(true);
         const scan = await window.electronAPI.pickRootFolder();
+        if (scanSequenceRef.current !== seq) return;
         if (scan) {
           applyRootScan(scan);
         }
@@ -699,7 +730,9 @@ export default function App() {
 
       if (typeof window.showDirectoryPicker === 'function') {
         const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+        setIsScanningFolder(true);
         const scan = await scanBrowserDirectoryHandle(dirHandle);
+        if (scanSequenceRef.current !== seq) return;
         applyRootScan(scan);
         return;
       }
@@ -707,7 +740,14 @@ export default function App() {
       fallbackFolderInputRef.current?.click();
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return;
-      setSyncError(err instanceof Error ? err.message : String(err));
+      if (scanSequenceRef.current === seq) {
+        setSyncError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (scanSequenceRef.current === seq) {
+        setIsScanningFolder(false);
+        setIsHoveringScanAbort(false);
+      }
     }
   }
 
@@ -795,20 +835,38 @@ export default function App() {
   }
 
   async function handleRescanRootFolder() {
-    if (!rootScan) return;
+    if (!rootScan || isSyncingFolder) return;
+    if (isScanningFolder) {
+      handleAbortScan();
+      return;
+    }
+
     setSyncError(null);
+    const seq = ++scanSequenceRef.current;
+    setIsScanningFolder(true);
+    setIsHoveringScanAbort(false);
+
     try {
       if (window.electronAPI?.rescanRootFolder && rootScan.rootFolderPath) {
         const updated = await window.electronAPI.rescanRootFolder(
           rootScan.rootFolderPath
         );
+        if (scanSequenceRef.current !== seq) return;
         applyRootScan(updated);
       } else if (rootScan.dirHandle) {
         const updated = await scanBrowserDirectoryHandle(rootScan.dirHandle);
+        if (scanSequenceRef.current !== seq) return;
         applyRootScan(updated);
       }
     } catch (err: unknown) {
-      setSyncError(err instanceof Error ? err.message : String(err));
+      if (scanSequenceRef.current === seq) {
+        setSyncError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (scanSequenceRef.current === seq) {
+        setIsScanningFolder(false);
+        setIsHoveringScanAbort(false);
+      }
     }
   }
 
@@ -1699,11 +1757,65 @@ export default function App() {
                         e.stopPropagation();
                         e.dataTransfer.dropEffect = 'copy';
                       }}
-                      onDrop={(e) => {
+                      onDrop={async (e) => {
                         e.preventDefault();
                         e.stopPropagation();
                         fileDragCounter.current = 0;
                         setIsDraggingFiles(false);
+
+                        const items = e.dataTransfer.items;
+                        if (
+                          items &&
+                          items.length > 0 &&
+                          typeof items[0].webkitGetAsEntry === 'function'
+                        ) {
+                          const extractedFiles: File[] = [];
+                          const traverse = async (entry: any): Promise<void> => {
+                            if (!entry) return;
+                            if (entry.isFile) {
+                              await new Promise<void>((resolve) => {
+                                entry.file(
+                                  (f: File) => {
+                                    extractedFiles.push(f);
+                                    resolve();
+                                  },
+                                  () => resolve()
+                                );
+                              });
+                            } else if (entry.isDirectory) {
+                              const reader = entry.createReader();
+                              const readBatch = (): Promise<any[]> => {
+                                return new Promise((resolve) => {
+                                  reader.readEntries(
+                                    (ents: any[]) => resolve(ents || []),
+                                    () => resolve([])
+                                  );
+                                });
+                              };
+                              let batch: any[] = [];
+                              do {
+                                batch = await readBatch();
+                                for (const child of batch) {
+                                  await traverse(child);
+                                }
+                              } while (batch.length > 0);
+                            }
+                          };
+
+                          const entriesToProcess: any[] = [];
+                          for (let i = 0; i < items.length; i++) {
+                            const ent = items[i].webkitGetAsEntry();
+                            if (ent) entriesToProcess.push(ent);
+                          }
+                          for (const ent of entriesToProcess) {
+                            await traverse(ent);
+                          }
+                          if (extractedFiles.length > 0) {
+                            handleFilesAdded(extractedFiles);
+                            return;
+                          }
+                        }
+
                         if (e.dataTransfer.files?.length) {
                           handleFilesAdded(e.dataTransfer.files);
                         }
@@ -1728,11 +1840,11 @@ export default function App() {
                       <Upload className="w-8 h-8 icon-upload mx-auto mb-2.5 dropzone-icon transition-transform pointer-events-none" />
                       <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
                         {isDraggingFiles
-                          ? 'Drop file(s) here to select'
-                          : 'Click to choose file(s) or drag & drop here'}
+                          ? 'Drop files here to select'
+                          : 'Click to choose files or drag & drop here'}
                       </div>
                       <div className="text-xs text-gray-500 mt-1 pointer-events-none">
-                        Select 1 file or multiple files from your device
+                        Select one or multiple files or folders from your device
                       </div>
                     </div>
 
@@ -1935,21 +2047,61 @@ export default function App() {
                           onChange={handleFallbackWebkitDirectory}
                         />
                         {rootScan && (
-                          <button
-                            type="button"
-                            disabled={isSyncingFolder}
-                            onClick={handleRescanRootFolder}
-                            className="btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-                          >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                            Rescan
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              disabled={isSyncingFolder}
+                              onClick={handleRescanRootFolder}
+                              onMouseEnter={() => isScanningFolder && setIsHoveringScanAbort(true)}
+                              onMouseLeave={() => setIsHoveringScanAbort(false)}
+                              title={
+                                isScanningFolder
+                                  ? 'Click to abort scanning'
+                                  : 'Rescan root folder'
+                              }
+                              className={`btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                                isScanningFolder && isHoveringScanAbort
+                                  ? 'hover:text-red-400 hover:border-red-500/50'
+                                  : ''
+                              }`}
+                            >
+                              {isScanningFolder ? (
+                                isHoveringScanAbort ? (
+                                  <>
+                                    <X className="w-3.5 h-3.5 text-red-400" />
+                                    <span>Cancel</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin theme-spinner" />
+                                    <span>Scanning...</span>
+                                  </>
+                                )
+                              ) : (
+                                <>
+                                  <RefreshCw className="w-3.5 h-3.5" />
+                                  <span>Rescan</span>
+                                </>
+                              )}
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={isSyncingFolder || isScanningFolder}
+                              onClick={handleRemoveRootFolder}
+                              title="Remove root folder"
+                              className="btn-modal-action px-3 py-2 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer hover:text-red-400 hover:border-red-500/50 transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Remove Folder</span>
+                            </button>
+                          </>
                         )}
                         <button
                           type="button"
-                          disabled={isSyncingFolder}
+                          disabled={isSyncingFolder || isScanningFolder}
                           onClick={handlePickRootFolder}
-                          className="px-4 py-2 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-2 cursor-pointer"
+                          className="px-4 py-2 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <Folder className="w-4 h-4" />
                           {rootScan ? 'Change Root Folder' : 'Choose Root Folder'}
@@ -1967,11 +2119,64 @@ export default function App() {
                     {!rootScan ? (
                       <div
                         onClick={handlePickRootFolder}
-                        className="dropzone-container rounded-xl p-10 text-center transition cursor-pointer select-none"
+                        onDragEnter={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          rootFolderDragCounter.current += 1;
+                          if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+                            setIsDraggingRootFolder(true);
+                          }
+                        }}
+                        onDragLeave={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          rootFolderDragCounter.current -= 1;
+                          if (rootFolderDragCounter.current <= 0) {
+                            rootFolderDragCounter.current = 0;
+                            setIsDraggingRootFolder(false);
+                          }
+                        }}
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          e.dataTransfer.dropEffect = 'copy';
+                        }}
+                        onDrop={async (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          rootFolderDragCounter.current = 0;
+                          setIsDraggingRootFolder(false);
+                          const firstFile = e.dataTransfer.files?.[0] as any;
+                          if (firstFile?.path && window.electronAPI?.rescanRootFolder) {
+                            const seq = ++scanSequenceRef.current;
+                            setIsScanningFolder(true);
+                            try {
+                              const scan = await window.electronAPI.rescanRootFolder(
+                                firstFile.path
+                              );
+                              if (scanSequenceRef.current === seq && scan) {
+                                applyRootScan(scan);
+                              }
+                            } catch {
+                              handlePickRootFolder();
+                            } finally {
+                              if (scanSequenceRef.current === seq) {
+                                setIsScanningFolder(false);
+                              }
+                            }
+                          } else {
+                            handlePickRootFolder();
+                          }
+                        }}
+                        className={`dropzone-container dropzone-container-sync rounded-xl p-10 text-center transition cursor-pointer select-none ${
+                          isDraggingRootFolder ? 'is-drag-over' : ''
+                        }`}
                       >
                         <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3 dropzone-icon transition-transform pointer-events-none" />
                         <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
-                          Select a Root Folder to Scan
+                          {isDraggingRootFolder
+                            ? 'Drop root folder here to scan'
+                            : 'Select a Root Folder to Scan'}
                         </div>
                         <p className="text-xs text-gray-500 max-w-md mx-auto mt-1 pointer-events-none">
                           Detects all direct files and immediate sub-folders and prepares
@@ -2007,6 +2212,17 @@ export default function App() {
                               className="text-gray-400 hover:text-gray-200 cursor-pointer"
                             >
                               None
+                            </button>
+                            <span className="text-gray-600">|</span>
+                            <button
+                              type="button"
+                              disabled={isSyncingFolder || isScanningFolder}
+                              onClick={handleRemoveRootFolder}
+                              title="Remove root folder"
+                              className="text-gray-400 hover:text-red-400 flex items-center gap-1 cursor-pointer transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                              Remove
                             </button>
                           </div>
                         </div>
@@ -2128,21 +2344,7 @@ export default function App() {
                                   )}
 
                                   {item.kind === 'root-subfolder' && isExpanded && (
-                                    <div className="mt-3 pl-7 space-y-1 max-h-40 overflow-y-auto border-l border-[#30363d] ml-2">
-                                      {item.files.map((f, fIdx) => (
-                                        <div
-                                          key={`${f.relativePath}-${fIdx}`}
-                                          className="text-[11px] text-gray-400 flex items-center justify-between pr-2 font-mono"
-                                        >
-                                          <span className="truncate">
-                                            {f.relativePath}
-                                          </span>
-                                          <span className="text-gray-500 shrink-0 ml-2">
-                                            {formatBytes(f.size)}
-                                          </span>
-                                        </div>
-                                      ))}
-                                    </div>
+                                    <SubfolderFileTree files={item.files} />
                                   )}
                                 </div>
                               );
