@@ -294,6 +294,7 @@ export default function App() {
   const uploadFolderInputRef = useRef<HTMLInputElement | null>(null);
   const fileDragCounter = useRef<number>(0);
   const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
+  const [showUploadPickerPrompt, setShowUploadPickerPrompt] = useState<boolean>(false);
 
   // --- TAB 2: Root Folder Sync state (Windows / Linux / macOS) ---
   const [rootScan, setRootScan] = useState<DesktopRootFolderScanResult | null>(null);
@@ -308,8 +309,6 @@ export default function App() {
   const activeScanIdRef = useRef<string | null>(null);
   const scanAbortControllerRef = useRef<AbortController | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [isDraggingRootFolder, setIsDraggingRootFolder] = useState<boolean>(false);
-  const rootFolderDragCounter = useRef<number>(0);
   const fallbackFolderInputRef = useRef<HTMLInputElement | null>(null);
   const fallbackFileMapRef = useRef<Map<string, File>>(new Map());
 
@@ -2060,13 +2059,13 @@ export default function App() {
 
             {selectedRepo && (
               <>
-                {/* ==================== TAB 1: UPLOAD FILE(S) ==================== */}
+                {/* ==================== TAB 1: UPLOAD FILES ==================== */}
                 {activeTab === 'upload-files' && (
                   <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-6">
                     <div>
                       <h3 className="text-base font-bold text-white flex items-center gap-2">
                         <FilePlus2 className="w-5 h-5 icon-upload" />
-                        Upload Single or Multiple Files as an Image
+                        Upload Files as an Image
                       </h3>
                       <p className="text-xs text-gray-400 mt-1">
                         Select files or folders to package into an OCI container image and push to{' '}
@@ -2329,7 +2328,7 @@ export default function App() {
                       }}
                       onClick={() => {
                         if (!isScanningUploadDrop) {
-                          fileInputRef.current?.click();
+                          setShowUploadPickerPrompt(true);
                         }
                       }}
                       className={`dropzone-container rounded-xl p-8 text-center transition select-none ${
@@ -2385,14 +2384,92 @@ export default function App() {
                           <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
                             {isDraggingFiles
                               ? 'Drop files or folders here to select'
-                              : 'Click to choose files or drag & drop here'}
+                              : 'Click to choose files or folders, or drag & drop here'}
                           </div>
                           <div className="text-xs text-gray-500 mt-1 pointer-events-none">
                             Select one or multiple files or folders from your device
                           </div>
+                          <div className="mt-3 flex items-center justify-center gap-2.5">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                fileInputRef.current?.click();
+                              }}
+                              className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                            >
+                              <FileIcon className="w-3.5 h-3.5 icon-upload" />
+                              Choose Files
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handlePickUploadFolders();
+                              }}
+                              className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                            >
+                              <Folder className="w-3.5 h-3.5 icon-upload" />
+                              Choose Folder
+                            </button>
+                          </div>
                         </>
                       )}
                     </div>
+
+                    {/* Upload Choice Modal (Triggered by Clicking Dropzone Area) */}
+                    {showUploadPickerPrompt && (
+                      <div
+                        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4"
+                        onClick={() => setShowUploadPickerPrompt(false)}
+                      >
+                        <div
+                          className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 max-w-sm w-full space-y-4 shadow-xl"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                              <Upload className="w-4 h-4 icon-upload" />
+                              Choose from Device
+                            </h4>
+                            <button
+                              type="button"
+                              onClick={() => setShowUploadPickerPrompt(false)}
+                              className="modal-close-btn p-1"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <p className="text-xs text-gray-400">
+                            Select whether you want to choose individual files or a whole folder:
+                          </p>
+                          <div className="grid grid-cols-2 gap-3 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowUploadPickerPrompt(false);
+                                fileInputRef.current?.click();
+                              }}
+                              className="btn-modal-action py-3 px-3 rounded-lg text-xs font-semibold flex flex-col items-center gap-2 cursor-pointer text-center"
+                            >
+                              <FileIcon className="w-6 h-6 icon-upload" />
+                              <span>Choose Files</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowUploadPickerPrompt(false);
+                                handlePickUploadFolders();
+                              }}
+                              className="btn-modal-action py-3 px-3 rounded-lg text-xs font-semibold flex flex-col items-center gap-2 cursor-pointer text-center"
+                            >
+                              <Folder className="w-6 h-6 icon-upload" />
+                              <span>Choose Folder</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Picked Files & Folders List */}
                     {pickedItems.length > 0 && (
@@ -2612,14 +2689,14 @@ export default function App() {
                   </div>
                 )}
 
-                {/* ==================== TAB 2: SYNC ROOT FOLDER (DESKTOP) ==================== */}
+                {/* ==================== TAB 2: SYNC ROOT FOLDER ==================== */}
                 {activeTab === 'sync-folder' && (
                   <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-6">
                     <div className="flex flex-wrap items-start justify-between gap-4">
                       <div>
                         <h3 className="text-base font-bold text-white flex items-center gap-2">
                           <FolderSync className="w-5 h-5 icon-sync" />
-                          Root Folder Auto-Image Sync (Windows, Linux, macOS)
+                          Sync Root Folder
                         </h3>
                         <p className="text-xs text-gray-400 mt-1">
                           Choose a root folder on your computer and press{' '}
@@ -2712,77 +2789,9 @@ export default function App() {
                             handlePickRootFolder();
                           }
                         }}
-                        onDragEnter={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          if (isScanningFolder) return;
-                          rootFolderDragCounter.current += 1;
-                          if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
-                            setIsDraggingRootFolder(true);
-                          }
-                        }}
-                        onDragLeave={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          rootFolderDragCounter.current -= 1;
-                          if (rootFolderDragCounter.current <= 0) {
-                            rootFolderDragCounter.current = 0;
-                            setIsDraggingRootFolder(false);
-                          }
-                        }}
-                        onDragOver={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          e.dataTransfer.dropEffect = 'copy';
-                        }}
-                        onDrop={async (e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          rootFolderDragCounter.current = 0;
-                          setIsDraggingRootFolder(false);
-                          if (isScanningFolder) return;
-                          const firstFile = e.dataTransfer.files?.[0] as any;
-                          if (firstFile?.path && window.electronAPI?.rescanRootFolder) {
-                            const seq = ++scanSequenceRef.current;
-                            const scanId = `root-drop-${Date.now()}-${seq}`;
-                            activeScanIdRef.current = scanId;
-                            setIsScanningFolder(true);
-                            setIsHoveringScanAbort(false);
-                            try {
-                              await new Promise((r) =>
-                                requestAnimationFrame(() => setTimeout(r, 0))
-                              );
-                              const scan = await window.electronAPI.rescanRootFolder(
-                                firstFile.path,
-                                scanId
-                              );
-                              if (scanSequenceRef.current === seq && scan) {
-                                applyRootScan(scan);
-                              }
-                            } catch (err: unknown) {
-                              if (
-                                !(
-                                  err instanceof Error &&
-                                  err.message === 'SCAN_ABORTED'
-                                ) &&
-                                scanSequenceRef.current === seq
-                              ) {
-                                handlePickRootFolder();
-                              }
-                            } finally {
-                              if (scanSequenceRef.current === seq) {
-                                activeScanIdRef.current = null;
-                                setIsScanningFolder(false);
-                                setIsHoveringScanAbort(false);
-                              }
-                            }
-                          } else {
-                            handlePickRootFolder();
-                          }
-                        }}
                         className={`dropzone-container dropzone-container-sync rounded-xl p-10 text-center transition select-none ${
                           isScanningFolder ? 'cursor-default' : 'cursor-pointer'
-                        } ${isDraggingRootFolder ? 'is-drag-over' : ''}`}
+                        }`}
                       >
                         {isScanningFolder ? (
                           <div className="space-y-3 py-1">
@@ -2808,9 +2817,7 @@ export default function App() {
                           <>
                             <HardDrive className="w-9 h-9 icon-sync mx-auto mb-3 dropzone-icon transition-transform pointer-events-none" />
                             <div className="text-sm font-semibold text-white dropzone-title transition-colors pointer-events-none">
-                              {isDraggingRootFolder
-                                ? 'Drop root folder here to scan'
-                                : 'Select a Root Folder to Scan'}
+                              Click to Choose a Root Folder to Scan
                             </div>
                             <p className="text-xs text-gray-500 max-w-md mx-auto mt-1 pointer-events-none">
                               Detects all direct files and immediate sub-folders and prepares
@@ -3148,7 +3155,7 @@ export default function App() {
                           No packages linked to {selectedRepo.full_name} yet
                         </div>
                         <p className="text-xs text-gray-500 max-w-md mx-auto">
-                          Use the &quot;Upload File(s)&quot; or &quot;Sync Root
+                          Use the &quot;Upload Files&quot; or &quot;Sync Root
                           Folder&quot; tabs to create and push your first container
                           package image.
                         </p>

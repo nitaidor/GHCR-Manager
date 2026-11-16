@@ -126,7 +126,7 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
       {depth > 0 && (
         <div
           onClick={handleToggleFolder}
-          className="flex items-center justify-between py-1 px-1.5 rounded hover:bg-[#161b22] cursor-pointer transition text-xs select-none"
+          className="tree-node-row flex items-center justify-between py-1 px-1.5 rounded cursor-pointer transition text-xs select-none"
         >
           <div className="flex items-center gap-1.5 min-w-0">
             {isExpandingNode ? (
@@ -141,14 +141,14 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
             ) : (
               <Folder className={`w-3.5 h-3.5 ${iconClassName} shrink-0`} />
             )}
-            <span className="font-semibold text-gray-200 truncate">
+            <span className="font-semibold truncate tree-node-label">
               {node.name}/
             </span>
-            <span className="text-[10px] text-gray-500 shrink-0">
+            <span className="text-[10px] shrink-0 tree-node-sub">
               ({node.fileCount} file{node.fileCount === 1 ? '' : 's'})
             </span>
           </div>
-          <span className="text-[10px] text-gray-500 font-mono shrink-0 ml-2">
+          <span className="text-[10px] font-mono shrink-0 ml-2 tree-node-sub">
             {formatBytes(node.size)}
           </span>
         </div>
@@ -174,13 +174,13 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
           {visibleFiles.map((file, idx) => (
             <div
               key={`${file.relativePath}-${idx}`}
-              className="flex items-center justify-between py-0.5 px-1.5 text-[11px] text-gray-400 font-mono hover:text-gray-200 transition"
+              className="tree-node-row flex items-center justify-between py-0.5 px-1.5 rounded text-[11px] font-mono transition"
             >
               <div className="flex items-center gap-1.5 min-w-0">
                 <FileText className="w-3 h-3 text-gray-500 shrink-0" />
-                <span className="truncate">{file.name}</span>
+                <span className="truncate tree-node-label">{file.name}</span>
               </div>
-              <span className="text-gray-500 shrink-0 ml-2 text-[10px]">
+              <span className="shrink-0 ml-2 text-[10px] tree-node-sub">
                 {formatBytes(file.size)}
               </span>
             </div>

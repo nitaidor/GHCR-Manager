@@ -295,6 +295,79 @@ html.theme-light:not(.theme-monochrome) .btn-modal-action:hover,
   border-color: #000000 !important;
 }
 
+/* Subfolder File Tree Rows - Theme Adherent Hover & Contrast */
+.tree-node-row {
+  background-color: transparent !important;
+  color: var(--theme-text-main) !important;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.tree-node-row .tree-node-label {
+  color: var(--theme-text-main) !important;
+}
+.tree-node-row .tree-node-sub {
+  color: var(--theme-text-muted) !important;
+}
+
+/* Default Dark Theme Hover */
+.tree-node-row:hover {
+  background-color: var(--theme-surface-hover) !important;
+}
+.tree-node-row:hover .tree-node-label {
+  color: var(--theme-text-heading) !important;
+}
+
+/* Terminal Green Theme Hover - Green tint, bright green text (no blue!) */
+.theme-terminal-green .tree-node-row:hover,
+html.theme-terminal-green .tree-node-row:hover {
+  background-color: rgba(34, 197, 94, 0.2) !important;
+}
+.theme-terminal-green .tree-node-row:hover .tree-node-label,
+html.theme-terminal-green .tree-node-row:hover .tree-node-label,
+.theme-terminal-green .tree-node-row:hover .tree-node-sub,
+html.theme-terminal-green .tree-node-row:hover .tree-node-sub {
+  color: #4ade80 !important;
+}
+
+/* Terminal Red Theme Hover - Red tint, bright red text (no blue!) */
+.theme-terminal-red .tree-node-row:hover,
+html.theme-terminal-red .tree-node-row:hover {
+  background-color: rgba(239, 68, 68, 0.2) !important;
+}
+.theme-terminal-red .tree-node-row:hover .tree-node-label,
+html.theme-terminal-red .tree-node-row:hover .tree-node-label,
+.theme-terminal-red .tree-node-row:hover .tree-node-sub,
+html.theme-terminal-red .tree-node-row:hover .tree-node-sub {
+  color: #f87171 !important;
+}
+
+/* Default Light Theme Hover - Light gray background, dark high-contrast text (no black on black!) */
+html.theme-light:not(.theme-monochrome) .tree-node-row:hover,
+.theme-light:not(.theme-monochrome) .tree-node-row:hover {
+  background-color: #e5e7eb !important;
+}
+html.theme-light:not(.theme-monochrome) .tree-node-row:hover .tree-node-label,
+.theme-light:not(.theme-monochrome) .tree-node-row:hover .tree-node-label {
+  color: #111827 !important;
+}
+html.theme-light:not(.theme-monochrome) .tree-node-row:hover .tree-node-sub,
+.theme-light:not(.theme-monochrome) .tree-node-row:hover .tree-node-sub {
+  color: #374151 !important;
+}
+
+/* Monochrome Theme Hover - Light gray background, dark high-contrast text (no black on black!) */
+html.theme-monochrome .tree-node-row:hover,
+.theme-monochrome .tree-node-row:hover {
+  background-color: #e5e7eb !important;
+}
+html.theme-monochrome .tree-node-row:hover .tree-node-label,
+.theme-monochrome .tree-node-row:hover .tree-node-label {
+  color: #111827 !important;
+}
+html.theme-monochrome .tree-node-row:hover .tree-node-sub,
+.theme-monochrome .tree-node-row:hover .tree-node-sub {
+  color: #374151 !important;
+}
+
 /* Header Settings Button & Dropdown */
 .header-settings-btn {
   color: var(--theme-text-muted) !important;

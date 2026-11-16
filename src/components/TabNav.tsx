@@ -18,7 +18,7 @@ export const TabNav: React.FC<TabNavProps> = ({
 }) => {
   return (
     <nav className="w-full max-w-4xl flex justify-start items-center gap-8 border-b border-[#30363d] -mt-1.5 mb-8 overflow-x-auto no-scrollbar relative z-10">
-      {/* 1. Upload File(s) */}
+      {/* 1. Upload Files */}
       <button
         type="button"
         onClick={() => setActiveTab('upload-files')}
@@ -28,13 +28,13 @@ export const TabNav: React.FC<TabNavProps> = ({
             : 'text-gray-500 hover:text-gray-300'
         }`}
       >
-        <Upload className="w-4 h-4" /> Upload File(s)
+        <Upload className="w-4 h-4" /> Upload Files
         {activeTab === 'upload-files' && (
           <div className="absolute bottom-0 left-0 w-full h-0.5 tab-indicator rounded-t-md z-20"></div>
         )}
       </button>
 
-      {/* 2. Sync Root Folder (Desktop Only — Disabled & Theme-Adherent in WebView) */}
+      {/* 2. Sync Root Folder (Disabled & Theme-Adherent in WebView) */}
       <button
         type="button"
         disabled={!isDesktop}
@@ -55,7 +55,7 @@ export const TabNav: React.FC<TabNavProps> = ({
               : 'text-gray-500 hover:text-gray-300 cursor-pointer'
         }`}
       >
-        <FolderSync className="w-4 h-4" /> Sync Root Folder (Desktop)
+        <FolderSync className="w-4 h-4" /> Sync Root Folder
         {isDesktop && activeTab === 'sync-folder' && (
           <div className="absolute bottom-0 left-0 w-full h-0.5 tab-indicator rounded-t-md z-20"></div>
         )}
