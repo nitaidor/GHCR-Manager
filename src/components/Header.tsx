@@ -130,21 +130,9 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       <div
-        className="absolute right-0 top-0 md:static settings-menu-container relative z-50 flex items-center gap-2"
+        className="absolute right-0 top-0 md:static settings-menu-container relative z-50"
         ref={menuRef}
       >
-        {user && (
-          <button
-            type="button"
-            onClick={onSignOut}
-            title="Sign Out"
-            className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-          >
-            <LogOut className="w-3.5 h-3.5" />
-            Sign Out
-          </button>
-        )}
-
         <button
           type="button"
           onClick={() => setShowMenu(!showMenu)}
@@ -186,6 +174,18 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <Info className="w-4 h-4 shrink-0" /> About GHCR Manager
             </button>
+            {user && (
+              <button
+                type="button"
+                onClick={() => {
+                  onSignOut();
+                  setShowMenu(false);
+                }}
+                className="theme-menu-item w-full text-left px-4 py-3 text-sm flex items-center gap-2 border-t border-[#30363d] whitespace-nowrap transition-colors"
+              >
+                <LogOut className="w-4 h-4 shrink-0" /> Sign Out
+              </button>
+            )}
           </div>
         )}
       </div>
