@@ -144,7 +144,9 @@ app.setName('GHCR Manager');
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('no-sandbox');
 }
-if (process.platform === 'win32') {
+// In portable runs the app launches from a temporary extracted binary with no Start Menu shortcut,
+// so keep the custom AppUserModelId for installed builds only.
+if (process.platform === 'win32' && !process.env.PORTABLE_EXECUTABLE_FILE) {
   app.setAppUserModelId('io.ghcr.manager');
 }
 

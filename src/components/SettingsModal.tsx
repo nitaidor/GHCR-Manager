@@ -24,8 +24,8 @@ const DATE_FORMAT_OPTIONS: Array<{ value: DateFormat; label: string; sample: str
 ];
 
 const CLOCK_FORMAT_OPTIONS: Array<{ value: ClockFormat; label: string; sample: string }> = [
-  { value: '24h', label: '24-Hour', sample: '13.05.09' },
   { value: '12h', label: '12-Hour (AM/PM)', sample: '01.05.09pm' },
+  { value: '24h', label: '24-Hour', sample: '13.05.09' },
 ];
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({

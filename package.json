@@ -43,6 +43,9 @@
   "build": {
     "appId": "io.ghcr.manager",
     "productName": "GHCR Manager",
+    "extraMetadata": {
+      "description": "GHCR Manager"
+    },
     "directories": {
       "output": "dist-exe"
     },
