@@ -319,24 +319,6 @@ export default function App() {
   const [modalExistingVersions, setModalExistingVersions] = useState<GitHubPackageVersion[]>([]);
   const modalLookupSeqRef = useRef<number>(0);
 
-  // Lock background page scroll whenever any modal is open
-  const isAnyModalOpen =
-    showSettingsModal ||
-    showHelpModal ||
-    showAboutModal ||
-    showUploadPickerPrompt ||
-    showUploadVersionModal;
-  useEffect(() => {
-    if (isAnyModalOpen) {
-      document.documentElement.classList.add('modal-open');
-    } else {
-      document.documentElement.classList.remove('modal-open');
-    }
-    return () => {
-      document.documentElement.classList.remove('modal-open');
-    };
-  }, [isAnyModalOpen]);
-
   // --- TAB 2: Root Folder Sync state (Windows / Linux / macOS) ---
   const [rootScan, setRootScan] = useState<DesktopRootFolderScanResult | null>(null);
   const [selectedSyncIndices, setSelectedSyncIndices] = useState<Set<number>>(new Set());
@@ -380,6 +362,38 @@ export default function App() {
     pkg: GitHubPackageItem;
     version: GitHubPackageVersion;
   } | null>(null);
+
+  // Lock background page scroll whenever any modal is open
+  const isAnyModalOpen =
+    showSettingsModal ||
+    showHelpModal ||
+    showAboutModal ||
+    showUploadPickerPrompt ||
+    showUploadVersionModal ||
+    Boolean(confirmDeletePkg) ||
+    Boolean(confirmDeleteVersion);
+  useEffect(() => {
+    if (isAnyModalOpen) {
+      document.documentElement.classList.add('modal-open');
+    } else {
+      document.documentElement.classList.remove('modal-open');
+    }
+    return () => {
+      document.documentElement.classList.remove('modal-open');
+    };
+  }, [isAnyModalOpen]);
+
+  useEffect(() => {
+    if (!confirmDeletePkg && !confirmDeleteVersion) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setConfirmDeletePkg(null);
+        setConfirmDeleteVersion(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [confirmDeletePkg, confirmDeleteVersion]);
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [actionBanner, setActionBanner] = useState<{
     type: 'success' | 'error';
@@ -1131,6 +1145,10 @@ export default function App() {
           `Uploaded ${details.packageName}:${details.tag}, but failed to remove ${deleteErrors.length} old version(s): ${deleteErrors.join('; ')}`
         );
       }
+      setPickedItems([]);
+      setExpandedUploadFolders(new Set());
+      setLoadingUploadFolders(new Set());
+      setCustomImageName('');
       setShowUploadVersionModal(false);
       await refreshPackages();
     } catch (err: unknown) {
@@ -2902,35 +2920,6 @@ export default function App() {
                           </div>
                         )}
 
-                        {uploadError && !showUploadVersionModal && (
-                          <div className="p-3 rounded-md theme-error-banner text-xs flex items-start gap-2">
-                            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                            <span>{uploadError}</span>
-                          </div>
-                        )}
-
-                        {uploadSuccess && (
-                          <div className="p-3.5 rounded-md theme-success-banner text-xs flex items-center justify-between gap-3">
-                            <div className="flex items-center gap-2">
-                              <CheckCircle2 className="w-4 h-4 shrink-0" />
-                              <div>
-                                <span className="font-semibold">
-                                  Image &quot;{uploadSuccess.packageName}:{uploadSuccess.tag}&quot; uploaded!
-                                </span>{' '}
-                                ({uploadSuccess.fileCount} file(s), compressed size{' '}
-                                {formatBytes(uploadSuccess.compressedSize)})
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => setActiveTab('packages')}
-                              className="btn-modal-action px-2.5 py-1 rounded-md font-medium shrink-0 cursor-pointer"
-                            >
-                              View in Packages →
-                            </button>
-                          </div>
-                        )}
-
                         <button
                           type="button"
                           disabled={!fileNamingValidation.valid || !!uploadProgress}
@@ -2941,6 +2930,55 @@ export default function App() {
                           Create Image &quot;
                           {fileNamingValidation.ociPackageName || '...'}&quot;
                         </button>
+                      </div>
+                    )}
+
+                    {uploadError && !showUploadVersionModal && (
+                      <div className="p-3 rounded-md theme-error-banner text-xs flex items-center justify-between gap-2">
+                        <div className="flex items-start gap-2">
+                          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                          <span>{uploadError}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setUploadError(null)}
+                          className="modal-close-btn p-1 shrink-0"
+                          aria-label="Dismiss error"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+
+                    {uploadSuccess && (
+                      <div className="p-3.5 rounded-md theme-success-banner text-xs flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <CheckCircle2 className="w-4 h-4 shrink-0" />
+                          <div>
+                            <span className="font-semibold">
+                              Image &quot;{uploadSuccess.packageName}:{uploadSuccess.tag}&quot; uploaded!
+                            </span>{' '}
+                            ({uploadSuccess.fileCount} file(s), compressed size{' '}
+                            {formatBytes(uploadSuccess.compressedSize)})
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab('packages')}
+                            className="btn-modal-action px-2.5 py-1 rounded-md font-medium cursor-pointer"
+                          >
+                            View in Packages →
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setUploadSuccess(null)}
+                            className="modal-close-btn p-1"
+                            aria-label="Dismiss notice"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -3372,77 +3410,6 @@ export default function App() {
                       </div>
                     )}
 
-                    {confirmDeletePkg && (
-                      <div className="p-4 rounded-md theme-error-banner flex flex-wrap items-center justify-between gap-3">
-                        <div className="text-xs">
-                          Are you sure you want to permanently remove the entire package{' '}
-                          <strong className="font-mono">{confirmDeletePkg.name}</strong>{' '}
-                          and all of its versions from GitHub Packages?
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDeletePkg(null)}
-                            className="btn-modal-action px-3 py-1.5 rounded-md text-xs cursor-pointer"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleDeletePackageConfirmed(confirmDeletePkg)
-                            }
-                            className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
-                          >
-                            Confirm Remove
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {confirmDeleteVersion && (() => {
-                      const info = getVersionReferenceInfo(confirmDeleteVersion.version);
-                      const siblingCount = (
-                        packageVersionsMap[confirmDeleteVersion.pkg.name.toLowerCase()] ||
-                        []
-                      ).length;
-                      return (
-                        <div className="p-4 rounded-md theme-error-banner flex flex-wrap items-center justify-between gap-3">
-                          <div className="text-xs">
-                            Are you sure you want to permanently remove{' '}
-                            <strong className="font-mono">
-                              {confirmDeleteVersion.pkg.name}
-                              {info.pullSuffix}
-                            </strong>
-                            ?{' '}
-                            {siblingCount <= 1 && (
-                              <span>
-                                Since this is the only version remaining, this will delete the package from GitHub Packages.
-                              </span>
-                            )}
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteVersion(null)}
-                              className="btn-modal-action px-3 py-1.5 rounded-md text-xs cursor-pointer"
-                            >
-                              Cancel
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleDeleteVersionConfirmed(confirmDeleteVersion)
-                              }
-                              className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
-                            >
-                              Confirm Remove
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })()}
-
                     {packagesLoading ? (
                       <div className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2">
                         <Loader2 className="w-6 h-6 animate-spin theme-spinner" />
@@ -3730,6 +3697,101 @@ export default function App() {
       )}
 
       {/* Modals */}
+      {(confirmDeletePkg || confirmDeleteVersion) && (() => {
+        const isPackageDelete = Boolean(confirmDeletePkg);
+        const pkgName = confirmDeletePkg
+          ? confirmDeletePkg.name
+          : confirmDeleteVersion!.pkg.name;
+        const info = confirmDeleteVersion
+          ? getVersionReferenceInfo(confirmDeleteVersion.version)
+          : null;
+        const siblingCount = confirmDeleteVersion
+          ? (packageVersionsMap[pkgName.toLowerCase()] || []).length
+          : 0;
+        const closeDeleteModal = () => {
+          setConfirmDeletePkg(null);
+          setConfirmDeleteVersion(null);
+        };
+        const handleConfirm = () => {
+          if (confirmDeletePkg) {
+            handleDeletePackageConfirmed(confirmDeletePkg);
+          } else if (confirmDeleteVersion) {
+            handleDeleteVersionConfirmed(confirmDeleteVersion);
+          }
+        };
+
+        return createPortal(
+          <div
+            className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+            onClick={closeDeleteModal}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-[#161b22] border border-[#30363d] rounded-xl w-full max-w-md overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-150"
+            >
+              <div className="flex items-center justify-between p-5 border-b border-[#30363d] bg-[#0d1117]">
+                <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Trash2 className="w-4 h-4 icon-packages" />
+                  {isPackageDelete ? 'Remove Package' : 'Remove Image Version'}
+                </h4>
+                <button
+                  type="button"
+                  onClick={closeDeleteModal}
+                  aria-label="Close confirmation dialog"
+                  className="modal-close-btn p-1"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="p-3.5 rounded-md theme-error-banner text-xs leading-relaxed">
+                  {isPackageDelete ? (
+                    <>
+                      Are you sure you want to permanently remove the entire package{' '}
+                      <strong className="font-mono">{pkgName}</strong> and all of its versions from GitHub Packages?
+                    </>
+                  ) : (
+                    <>
+                      Are you sure you want to permanently remove{' '}
+                      <strong className="font-mono">
+                        {pkgName}
+                        {info?.pullSuffix}
+                      </strong>
+                      ?
+                      {siblingCount <= 1 && (
+                        <span className="block mt-1.5">
+                          Since this is the only version remaining, this will permanently delete package{' '}
+                          <strong className="font-mono">{pkgName}</strong> from GitHub Packages.
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={closeDeleteModal}
+                    className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirm}
+                    className="px-3.5 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
+                  >
+                    Confirm Remove
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        );
+      })()}
+
       {selectedRepo && (
         <UploadVersionModal
           isOpen={showUploadVersionModal}
