@@ -3,7 +3,7 @@
 A package manager to build, sync, inspect, download, and manage OCI container images on GitHub Packages (ghcr.io).
 
 ## About The Project
-Pushing files or folders to GitHub Packages (`ghcr.io`) traditionally requires installing Docker or complex command-line tools like `oras` and `skopeo`, making it tedious on desktop and impossible on mobile devices. GHCR Manager was built to turn GitHub Container Registry into an effortless, visual file and folder package manager—building compliant OCI container layers directly in-memory and linking them automatically to your GitHub repositories.
+Pushing files or folders to GitHub Packages (`ghcr.io`) traditionally requires installing Docker or complex command-line tools like `oras` and `skopeo`, making it tedious on desktop and impossible on mobile devices. GHCR Manager was built to turn GitHub Container Registry into an effortless, visual file and folder package manager, building compliant OCI container layers directly in-memory and linking them automatically to your GitHub repositories.
 
 ## Key Features
 
