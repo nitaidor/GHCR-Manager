@@ -17,7 +17,8 @@ Pushing files or folders to GitHub Packages (`ghcr.io`) traditionally requires i
 ## Live Demo
 Run GHCR Manager directly in your browser: [nitaidor.github.io/GHCR-Manager](https://nitaidor.github.io/GHCR-Manager/)
 
-* **Supported in Web & Mobile:** Repository browsing, single/multi-file OCI image creation & upload, version inspection & replacement, `.zip`/file extraction downloads, and version/package removal.
+* **Supported in Live Demo:** Personal Access Token sign-in, repository browsing, viewing linked packages & versions, and removing versions or packages.
+* **Requires Installed App or Local `npm run dev`:** OCI image creation & uploads, layer file inspection (`Load Files`), package downloads & extraction from `ghcr.io`, and OAuth Device Flow (blocked by browser CORS on static GitHub Pages).
 * **Requires Desktop App:** Root Folder Auto-Sync (`Sync Root Folder` tab) and direct multi-file folder extraction to disk.
 
 ## Installation
