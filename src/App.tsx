@@ -4904,12 +4904,13 @@ export default function App() {
                                   Visibility Settings
                                   <ExternalLink className="w-3 h-3" />
                                 </a>
-                                {headerMetaNote && (
-                                  <span className="text-[11px] text-gray-400">
-                                    {headerMetaNote}
-                                  </span>
-                                )}
                               </div>
+
+                              {headerMetaNote && (
+                                <span className="text-[11px] text-gray-400 ml-auto text-right">
+                                  {headerMetaNote}
+                                </span>
+                              )}
 
                               {allowDelete && (
                                 <button
@@ -5312,7 +5313,7 @@ export default function App() {
                                     displayTitleOverride: getRepoIndexDisplayTitle(
                                       selectedRepo.name
                                     ),
-                                    headerMetaNote: `Keeps latest ${REPO_INDEX_KEEP_VERSIONS} timestamped checkpoints`,
+                                    headerMetaNote: `(Keeps latest ${REPO_INDEX_KEEP_VERSIONS} timestamped checkpoints)`,
                                   });
                                 })()}
                             </div>

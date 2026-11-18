@@ -130,7 +130,7 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       <div
-        className="absolute right-0 top-0 md:static settings-menu-container relative z-50"
+        className="absolute right-0 top-0 md:relative settings-menu-container z-50"
         ref={menuRef}
       >
         <button
