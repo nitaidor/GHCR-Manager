@@ -33,10 +33,11 @@ function finalizeTarHeaderChecksum(header) {
   header[155] = 0x20;
 }
 
-function createUstarHeaderNode(name, size, mtime, typeflag = '0') {
+function createUstarHeaderNode(name, size, mtime, typeflag = '0', mode = null) {
   const header = Buffer.alloc(512);
+  const resolvedMode = mode ?? (typeflag === '5' ? 0o755 : 0o644);
   writeAscii(header, name, 0, 100);
-  writeOctal(header, 0o644, 100, 8);
+  writeOctal(header, resolvedMode, 100, 8);
   writeOctal(header, 0, 108, 8);
   writeOctal(header, 0, 116, 8);
   writeOctal(header, size > MAX_USTAR_OCTAL_SIZE ? 0 : size, 124, 12);
@@ -95,11 +96,20 @@ function writeStreamChunk(stream, buf) {
   });
 }
 
+function createAbortError(message = 'Operation aborted') {
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
 /**
  * Streams local files directly from disk into a temporary gzipped OCI layer (.tar.gz),
  * computing uncompressed diff_id and compressed SHA-256 digests with O(1) RAM usage.
  */
-async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
+async function buildOciLayerToFile({ files, outFilePath, onProgress, signal }) {
+  if (signal?.aborted) {
+    throw createAbortError('Upload cancelled');
+  }
   if (!Array.isArray(files) || files.length === 0) {
     throw new Error('Cannot create an image with zero files.');
   }
@@ -107,6 +117,31 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
   const statList = [];
   let totalFileBytes = 0;
   for (const f of files) {
+    if (signal?.aborted) {
+      throw createAbortError('Upload cancelled');
+    }
+    if (f.isDirectory) {
+      let mtime =
+        typeof f.mtime === 'number' && Number.isFinite(f.mtime)
+          ? Math.floor(f.mtime)
+          : Math.floor(Date.now() / 1000);
+      if (f.fullPath && !(typeof f.mtime === 'number' && Number.isFinite(f.mtime))) {
+        try {
+          const st = await fs.stat(f.fullPath);
+          mtime = Math.floor(st.mtimeMs / 1000);
+        } catch {
+          // Ignore stat error and keep default mtime
+        }
+      }
+      statList.push({
+        fullPath: f.fullPath || '',
+        relativePath: f.relativePath,
+        size: 0,
+        mtime,
+        isDirectory: true,
+      });
+      continue;
+    }
     if (!f.fullPath) {
       throw new Error(`Missing disk path for "${f.relativePath}".`);
     }
@@ -123,6 +158,7 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
       relativePath: f.relativePath,
       size: st.size,
       mtime,
+      isDirectory: false,
     });
     totalFileBytes += st.size;
   }
@@ -132,6 +168,7 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
   const gzip = zlib.createGzip({ level: 6 });
   const outStream = fsSync.createWriteStream(outFilePath);
   let compressedSize = 0;
+  let activeReadStream = null;
 
   gzip.on('data', (gzChunk) => {
     compressedSize += gzChunk.length;
@@ -145,7 +182,30 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
     pipeFailed = true;
   });
 
+  const onAbort = () => {
+    pipeFailed = true;
+    try {
+      activeReadStream?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      gzip.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      outStream.destroy();
+    } catch {
+      // ignore
+    }
+  };
+  if (signal) {
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
   async function emitTarBytes(buf) {
+    if (signal?.aborted) throw createAbortError('Upload cancelled');
     if (!buf || buf.length === 0) return;
     uncompressedHash.update(buf);
     await writeStreamChunk(gzip, buf);
@@ -174,11 +234,17 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
     const nowSec = Math.floor(Date.now() / 1000);
 
     for (const entry of statList) {
-      const cleanPath = entry.relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (signal?.aborted) throw createAbortError('Upload cancelled');
+      const rawCleanPath = entry.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      const cleanPath = entry.isDirectory
+        ? rawCleanPath === '' || rawCleanPath === '.'
+          ? './'
+          : `${rawCleanPath}/`
+        : rawCleanPath;
       const pathBytes = Buffer.byteLength(cleanPath, 'utf8');
       const isAscii = /^[\x00-\x7F]*$/.test(cleanPath);
       const needsPaxPath = pathBytes > 99 || !isAscii;
-      const needsPaxSize = entry.size > MAX_USTAR_OCTAL_SIZE;
+      const needsPaxSize = !entry.isDirectory && entry.size > MAX_USTAR_OCTAL_SIZE;
       const mtime = entry.mtime ?? nowSec;
 
       if (needsPaxPath || needsPaxSize) {
@@ -199,6 +265,18 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
       }
 
       const shortAsciiName = cleanPath.replace(/[^\x20-\x7E]/g, '_').slice(-99);
+      if (entry.isDirectory) {
+        const dirHeader = createUstarHeaderNode(
+          shortAsciiName || './',
+          0,
+          mtime,
+          '5',
+          0o755
+        );
+        await emitTarBytes(dirHeader);
+        continue;
+      }
+
       const fileHeader = createUstarHeaderNode(
         shortAsciiName || 'file',
         entry.size,
@@ -211,7 +289,12 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
       const readStream = fsSync.createReadStream(entry.fullPath, {
         highWaterMark: READ_CHUNK_BYTES,
       });
+      activeReadStream = readStream;
       for await (const chunk of readStream) {
+        if (signal?.aborted) {
+          readStream.destroy();
+          throw createAbortError('Upload cancelled');
+        }
         if (pipeFailed) {
           readStream.destroy();
           break;
@@ -220,6 +303,11 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
         processedBytes += chunk.length;
         await emitTarBytes(chunk);
         reportProgress(false);
+      }
+      activeReadStream = null;
+
+      if (signal?.aborted) {
+        throw createAbortError('Upload cancelled');
       }
 
       if (actualRead !== entry.size) {
@@ -240,10 +328,12 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
     await pipeDone;
     reportProgress(true);
 
-    const fileMetaList = statList.slice(0, 150).map((f) => ({
-      path: f.relativePath,
-      size: f.size,
-    }));
+    const fileMetaList = statList.slice(0, 150).map((f) => {
+      const normalized = f.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') || '.';
+      return f.isDirectory
+        ? { path: normalized, size: 0, isDirectory: true }
+        : { path: normalized, size: f.size };
+    });
 
     return {
       tempPath: outFilePath,
@@ -251,10 +341,15 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
       compressedDigest: `sha256:${compressedHash.digest('hex')}`,
       compressedSize,
       totalFileBytes,
-      fileCount: statList.length,
+      fileCount: statList.filter((f) => !f.isDirectory).length,
       fileMetaList,
     };
   } catch (err) {
+    try {
+      activeReadStream?.destroy();
+    } catch {
+      // ignore
+    }
     try {
       gzip.destroy();
     } catch {
@@ -267,7 +362,14 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
     }
     await pipeDone.catch(() => {});
     await fs.unlink(outFilePath).catch(() => {});
+    if (signal?.aborted) {
+      throw createAbortError('Upload cancelled');
+    }
     throw err;
+  } finally {
+    if (signal) {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
 }
 
@@ -276,7 +378,7 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress }) {
  * and streaming zero-RAM extraction directly to disk.
  */
 function createNodeTarStreamParser(handlers = {}) {
-  const { onEntry, onFileStart, onFileData, onFileEnd } = handlers;
+  const { onEntry, onDirectory, onFileStart, onFileData, onFileEnd } = handlers;
   const files = [];
   let pendingBuf = Buffer.alloc(4096);
   let pendingLen = 0;
@@ -445,6 +547,19 @@ function createNodeTarStreamParser(handlers = {}) {
           } else {
             skipRemaining = blocks;
           }
+        } else if (typeflag === '5') {
+          const fullPath =
+            (pendingPaxPath || (prefix ? `${prefix}/${name}` : name))
+              .replace(/^\/+/, '')
+              .replace(/\/+$/, '') || '.';
+          pendingPaxPath = null;
+          pendingPaxSize = null;
+
+          const meta = { path: fullPath, size: 0, isDirectory: true };
+          files.push(meta);
+          if (onEntry) await onEntry(meta);
+          if (onDirectory) await onDirectory(meta);
+          skipRemaining = blocks;
         } else {
           pendingPaxPath = null;
           pendingPaxSize = null;
@@ -477,9 +592,73 @@ function resolveSafeExtractPath(baseDest, relPath) {
   return resolvedDest;
 }
 
+/**
+ * Sanitizes a package/image name into a safe cross-platform single folder name.
+ */
+function sanitizeFolderName(rawName) {
+  const cleaned = String(rawName || '')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .trim()
+    .replace(/[. ]+$/, '');
+  if (!cleaned || cleaned === '.' || cleaned === '..') {
+    return 'package';
+  }
+  return cleaned;
+}
+
+/**
+ * Checks whether "<parentDir>/<folderName>" already exists and returns a unique "(1)"/"(2)" suggestion.
+ */
+function resolveExtractDestinationInfo(parentDir, rawFolderName) {
+  const folderName = sanitizeFolderName(rawFolderName);
+  const targetPath = resolveSafeExtractPath(parentDir, folderName);
+  const exists = fsSync.existsSync(targetPath);
+
+  if (!exists) {
+    return {
+      parentDir,
+      folderName,
+      targetPath,
+      exists: false,
+      suggestedName: folderName,
+      suggestedPath: targetPath,
+    };
+  }
+
+  let counter = 1;
+  while (counter < 10000) {
+    const candidateName = `${folderName} (${counter})`;
+    const candidatePath = resolveSafeExtractPath(parentDir, candidateName);
+    if (!fsSync.existsSync(candidatePath)) {
+      return {
+        parentDir,
+        folderName,
+        targetPath,
+        exists: true,
+        suggestedName: candidateName,
+        suggestedPath: candidatePath,
+      };
+    }
+    counter += 1;
+  }
+
+  const fallbackName = `${folderName}-${Date.now()}`;
+  return {
+    parentDir,
+    folderName,
+    targetPath,
+    exists: true,
+    suggestedName: fallbackName,
+    suggestedPath: resolveSafeExtractPath(parentDir, fallbackName),
+  };
+}
+
 module.exports = {
   buildOciLayerToFile,
+  createAbortError,
   createNodeTarStreamParser,
+  resolveExtractDestinationInfo,
   resolveSafeExtractPath,
+  sanitizeFolderName,
   writeStreamChunk,
 };

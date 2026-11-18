@@ -69,6 +69,7 @@ export interface UploadVersionModalProps {
     tag: string;
     replaceVersions: GitHubPackageVersion[];
   }) => Promise<void>;
+  onCancelUpload?: () => void;
 }
 
 export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
@@ -94,6 +95,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
   uploadProgress,
   uploadError,
   onConfirmUpload,
+  onCancelUpload,
 }) => {
   const [selectedReplaceIds, setSelectedReplaceIds] = useState<Set<number>>(new Set());
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
@@ -529,27 +531,40 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
             </div>
           )}
 
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="w-full py-2.5 px-4 rounded-md bg-blue-600 font-semibold text-xs text-white transition flex items-center justify-center gap-2 cursor-pointer"
-          >
-            {isUploading ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                {replaceCount > 0
-                  ? 'Uploading & Replacing Selected Versions...'
-                  : 'Building & Uploading OCI Image...'}
-              </>
-            ) : (
-              <>
-                <Upload className="w-4 h-4" />
-                {replaceCount > 0
-                  ? `Upload to Repo Packages (Replacing ${replaceCount})`
-                  : 'Upload to Repo Packages'}
-              </>
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              disabled={!canSubmit}
+              className="flex-1 py-2.5 px-4 rounded-md bg-blue-600 font-semibold text-xs text-white transition flex items-center justify-center gap-2 cursor-pointer"
+            >
+              {isUploading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {replaceCount > 0
+                    ? 'Uploading & Replacing Selected Versions...'
+                    : 'Building & Uploading OCI Image...'}
+                </>
+              ) : (
+                <>
+                  <Upload className="w-4 h-4" />
+                  {replaceCount > 0
+                    ? `Upload to Repo Packages (Replacing ${replaceCount})`
+                    : 'Upload to Repo Packages'}
+                </>
+              )}
+            </button>
+
+            {isUploading && onCancelUpload && (
+              <button
+                type="button"
+                onClick={onCancelUpload}
+                className="btn-modal-action py-2.5 px-4 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+              >
+                <X className="w-4 h-4" />
+                Cancel
+              </button>
             )}
-          </button>
+          </div>
         </div>
       </form>
     </div>,

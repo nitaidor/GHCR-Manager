@@ -27,8 +27,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   buildOciLayerFile: (opts) => ipcRenderer.invoke('desktop:buildOciLayerFile', opts),
   uploadBlobFromFile: (opts) => ipcRenderer.invoke('desktop:uploadBlobFromFile', opts),
   deleteTempFile: (tempPath) => ipcRenderer.invoke('desktop:deleteTempFile', tempPath),
+  prepareExtractDestination: (opts) =>
+    ipcRenderer.invoke('desktop:prepareExtractDestination', opts),
   downloadAndExtractLayer: (opts) =>
     ipcRenderer.invoke('desktop:downloadAndExtractLayer', opts),
+  cancelTransfer: (requestId) => ipcRenderer.send('desktop:cancelTransfer', requestId),
   onTransferProgress: (cb) => {
     const listener = (_event, payload) => cb(payload);
     ipcRenderer.on('desktop:transferProgress', listener);

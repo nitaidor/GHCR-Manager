@@ -10,6 +10,7 @@ export interface DesktopRootFolderFileEntry {
   name: string;
   size: number;
   mtime?: number;
+  isDirectory?: boolean;
   fileHandle?: FileSystemFileHandle;
   rawFile?: File;
 }
@@ -63,7 +64,7 @@ declare global {
       readFileBytes: (fullPath: string) => Promise<Uint8Array>;
       saveExtractedFiles: (
         defaultFolderName: string,
-        files: Array<{ relativePath: string; data: Uint8Array }>
+        files: Array<{ relativePath: string; data: Uint8Array; isDirectory?: boolean }>
       ) => Promise<{ saved: boolean; outputPath?: string }>;
       buildOciLayerFile?: (opts: {
         files: Array<{
@@ -71,6 +72,7 @@ declare global {
           relativePath: string;
           size?: number;
           mtime?: number;
+          isDirectory?: boolean;
         }>;
         requestId?: string;
       }) => Promise<{
@@ -80,7 +82,7 @@ declare global {
         compressedSize: number;
         totalFileBytes: number;
         fileCount: number;
-        fileMetaList: Array<{ path: string; size: number }>;
+        fileMetaList: Array<{ path: string; size: number; isDirectory?: boolean }>;
       }>;
       uploadBlobFromFile?: (opts: {
         tempPath: string;
@@ -93,18 +95,32 @@ declare global {
         requestId?: string;
       }) => Promise<{ registryToken?: string }>;
       deleteTempFile?: (tempPath: string) => Promise<void>;
+      prepareExtractDestination?: (opts: {
+        defaultFolderName: string;
+      }) => Promise<{
+        canceled: boolean;
+        parentDir?: string;
+        folderName?: string;
+        targetPath?: string;
+        exists?: boolean;
+        suggestedName?: string;
+        suggestedPath?: string;
+      }>;
       downloadAndExtractLayer?: (opts: {
         url: string;
         registryToken: string;
-        defaultFolderName: string;
+        parentDir?: string;
+        folderName?: string;
+        replaceExisting?: boolean;
+        defaultFolderName?: string;
         expectedSize?: number;
-        knownSingleFile?: boolean;
         requestId?: string;
       }) => Promise<{
         saved: boolean;
         outputPath?: string;
-        files: Array<{ path: string; size: number }>;
+        files: Array<{ path: string; size: number; isDirectory?: boolean }>;
       }>;
+      cancelTransfer?: (requestId: string) => void;
       onTransferProgress?: (
         cb: (payload: {
           requestId: string;
@@ -124,7 +140,9 @@ declare global {
         registryToken: string;
         expectedSize?: number;
         requestId: string;
-      }) => Promise<{ files: Array<{ path: string; size: number }> }>;
+      }) => Promise<{
+        files: Array<{ path: string; size: number; isDirectory?: boolean }>;
+      }>;
       cancelLayerStream?: (requestId: string) => void;
       onLayerStreamProgress?: (
         cb: (payload: { requestId: string; percent: number }) => void
@@ -147,6 +165,15 @@ export function decodeText(bytes: Uint8Array): string {
   return decoder.decode(bytes);
 }
 
+export function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: string; message?: string };
+  return (
+    e.name === 'AbortError' ||
+    (typeof e.message === 'string' && /\bAbortError\b/i.test(e.message))
+  );
+}
+
 /**
  * Unified cross-platform HTTP client for GitHub REST API and ghcr.io OCI v2 Registry.
  * - On Desktop (Electron): routes through Node.js main process IPC
@@ -158,7 +185,12 @@ export async function crossPlatformHttpRequest(opts: {
   method?: string;
   headers?: Record<string, string>;
   body?: Uint8Array | string;
+  signal?: AbortSignal;
 }): Promise<HttpResponseData> {
+  if (opts.signal?.aborted) {
+    throw new DOMException('Operation aborted', 'AbortError');
+  }
+
   const bodyBytes =
     typeof opts.body === 'string'
       ? new TextEncoder().encode(opts.body)
@@ -193,6 +225,7 @@ export async function crossPlatformHttpRequest(opts: {
           opts.method && opts.method !== 'GET' && opts.method !== 'HEAD' && bodyCopy
             ? bodyCopy.buffer
             : undefined,
+        signal: opts.signal,
       });
 
       const upstreamHeadersRaw = proxyRes.headers.get('x-upstream-headers');
@@ -205,9 +238,16 @@ export async function crossPlatformHttpRequest(opts: {
           body: buf,
         };
       }
-    } catch {
+    } catch (err) {
+      if (opts.signal?.aborted || isAbortError(err)) {
+        throw err;
+      }
       // Fallback to direct fetch (e.g. Capacitor native HTTP on Android/iOS)
     }
+  }
+
+  if (opts.signal?.aborted) {
+    throw new DOMException('Operation aborted', 'AbortError');
   }
 
   const directCopy = bodyBytes ? new Uint8Array(bodyBytes.byteLength) : undefined;
@@ -220,6 +260,7 @@ export async function crossPlatformHttpRequest(opts: {
       opts.method && opts.method !== 'GET' && opts.method !== 'HEAD' && directCopy
         ? directCopy.buffer
         : undefined,
+    signal: opts.signal,
   });
 
   const headers: Record<string, string> = {};
@@ -300,8 +341,18 @@ async function collectBrowserDirFilesRecursively(
         signal,
         counter
       );
-      for (let i = 0; i < nested.length; i++) {
-        results.push(nested[i]);
+      if (nested.length === 0) {
+        results.push({
+          relativePath: relPath,
+          name,
+          size: 0,
+          mtime: Math.floor(Date.now() / 1000),
+          isDirectory: true,
+        });
+      } else {
+        for (let i = 0; i < nested.length; i++) {
+          results.push(nested[i]);
+        }
       }
     }
   }
@@ -346,15 +397,13 @@ export async function scanBrowserDirectoryHandle(
         signal,
         counter
       );
-      if (files.length > 0) {
-        const totalSize = files.reduce((acc, f) => acc + f.size, 0);
-        subFolders.push({
-          kind: 'root-subfolder',
-          name,
-          size: totalSize,
-          files,
-        });
-      }
+      const totalSize = files.reduce((acc, f) => acc + f.size, 0);
+      subFolders.push({
+        kind: 'root-subfolder',
+        name,
+        size: totalSize,
+        files,
+      });
     }
   }
 

@@ -1,6 +1,7 @@
 import React from 'react';
 import { ChevronDown, ChevronRight, Loader2, X } from 'lucide-react';
 import { formatBytes, type OciPackageDetails } from '../lib/github-oci';
+import { summarizeArchiveEntries } from '../lib/tar';
 import { SubfolderFileTree, toTreeEntries } from './SubfolderFileTree';
 
 interface VersionInspectButtonProps {
@@ -85,7 +86,14 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
   }
 
   if (details) {
-    const displayedFileCount = Math.max(details.fileCount, details.files.length);
+    const { regularFileCount, emptyFolderCount } = summarizeArchiveEntries(details.files);
+    const displayedFileCount = Math.max(details.fileCount, regularFileCount);
+    const hasOnlyRootEmptyFolder =
+      displayedFileCount === 0 && emptyFolderCount === 0 && details.files.length > 0;
+    const label =
+      displayedFileCount === 0 && (emptyFolderCount > 0 || hasOnlyRootEmptyFolder)
+        ? `Empty Folder${emptyFolderCount > 1 ? `s (${emptyFolderCount})` : ''}`
+        : `Files (${displayedFileCount})`;
     return (
       <button
         type="button"
@@ -100,7 +108,7 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
         ) : (
           <ChevronRight className="w-3.5 h-3.5" />
         )}
-        {isExpanded ? 'Hide Files' : `Files (${displayedFileCount})`}
+        {isExpanded ? 'Hide Files' : label}
       </button>
     );
   }
@@ -140,6 +148,7 @@ export const VersionFileDetailsPanel: React.FC<VersionFileDetailsPanelProps> = (
   containerBgClass = 'bg-[#0d1117]',
 }) => {
   if (details.needsManualLargeLayerLoad) return null;
+  const { emptyFolderCount } = summarizeArchiveEntries(details.files);
   return (
     <div className="pt-2 border-t border-[#30363d] space-y-2">
       <div className="flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-gray-400">
@@ -153,6 +162,12 @@ export const VersionFileDetailsPanel: React.FC<VersionFileDetailsPanelProps> = (
         <span>
           Files: <strong className="text-gray-200">{details.fileCount}</strong>
         </span>
+        {emptyFolderCount > 0 && (
+          <span>
+            Empty folders:{' '}
+            <strong className="text-gray-200">{emptyFolderCount}</strong>
+          </span>
+        )}
         <span>
           Layer Size:{' '}
           <strong className="text-gray-200">

@@ -35,8 +35,33 @@ function buildTree(files: DesktopRootFolderFileEntry[]): TreeNode {
 
   for (let idx = 0; idx < files.length; idx++) {
     const f = files[idx];
-    const cleanPath = normalizePath(f.relativePath);
+    const cleanPath = normalizePath(f.relativePath).replace(/\/+$/, '');
+    if (!cleanPath || cleanPath === '.') continue;
     const segments = cleanPath.split('/').filter(Boolean);
+    if (segments.length === 0) continue;
+
+    if (f.isDirectory) {
+      let current = root;
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        const currentPath = segments.slice(0, i + 1).join('/');
+        let next = current.subfolders.get(seg);
+        if (!next) {
+          next = {
+            name: seg,
+            path: currentPath,
+            size: 0,
+            fileCount: 0,
+            subfolders: new Map(),
+            files: [],
+          };
+          current.subfolders.set(seg, next);
+        }
+        current = next;
+      }
+      continue;
+    }
+
     root.size += f.size;
     root.fileCount += 1;
 
@@ -71,7 +96,7 @@ function buildTree(files: DesktopRootFolderFileEntry[]): TreeNode {
   return root;
 }
 
-/** Collect every folder path that contains (at any depth) a file matching the query */
+/** Collect every folder path that contains (or is) an entry matching the query */
 function collectMatchedFolders(
   files: DesktopRootFolderFileEntry[],
   query: string
@@ -79,10 +104,11 @@ function collectMatchedFolders(
   const matched = new Set<string>();
   if (!query) return matched;
   for (const f of files) {
-    const clean = normalizePath(f.relativePath);
-    if (!clean.toLowerCase().includes(query)) continue;
+    const clean = normalizePath(f.relativePath).replace(/\/+$/, '');
+    if (!clean || clean === '.' || !clean.toLowerCase().includes(query)) continue;
     const segments = clean.split('/').filter(Boolean);
-    for (let i = 1; i < segments.length; i++) {
+    const maxAncestors = f.isDirectory ? segments.length : segments.length - 1;
+    for (let i = 1; i <= maxAncestors; i++) {
       matched.add(segments.slice(0, i).join('/'));
     }
   }
@@ -134,7 +160,11 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
     [node.files, isExpanded]
   );
 
+  const isEmptyLeaf = node.subfolders.size === 0 && node.files.length === 0;
+  const isFolderMatch =
+    depth > 0 && !!query && normalizePath(node.path).toLowerCase().includes(query);
   const handleToggleFolder = () => {
+    if (isEmptyLeaf) return;
     if (isExpanded) {
       setIsExpanded(false);
       return;
@@ -159,17 +189,21 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
       {depth > 0 && (
         <div
           onClick={handleToggleFolder}
-          className="tree-node-row flex items-center justify-between py-1 px-1.5 rounded cursor-pointer transition text-xs select-none"
+          className={`tree-node-row flex items-center justify-between py-1 px-1.5 rounded transition text-xs select-none ${
+            isEmptyLeaf ? 'cursor-default' : 'cursor-pointer'
+          } ${isFolderMatch ? 'active-variant font-bold' : ''}`}
         >
           <div className="flex items-center gap-1.5 min-w-0">
-            {isExpandingNode ? (
+            {isEmptyLeaf ? (
+              <span className="w-3 shrink-0" />
+            ) : isExpandingNode ? (
               <Loader2 className="w-3 h-3 animate-spin theme-spinner shrink-0" />
             ) : isExpanded ? (
               <ChevronDown className="w-3 h-3 text-gray-500 shrink-0" />
             ) : (
               <ChevronRight className="w-3 h-3 text-gray-500 shrink-0" />
             )}
-            {isExpanded ? (
+            {isExpanded && !isEmptyLeaf ? (
               <FolderOpen className={`w-3.5 h-3.5 ${iconClassName} shrink-0`} />
             ) : (
               <Folder className={`w-3.5 h-3.5 ${iconClassName} shrink-0`} />
@@ -178,12 +212,16 @@ const TreeNodeView: React.FC<TreeNodeViewProps> = ({
               {node.name}/
             </span>
             <span className="text-[10px] shrink-0 tree-node-sub">
-              ({node.fileCount} file{node.fileCount === 1 ? '' : 's'})
+              {isEmptyLeaf
+                ? '(empty folder)'
+                : `(${node.fileCount} file${node.fileCount === 1 ? '' : 's'})`}
             </span>
           </div>
-          <span className="text-[10px] font-mono shrink-0 ml-2 tree-node-sub">
-            {formatBytes(node.size)}
-          </span>
+          {!isEmptyLeaf && (
+            <span className="text-[10px] font-mono shrink-0 ml-2 tree-node-sub">
+              {formatBytes(node.size)}
+            </span>
+          )}
         </div>
       )}
 
@@ -273,10 +311,13 @@ export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
     () => collectMatchedFolders(files, query),
     [files, query]
   );
+  const regularEntriesInTree = files.filter((f) => !f.isDirectory).length;
   const unshownCount =
-    totalArchiveFileCount && totalArchiveFileCount > files.length
-      ? totalArchiveFileCount - files.length
+    totalArchiveFileCount && totalArchiveFileCount > regularEntriesInTree
+      ? totalArchiveFileCount - regularEntriesInTree
       : 0;
+  const isBareEmptyRoot =
+    root.subfolders.size === 0 && root.files.length === 0;
 
   return (
     <div
@@ -288,13 +329,20 @@ export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
       {title && (
         <div className="text-[11px] font-semibold text-gray-400 mb-1">{title}</div>
       )}
-      <TreeNodeView
-        node={root}
-        depth={0}
-        iconClassName={iconClassName}
-        query={query}
-        matchedFolders={matchedFolders}
-      />
+      {isBareEmptyRoot ? (
+        <div className="py-1 px-1.5 text-[11px] font-mono tree-node-sub flex items-center gap-1.5">
+          <Folder className={`w-3.5 h-3.5 ${iconClassName} shrink-0`} />
+          Empty folder (0 files)
+        </div>
+      ) : (
+        <TreeNodeView
+          node={root}
+          depth={0}
+          iconClassName={iconClassName}
+          query={query}
+          matchedFolders={matchedFolders}
+        />
+      )}
       {unshownCount > 0 && (
         <div className="mt-1.5 pt-1.5 border-t border-[#30363d] px-1.5 text-[11px] font-mono text-gray-400">
           ... and {unshownCount.toLocaleString()} more file{unshownCount === 1 ? '' : 's'} ({totalArchiveFileCount!.toLocaleString()} total in archive)
@@ -305,7 +353,7 @@ export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
 };
 
 const treeEntriesCache = new WeakMap<
-  ReadonlyArray<{ path: string; size: number }>,
+  ReadonlyArray<{ path: string; size: number; isDirectory?: boolean }>,
   DesktopRootFolderFileEntry[]
 >();
 
@@ -313,16 +361,17 @@ const treeEntriesCache = new WeakMap<
  * Converts a flat manifest file list into cached entries for SubfolderFileTree.
  */
 export function toTreeEntries(
-  files: ReadonlyArray<{ path: string; size: number }>
+  files: ReadonlyArray<{ path: string; size: number; isDirectory?: boolean }>
 ): DesktopRootFolderFileEntry[] {
   const cached = treeEntriesCache.get(files);
   if (cached) return cached;
   const entries = files.map((f) => {
-    const clean = normalizePath(f.path);
+    const clean = normalizePath(f.path).replace(/\/+$/, '') || '.';
     return {
       relativePath: clean,
       name: clean.split('/').pop() || clean,
-      size: f.size,
+      size: f.isDirectory ? 0 : f.size,
+      isDirectory: Boolean(f.isDirectory),
     };
   });
   treeEntriesCache.set(files, entries);

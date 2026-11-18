@@ -3,10 +3,12 @@ import { gzipSync, gunzipSync, Gunzip, zipSync } from 'fflate';
 export interface TarInputFile {
   /** Path inside the image layer (e.g. "report.pdf" or "subfolder/nested/file.txt") */
   relativePath: string;
-  /** Raw file content */
+  /** Raw file content (empty Uint8Array when isDirectory is true) */
   data: Uint8Array;
   /** Optional modification unix timestamp in seconds */
   mtime?: number;
+  /** When true, represents an explicit directory entry (TAR typeflag '5') */
+  isDirectory?: boolean;
 }
 
 export interface BuiltOciLayer {
@@ -102,11 +104,13 @@ function createUstarHeader(
   name: string,
   size: number,
   mtime: number,
-  typeflag: string = '0'
+  typeflag: string = '0',
+  mode?: number
 ): Uint8Array {
   const header = new Uint8Array(512);
+  const resolvedMode = mode ?? (typeflag === '5' ? 0o755 : 0o644);
   writeAscii(header, name, 0, 100);
-  writeOctal(header, 0o644, 100, 8); // mode
+  writeOctal(header, resolvedMode, 100, 8); // mode
   writeOctal(header, 0, 108, 8); // uid
   writeOctal(header, 0, 116, 8); // gid
   writeOctal(header, size, 124, 12); // size
@@ -132,14 +136,19 @@ function createPaxPathRecord(fullPath: string): Uint8Array {
 }
 
 /**
- * Creates a standard POSIX USTAR/PAX .tar archive from a list of files.
+ * Creates a standard POSIX USTAR/PAX .tar archive from a list of files and/or empty directories.
  */
 export function createTarArchive(files: TarInputFile[]): Uint8Array {
   const chunks: Uint8Array[] = [];
   const nowSec = Math.floor(Date.now() / 1000);
 
   for (const file of files) {
-    const cleanPath = file.relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const rawClean = file.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const cleanPath = file.isDirectory
+      ? rawClean === '' || rawClean === '.'
+        ? './'
+        : `${rawClean}/`
+      : rawClean;
     const pathBytes = encoder.encode(cleanPath);
     const isAscii = cleanPath.split('').every((ch) => ch.charCodeAt(0) < 128);
     const mtime = file.mtime ?? nowSec;
@@ -155,6 +164,11 @@ export function createTarArchive(files: TarInputFile[]): Uint8Array {
     }
 
     const shortAsciiName = cleanPath.replace(/[^\x20-\x7E]/g, '_').slice(-99);
+    if (file.isDirectory) {
+      chunks.push(createUstarHeader(shortAsciiName || './', 0, mtime, '5', 0o755));
+      continue;
+    }
+
     const fileHeader = createUstarHeader(
       shortAsciiName || 'file',
       file.data.byteLength,
@@ -191,7 +205,10 @@ export async function buildOciLayerFromFiles(files: TarInputFile[]): Promise<Bui
   const uncompressedHex = await sha256Hex(tarBytes);
   const targzBytes = gzipSync(tarBytes, { level: 6 });
   const compressedHex = await sha256Hex(targzBytes);
-  const totalFileBytes = files.reduce((acc, f) => acc + f.data.byteLength, 0);
+  const totalFileBytes = files.reduce(
+    (acc, f) => acc + (f.isDirectory ? 0 : f.data.byteLength),
+    0
+  );
 
   return {
     tarBytes,
@@ -287,6 +304,17 @@ export function extractFilesFromOciLayer(layerBytes: Uint8Array): TarInputFile[]
         data: copy,
         mtime,
       });
+    } else if (typeflag === '5') {
+      const fullPath =
+        pendingPaxPath || (prefix ? `${prefix}/${name}` : name);
+      pendingPaxPath = null;
+      const cleanDir = fullPath.replace(/^\/+/, '').replace(/\/+$/, '') || '.';
+      extracted.push({
+        relativePath: cleanDir,
+        data: new Uint8Array(0),
+        mtime,
+        isDirectory: true,
+      });
     } else {
       pendingPaxPath = null;
     }
@@ -301,10 +329,10 @@ export function extractFilesFromOciLayer(layerBytes: Uint8Array): TarInputFile[]
  */
 export function createStreamingTarMetaParser(): {
   feed: (chunk: Uint8Array) => void;
-  getFiles: () => Array<{ path: string; size: number }>;
+  getFiles: () => Array<{ path: string; size: number; isDirectory?: boolean }>;
   isDone: () => boolean;
 } {
-  const files: Array<{ path: string; size: number }> = [];
+  const files: Array<{ path: string; size: number; isDirectory?: boolean }> = [];
   let pendingBuf = new Uint8Array(4096);
   let pendingLen = 0;
   let skipRemaining = 0;
@@ -412,6 +440,14 @@ export function createStreamingTarMetaParser(): {
             files.push({ path: fullPath, size });
           }
           skipRemaining = blocks;
+        } else if (typeflag === '5') {
+          const cleanDir =
+            (pendingPaxPath || (prefix ? `${prefix}/${name}` : name))
+              .replace(/^\/+/, '')
+              .replace(/\/+$/, '') || '.';
+          pendingPaxPath = null;
+          files.push({ path: cleanDir, size: 0, isDirectory: true });
+          skipRemaining = blocks;
         } else {
           pendingPaxPath = null;
           skipRemaining = blocks;
@@ -438,7 +474,7 @@ export async function extractFileMetaListStreaming(
     onProgress?: (percent: number) => void;
     signal?: AbortSignal;
   }
-): Promise<Array<{ path: string; size: number }>> {
+): Promise<Array<{ path: string; size: number; isDirectory?: boolean }>> {
   const parser = createStreamingTarMetaParser();
   const total = layerBytes.byteLength;
   if (total === 0) return [];
@@ -489,7 +525,51 @@ export async function extractFileMetaListStreaming(
 export function createZipFromExtractedFiles(files: TarInputFile[]): Uint8Array {
   const zipMap: Record<string, Uint8Array> = {};
   for (const file of files) {
-    zipMap[file.relativePath] = file.data;
+    if (file.isDirectory) {
+      const cleanDir = file.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      if (cleanDir && cleanDir !== '.') {
+        zipMap[`${cleanDir}/`] = new Uint8Array(0);
+      }
+    } else {
+      zipMap[file.relativePath] = file.data;
+    }
   }
   return zipSync(zipMap, { level: 6 });
+}
+
+/**
+ * Summarizes regular files and leaf empty directories in an extracted/indexed entry list
+ * (skipping standalone '.' root markers and intermediate dirs that contain files/children).
+ */
+export function summarizeArchiveEntries(
+  entries: ReadonlyArray<{ path: string; isDirectory?: boolean }>
+): { regularFileCount: number; emptyFolderCount: number } {
+  let regularFileCount = 0;
+  const dirPaths: string[] = [];
+  const nonDirPaths: string[] = [];
+
+  for (const entry of entries) {
+    const clean = entry.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (entry.isDirectory) {
+      if (clean && clean !== '.') {
+        dirPaths.push(clean);
+      }
+    } else {
+      regularFileCount += 1;
+      if (clean) nonDirPaths.push(clean);
+    }
+  }
+
+  let emptyFolderCount = 0;
+  for (const dir of dirPaths) {
+    const prefix = `${dir}/`;
+    const hasChild =
+      nonDirPaths.some((p) => p.startsWith(prefix)) ||
+      dirPaths.some((d) => d !== dir && d.startsWith(prefix));
+    if (!hasChild) {
+      emptyFolderCount += 1;
+    }
+  }
+
+  return { regularFileCount, emptyFolderCount };
 }

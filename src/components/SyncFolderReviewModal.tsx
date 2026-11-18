@@ -103,6 +103,7 @@ export interface SyncFolderReviewModalProps {
   } | null;
   syncModalError: string | null;
   onConfirmSync: (plans: SyncBatchItemPlan[]) => Promise<void>;
+  onCancelSync?: () => void;
 }
 
 export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
@@ -129,6 +130,7 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
   syncOverallProgress,
   syncModalError,
   onConfirmSync,
+  onCancelSync,
 }) => {
   const [decisions, setDecisions] = useState<Record<number, ItemDecision>>({});
   const [expandedItemIndices, setExpandedItemIndices] = useState<Set<number>>(new Set());
@@ -968,29 +970,42 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
             </div>
           )}
 
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="w-full py-2.5 px-4 rounded-md btn-sync-green font-semibold text-xs text-white transition flex items-center justify-center gap-2 cursor-pointer"
-          >
-            {isSyncing ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Syncing Selected Items to Repo Packages...
-              </>
-            ) : (
-              <>
-                <FolderSync className="w-4 h-4" />
-                {validationSummary.totalReplaceCount > 0
-                  ? `Sync ${validationSummary.activeCount} Image${
-                      validationSummary.activeCount === 1 ? '' : 's'
-                    } (Replacing ${validationSummary.totalReplaceCount} Old)`
-                  : `Sync ${validationSummary.activeCount} Image${
-                      validationSummary.activeCount === 1 ? '' : 's'
-                    } to Repo Packages`}
-              </>
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              disabled={!canSubmit}
+              className="flex-1 py-2.5 px-4 rounded-md btn-sync-green font-semibold text-xs text-white transition flex items-center justify-center gap-2 cursor-pointer"
+            >
+              {isSyncing ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Syncing Selected Items to Repo Packages...
+                </>
+              ) : (
+                <>
+                  <FolderSync className="w-4 h-4" />
+                  {validationSummary.totalReplaceCount > 0
+                    ? `Sync ${validationSummary.activeCount} Image${
+                        validationSummary.activeCount === 1 ? '' : 's'
+                      } (Replacing ${validationSummary.totalReplaceCount} Old)`
+                    : `Sync ${validationSummary.activeCount} Image${
+                        validationSummary.activeCount === 1 ? '' : 's'
+                      } to Repo Packages`}
+                </>
+              )}
+            </button>
+
+            {isSyncing && onCancelSync && (
+              <button
+                type="button"
+                onClick={onCancelSync}
+                className="btn-modal-action py-2.5 px-4 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+              >
+                <X className="w-4 h-4" />
+                Cancel
+              </button>
             )}
-          </button>
+          </div>
         </div>
       </form>
     </div>,

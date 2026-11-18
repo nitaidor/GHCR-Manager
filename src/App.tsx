@@ -82,6 +82,7 @@ import {
   type DesktopRootFolderScanResult,
   type UploadSelectionItem,
 } from './lib/http';
+import { isAbortError } from './lib/http';
 import {
   toOciImageName,
   validateFilesSelectionName,
@@ -90,8 +91,50 @@ import {
 import {
   createZipFromExtractedFiles,
   normalizeMemoryLimitError,
+  summarizeArchiveEntries,
   type TarInputFile,
 } from './lib/tar';
+
+function formatFolderSummaryBadge(
+  entries: ReadonlyArray<DesktopRootFolderFileEntry>,
+  baseLabel: string
+): string {
+  const regularCount = entries.filter((e) => !e.isDirectory).length;
+  const emptyDirCount = entries.filter((e) => e.isDirectory).length;
+  if (regularCount === 0 && emptyDirCount === 0) {
+    return `${baseLabel} (empty)`;
+  }
+  if (regularCount === 0) {
+    return `${baseLabel} (${emptyDirCount} empty subfolder${
+      emptyDirCount === 1 ? '' : 's'
+    })`;
+  }
+  if (emptyDirCount > 0) {
+    return `${baseLabel} (${regularCount} file${
+      regularCount === 1 ? '' : 's'
+    }, ${emptyDirCount} empty subfolder${emptyDirCount === 1 ? '' : 's'})`;
+  }
+  return `${baseLabel} (${regularCount} file${regularCount === 1 ? '' : 's'})`;
+}
+
+function formatExtractionNoticeText(
+  regularFileCount: number,
+  emptyFolderCount: number,
+  displayLabel: string,
+  outputPath?: string
+): string {
+  const destSuffix = outputPath ? ` to ${outputPath}` : '';
+  if (regularFileCount > 0 && emptyFolderCount > 0) {
+    return `Extracted ${regularFileCount} file(s) and ${emptyFolderCount} empty folder(s) from "${displayLabel}"${destSuffix}`;
+  }
+  if (regularFileCount === 0) {
+    if (emptyFolderCount > 0) {
+      return `Extracted ${emptyFolderCount} empty folder(s) from "${displayLabel}"${destSuffix}`;
+    }
+    return `Extracted empty folder from "${displayLabel}"${destSuffix}`;
+  }
+  return `Extracted ${regularFileCount} file(s) from "${displayLabel}"${destSuffix}`;
+}
 
 interface SyncItemStatus {
   state: 'idle' | 'uploading' | 'done' | 'skipped' | 'error';
@@ -396,6 +439,9 @@ export default function App() {
     message: string;
     percent: number;
   } | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const syncAbortRef = useRef<AbortController | null>(null);
+  const downloadAbortRef = useRef<AbortController | null>(null);
   const [deletingPkgName, setDeletingPkgName] = useState<string | null>(null);
   const [deletingVersionKey, setDeletingVersionKey] = useState<string | null>(null);
   const [confirmDeletePkg, setConfirmDeletePkg] = useState<GitHubPackageItem | null>(null);
@@ -403,6 +449,31 @@ export default function App() {
     pkg: GitHubPackageItem;
     version: GitHubPackageVersion;
   } | null>(null);
+  const [extractConflict, setExtractConflict] = useState<{
+    pkg: GitHubPackageItem;
+    version: GitHubPackageVersion;
+    vKey: string;
+    displayLabel: string;
+    details: OciPackageDetails;
+    parentDir: string;
+    folderName: string;
+    suggestedName: string;
+  } | null>(null);
+
+  type InlineNotice = { type: 'success' | 'warning' | 'error'; text: string };
+  const [deletedPkgTombstones, setDeletedPkgTombstones] = useState<
+    Record<
+      string,
+      {
+        pkg: GitHubPackageItem;
+        index: number;
+        isOther: boolean;
+        message: string;
+      }
+    >
+  >({});
+  const [pkgNotices, setPkgNotices] = useState<Record<string, InlineNotice>>({});
+  const [versionNotices, setVersionNotices] = useState<Record<string, InlineNotice>>({});
 
   // Lock background page scroll whenever any modal is open
   const isAnyModalOpen =
@@ -412,6 +483,7 @@ export default function App() {
     showUploadPickerPrompt ||
     showUploadVersionModal ||
     showSyncReviewModal ||
+    Boolean(extractConflict) ||
     Boolean(confirmDeletePkg) ||
     Boolean(confirmDeleteVersion);
   useEffect(() => {
@@ -426,21 +498,18 @@ export default function App() {
   }, [isAnyModalOpen]);
 
   useEffect(() => {
-    if (!confirmDeletePkg && !confirmDeleteVersion) return;
+    if (!confirmDeletePkg && !confirmDeleteVersion && !extractConflict) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setConfirmDeletePkg(null);
         setConfirmDeleteVersion(null);
+        setExtractConflict(null);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [confirmDeletePkg, confirmDeleteVersion]);
+  }, [confirmDeletePkg, confirmDeleteVersion, extractConflict]);
   const [copiedText, setCopiedText] = useState<string | null>(null);
-  const [actionBanner, setActionBanner] = useState<{
-    type: 'success' | 'error';
-    text: string;
-  } | null>(null);
 
   // Auto sign-in if an active session token exists
   useEffect(() => {
@@ -559,6 +628,10 @@ export default function App() {
     setSyncBatchSummary(null);
     setConfirmDeletePkg(null);
     setConfirmDeleteVersion(null);
+    setExtractConflict(null);
+    setDeletedPkgTombstones({});
+    setPkgNotices({});
+    setVersionNotices({});
   }
 
   // Saved PAT handlers
@@ -665,18 +738,20 @@ export default function App() {
   useEffect(() => {
     if (selectedRepo && authToken && user) {
       handleCancelInspect();
+      downloadAbortRef.current?.abort();
       setExpandedVersionKeys(new Set());
       setConfirmDeletePkg(null);
       setConfirmDeleteVersion(null);
+      setExtractConflict(null);
       localStorage.setItem(STORAGE_REPO_KEY, String(selectedRepo.id));
-      refreshPackages();
+      refreshPackages({ clearTransientNotices: true });
     }
   }, [selectedRepo, authToken, user]);
 
   useEffect(() => {
     if (activeTab === 'packages' && selectedRepo && authToken && user) {
       setExpandedVersionKeys(new Set());
-      refreshPackages();
+      refreshPackages({ clearTransientNotices: true });
     }
   }, [activeTab]);
 
@@ -734,8 +809,13 @@ export default function App() {
     }
   }
 
-  async function refreshPackages() {
+  async function refreshPackages(opts?: { clearTransientNotices?: boolean }) {
     if (!selectedRepo || !authToken || !user) return;
+    if (opts?.clearTransientNotices) {
+      setDeletedPkgTombstones({});
+      setPkgNotices({});
+      setVersionNotices({});
+    }
     const seq = ++refreshSeqRef.current;
     setPackagesLoading(true);
     setPackagesError(null);
@@ -1094,6 +1174,10 @@ export default function App() {
     runLivePackageCheckForModal(fileNamingValidation.ociPackageName);
   }
 
+  function handleCancelUpload() {
+    uploadAbortRef.current?.abort();
+  }
+
   async function handleExecuteVersionedUpload(opts: {
     tag: string;
     replaceVersions: GitHubPackageVersion[];
@@ -1104,6 +1188,8 @@ export default function App() {
       return;
     }
 
+    const abortCtrl = new AbortController();
+    uploadAbortRef.current = abortCtrl;
     setUploadError(null);
     setUploadSuccess(null);
 
@@ -1117,6 +1203,7 @@ export default function App() {
         size: number;
         fullPath?: string;
         rawFile?: File;
+        isDirectory?: boolean;
         entry: DesktopRootFolderFileEntry;
       }> = [];
 
@@ -1131,6 +1218,23 @@ export default function App() {
             rawFile: item.rawFile,
             entry,
           });
+        } else if (item.files.length === 0) {
+          const dirRelPath = isSingleFolderOnly ? '.' : item.name;
+          pendingEntries.push({
+            relativePath: dirRelPath,
+            mtime: item.mtime,
+            size: 0,
+            fullPath: item.fullPath,
+            isDirectory: true,
+            entry: {
+              fullPath: item.fullPath,
+              relativePath: dirRelPath,
+              name: item.name,
+              size: 0,
+              mtime: item.mtime,
+              isDirectory: true,
+            },
+          });
         } else {
           for (const entry of item.files) {
             const archivePath = isSingleFolderOnly
@@ -1139,9 +1243,10 @@ export default function App() {
             pendingEntries.push({
               relativePath: archivePath,
               mtime: entry.mtime,
-              size: entry.size,
+              size: entry.isDirectory ? 0 : entry.size,
               fullPath: entry.fullPath,
               rawFile: entry.rawFile,
+              isDirectory: Boolean(entry.isDirectory),
               entry,
             });
           }
@@ -1152,22 +1257,35 @@ export default function App() {
         Boolean(window.electronAPI?.buildOciLayerFile) &&
         Boolean(window.electronAPI?.uploadBlobFromFile) &&
         pendingEntries.length > 0 &&
-        pendingEntries.every((p) => Boolean(p.fullPath));
+        pendingEntries.every((p) => Boolean(p.fullPath) || Boolean(p.isDirectory));
 
       let tarInputs: TarInputFile[] | undefined;
       let desktopFiles: DesktopStreamingInputFile[] | undefined;
 
       if (canStreamDesktop) {
         desktopFiles = pendingEntries.map((p) => ({
-          fullPath: p.fullPath!,
+          fullPath: p.fullPath || '',
           relativePath: p.relativePath,
-          size: p.size,
+          size: p.isDirectory ? 0 : p.size,
           mtime: p.mtime,
+          ...(p.isDirectory ? { isDirectory: true } : {}),
         }));
       } else {
         tarInputs = [];
         try {
           for (const p of pendingEntries) {
+            if (abortCtrl.signal.aborted) {
+              throw new DOMException('Upload cancelled', 'AbortError');
+            }
+            if (p.isDirectory) {
+              tarInputs.push({
+                relativePath: p.relativePath,
+                data: new Uint8Array(0),
+                mtime: p.mtime,
+                isDirectory: true,
+              });
+              continue;
+            }
             const bytes = p.rawFile
               ? new Uint8Array(await p.rawFile.arrayBuffer())
               : await readUploadEntryBytes(p.entry);
@@ -1194,7 +1312,22 @@ export default function App() {
             : 'multi-file',
         files: tarInputs,
         desktopFiles,
+        signal: abortCtrl.signal,
         onProgress: (p) => setUploadProgress(p),
+      });
+
+      const pkgKey = details.packageName.toLowerCase();
+      setDeletedPkgTombstones((prev) => {
+        if (!prev[pkgKey]) return prev;
+        const next = { ...prev };
+        delete next[pkgKey];
+        return next;
+      });
+      setPkgNotices((prev) => {
+        if (!prev[pkgKey]) return prev;
+        const next = { ...prev };
+        delete next[pkgKey];
+        return next;
       });
 
       if (details.manifestDigest) {
@@ -1243,8 +1376,15 @@ export default function App() {
       setShowUploadVersionModal(false);
       await refreshPackages();
     } catch (err: unknown) {
-      setUploadError(err instanceof Error ? err.message : String(err));
+      if (isAbortError(err)) {
+        setUploadError('Upload cancelled.');
+      } else {
+        setUploadError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
+      if (uploadAbortRef.current === abortCtrl) {
+        uploadAbortRef.current = null;
+      }
       setUploadProgress(null);
     }
   }
@@ -1541,8 +1681,29 @@ export default function App() {
   async function readRootSyncItemFiles(
     item: DesktopRootFolderItem
   ): Promise<TarInputFile[]> {
+    if (item.kind === 'root-subfolder' && item.files.length === 0) {
+      return [
+        {
+          relativePath: '.',
+          data: new Uint8Array(0),
+          mtime: item.mtime,
+          isDirectory: true,
+        },
+      ];
+    }
+
     const result: TarInputFile[] = [];
     for (const entry of item.files) {
+      if (entry.isDirectory) {
+        result.push({
+          relativePath: entry.relativePath,
+          data: new Uint8Array(0),
+          mtime: entry.mtime,
+          isDirectory: true,
+        });
+        continue;
+      }
+
       let bytes: Uint8Array;
       if (entry.fileHandle) {
         const fileObj = await entry.fileHandle.getFile();
@@ -1650,11 +1811,17 @@ export default function App() {
     runLiveLookupForSyncModal(itemsList);
   }
 
+  function handleCancelSync() {
+    syncAbortRef.current?.abort();
+  }
+
   async function handleExecuteBatchSync(plans: SyncBatchItemPlan[]) {
     if (!selectedRepo || !user || !authToken) return;
     const activePlans = plans.filter((p) => p.action !== 'skip');
     if (activePlans.length === 0) return;
 
+    const abortCtrl = new AbortController();
+    syncAbortRef.current = abortCtrl;
     setIsSyncingFolder(true);
     setSyncError(null);
     setSyncModalError(null);
@@ -1670,10 +1837,15 @@ export default function App() {
 
     let syncedCount = 0;
     let totalReplacedCount = 0;
+    let wasCancelled = false;
     const skippedCount = plans.length - activePlans.length;
     const batchErrors: string[] = [];
 
     for (let i = 0; i < activePlans.length; i++) {
+      if (abortCtrl.signal.aborted) {
+        wasCancelled = true;
+        break;
+      }
       const plan = activePlans[i];
       const basePercent = Math.floor((i / activePlans.length) * 100);
 
@@ -1694,22 +1866,39 @@ export default function App() {
       }));
 
       try {
+        const isBareEmptyRootSubfolder =
+          plan.item.kind === 'root-subfolder' && plan.item.files.length === 0;
         const canStreamDesktop =
           Boolean(window.electronAPI?.buildOciLayerFile) &&
           Boolean(window.electronAPI?.uploadBlobFromFile) &&
-          plan.item.files.length > 0 &&
-          plan.item.files.every((f) => Boolean(f.fullPath));
+          (isBareEmptyRootSubfolder
+            ? Boolean(plan.item.fullPath)
+            : plan.item.files.length > 0 &&
+              plan.item.files.every(
+                (f) => Boolean(f.fullPath) || Boolean(f.isDirectory)
+              ));
 
         let tarFiles: TarInputFile[] | undefined;
         let desktopFiles: DesktopStreamingInputFile[] | undefined;
 
         if (canStreamDesktop) {
-          desktopFiles = plan.item.files.map((f) => ({
-            fullPath: f.fullPath!,
-            relativePath: f.relativePath,
-            size: f.size,
-            mtime: f.mtime,
-          }));
+          desktopFiles = isBareEmptyRootSubfolder
+            ? [
+                {
+                  fullPath: plan.item.fullPath || '',
+                  relativePath: '.',
+                  size: 0,
+                  mtime: plan.item.mtime,
+                  isDirectory: true,
+                },
+              ]
+            : plan.item.files.map((f) => ({
+                fullPath: f.fullPath || '',
+                relativePath: f.relativePath,
+                size: f.isDirectory ? 0 : f.size,
+                mtime: f.mtime,
+                ...(f.isDirectory ? { isDirectory: true } : {}),
+              }));
         } else {
           try {
             tarFiles = await readRootSyncItemFiles(plan.item);
@@ -1727,6 +1916,7 @@ export default function App() {
           mode: plan.item.kind,
           files: tarFiles,
           desktopFiles,
+          signal: abortCtrl.signal,
           onProgress: (p) => {
             const overallPct = Math.min(
               99,
@@ -1735,7 +1925,7 @@ export default function App() {
             setSyncOverallProgress({
               current: i + 1,
               total: activePlans.length,
-              message: `${plan.ociName}:${plan.tag} — ${p.message}`,
+              message: `${plan.ociName}:${plan.tag} - ${p.message}`,
               percent: overallPct,
             });
             setSyncStatuses((prev) => ({
@@ -1747,6 +1937,14 @@ export default function App() {
               },
             }));
           },
+        });
+
+        const syncedPkgKey = details.packageName.toLowerCase();
+        setDeletedPkgTombstones((prev) => {
+          if (!prev[syncedPkgKey]) return prev;
+          const next = { ...prev };
+          delete next[syncedPkgKey];
+          return next;
         });
 
         if (details.manifestDigest) {
@@ -1801,6 +1999,14 @@ export default function App() {
           }));
         }
       } catch (err: unknown) {
+        if (isAbortError(err)) {
+          wasCancelled = true;
+          setSyncStatuses((prev) => ({
+            ...prev,
+            [plan.idx]: { state: 'error', message: 'Cancelled' },
+          }));
+          break;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         batchErrors.push(`${plan.ociName}: ${msg}`);
         setSyncStatuses((prev) => ({
@@ -1810,11 +2016,16 @@ export default function App() {
       }
     }
 
+    if (syncAbortRef.current === abortCtrl) {
+      syncAbortRef.current = null;
+    }
     setSyncOverallProgress(null);
     setIsSyncingFolder(false);
     await refreshPackages();
 
-    if (batchErrors.length > 0) {
+    if (wasCancelled) {
+      setSyncModalError('Sync cancelled.');
+    } else if (batchErrors.length > 0) {
       setSyncModalError(batchErrors.join(' | '));
     } else {
       setShowSyncReviewModal(false);
@@ -1861,7 +2072,12 @@ export default function App() {
     inspectAbortRef.current = ac;
     setInspectingKey(vKey);
     setInspectProgress(0);
-    setActionBanner(null);
+    setVersionNotices((prev) => {
+      if (!prev[vKey]) return prev;
+      const next = { ...prev };
+      delete next[vKey];
+      return next;
+    });
 
     try {
       const details = await inspectPackageManifest({
@@ -1881,13 +2097,16 @@ export default function App() {
       }));
       setExpandedVersionKeys((prev) => new Set(prev).add(vKey));
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') {
+      if (isAbortError(err)) {
         return;
       }
-      setActionBanner({
-        type: 'error',
-        text: err instanceof Error ? err.message : String(err),
-      });
+      setVersionNotices((prev) => ({
+        ...prev,
+        [vKey]: {
+          type: 'error',
+          text: err instanceof Error ? err.message : String(err),
+        },
+      }));
     } finally {
       if (inspectAbortRef.current === ac) {
         inspectAbortRef.current = null;
@@ -1911,6 +2130,105 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
+  function handleCancelDownload() {
+    downloadAbortRef.current?.abort();
+  }
+
+  async function runDesktopDownloadAndExtract(opts: {
+    pkg: GitHubPackageItem;
+    version: GitHubPackageVersion;
+    vKey: string;
+    displayLabel: string;
+    details: OciPackageDetails;
+    parentDir: string;
+    folderName: string;
+    replaceExisting: boolean;
+  }) {
+    if (!selectedRepo || !user || !authToken) return;
+    const {
+      pkg,
+      version,
+      vKey,
+      displayLabel,
+      details,
+      parentDir,
+      folderName,
+      replaceExisting,
+    } = opts;
+    const info = getVersionReferenceInfo(version);
+    const abortCtrl = new AbortController();
+    downloadAbortRef.current = abortCtrl;
+    setDownloadingKey(vKey);
+    setDownloadProgress({ message: 'Preparing download...', percent: 1 });
+    setVersionNotices((prev) => {
+      const next = { ...prev };
+      delete next[vKey];
+      return next;
+    });
+
+    try {
+      const res = await downloadAndExtractPackageToDiskDesktop({
+        username: user.login,
+        githubToken: authToken,
+        owner: pkg.owner.login,
+        packageName: pkg.name,
+        tag: info.primaryTag || info.shortDigest,
+        reference: info.inspectRef,
+        preloadedDetails: details,
+        parentDir,
+        folderName,
+        replaceExisting,
+        signal: abortCtrl.signal,
+        onProgress: (p) => setDownloadProgress(p),
+      });
+
+      setInspectedByKey((prev) => ({
+        ...prev,
+        [vKey]: res.details,
+      }));
+
+      if (res.saved) {
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'success',
+            text: formatExtractionNoticeText(
+              res.fileCount,
+              res.emptyFolderCount,
+              displayLabel,
+              res.outputPath
+            ),
+          },
+        }));
+      }
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'warning',
+            text: 'Download cancelled.',
+          },
+        }));
+      } else {
+        const friendly = normalizeMemoryLimitError(err, 'download');
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'error',
+            text: friendly.message,
+          },
+        }));
+      }
+    } finally {
+      if (downloadAbortRef.current === abortCtrl) {
+        downloadAbortRef.current = null;
+      }
+      setDownloadingKey(null);
+      setDownloadProgress(null);
+    }
+  }
+
   async function handleDownloadVersion(
     pkg: GitHubPackageItem,
     version: GitHubPackageVersion
@@ -1918,37 +2236,93 @@ export default function App() {
     if (!selectedRepo || !user || !authToken) return;
     const vKey = makeVersionStateKey(pkg.name, version.name);
     const info = getVersionReferenceInfo(version);
-    setDownloadingKey(vKey);
-    setDownloadProgress(null);
-    setActionBanner(null);
-    try {
-      const displayLabel = `${pkg.name}${info.pullSuffix}`;
+    const displayLabel = `${pkg.name}${info.pullSuffix}`;
 
-      if (window.electronAPI?.downloadAndExtractLayer) {
-        const res = await downloadAndExtractPackageToDiskDesktop({
-          username: user.login,
-          githubToken: authToken,
-          owner: pkg.owner.login,
-          packageName: pkg.name,
-          tag: info.primaryTag || info.shortDigest,
-          reference: info.inspectRef,
-          onProgress: (p) => setDownloadProgress(p),
+    setVersionNotices((prev) => {
+      const next = { ...prev };
+      delete next[vKey];
+      return next;
+    });
+
+    if (
+      window.electronAPI?.prepareExtractDestination &&
+      window.electronAPI?.downloadAndExtractLayer
+    ) {
+      setDownloadingKey(vKey);
+      setDownloadProgress({ message: 'Fetching package metadata...', percent: 1 });
+      try {
+        const details =
+          inspectedByKey[vKey] ||
+          (await inspectPackageManifest({
+            username: user.login,
+            githubToken: authToken,
+            owner: pkg.owner.login,
+            packageName: pkg.name,
+            tag: info.primaryTag || info.shortDigest,
+            reference: info.inspectRef,
+            skipLayerScan: true,
+          }));
+
+        if (!details.layerDigest) {
+          throw new Error('Package manifest does not contain a downloadable layer.');
+        }
+
+        const prep = await window.electronAPI.prepareExtractDestination({
+          defaultFolderName: details.originalName || pkg.name,
         });
 
-        setInspectedByKey((prev) => ({
-          ...prev,
-          [vKey]: res.details,
-        }));
-
-        if (res.saved) {
-          setActionBanner({
-            type: 'success',
-            text: `Extracted ${res.fileCount} file(s) from "${displayLabel}" to ${res.outputPath}`,
-          });
+        if (prep.canceled || !prep.parentDir || !prep.folderName) {
+          setDownloadingKey(null);
+          setDownloadProgress(null);
+          return;
         }
-        return;
-      }
 
+        if (prep.exists && prep.suggestedName) {
+          setDownloadingKey(null);
+          setDownloadProgress(null);
+          setExtractConflict({
+            pkg,
+            version,
+            vKey,
+            displayLabel,
+            details,
+            parentDir: prep.parentDir,
+            folderName: prep.folderName,
+            suggestedName: prep.suggestedName,
+          });
+          return;
+        }
+
+        await runDesktopDownloadAndExtract({
+          pkg,
+          version,
+          vKey,
+          displayLabel,
+          details,
+          parentDir: prep.parentDir,
+          folderName: prep.folderName,
+          replaceExisting: false,
+        });
+      } catch (err: unknown) {
+        setDownloadingKey(null);
+        setDownloadProgress(null);
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'error',
+            text: err instanceof Error ? err.message : String(err),
+          },
+        }));
+      }
+      return;
+    }
+
+    const abortCtrl = new AbortController();
+    downloadAbortRef.current = abortCtrl;
+    setDownloadingKey(vKey);
+    setDownloadProgress(null);
+
+    try {
       const { details, extractedFiles } = await downloadAndExtractPackage({
         username: user.login,
         githubToken: authToken,
@@ -1956,6 +2330,7 @@ export default function App() {
         packageName: pkg.name,
         tag: info.primaryTag || info.shortDigest,
         reference: info.inspectRef,
+        signal: abortCtrl.signal,
       });
 
       setInspectedByKey((prev) => ({
@@ -1964,8 +2339,15 @@ export default function App() {
       }));
 
       if (extractedFiles.length === 0) {
-        throw new Error('No files were found inside the image layer.');
+        throw new Error('No files or folders were found inside the image layer.');
       }
+
+      const extractedSummary = summarizeArchiveEntries(
+        extractedFiles.map((f) => ({
+          path: f.relativePath,
+          isDirectory: f.isDirectory,
+        }))
+      );
 
       if (window.electronAPI?.saveExtractedFiles) {
         const res = await window.electronAPI.saveExtractedFiles(
@@ -1973,41 +2355,158 @@ export default function App() {
           extractedFiles
         );
         if (res.saved) {
-          setActionBanner({
-            type: 'success',
-            text: `Extracted ${extractedFiles.length} file(s) from "${displayLabel}" to ${res.outputPath}`,
-          });
+          setVersionNotices((prev) => ({
+            ...prev,
+            [vKey]: {
+              type: 'success',
+              text: formatExtractionNoticeText(
+                extractedSummary.regularFileCount,
+                extractedSummary.emptyFolderCount,
+                displayLabel,
+                res.outputPath
+              ),
+            },
+          }));
         }
         return;
       }
 
-      if (extractedFiles.length === 1) {
+      if (extractedFiles.length === 1 && !extractedFiles[0].isDirectory) {
         const single = extractedFiles[0];
         const fileName = single.relativePath.split('/').pop() || pkg.name;
         triggerBrowserDownload(single.data, fileName);
-        setActionBanner({
-          type: 'success',
-          text: `Downloaded "${fileName}" (${formatBytes(single.data.byteLength)})`,
-        });
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'success',
+            text: `Downloaded "${fileName}" (${formatBytes(single.data.byteLength)})`,
+          },
+        }));
       } else {
         const zipBytes = createZipFromExtractedFiles(extractedFiles);
         const zipName = `${details.originalName || pkg.name}.zip`;
         triggerBrowserDownload(zipBytes, zipName);
-        setActionBanner({
-          type: 'success',
-          text: `Downloaded ${extractedFiles.length} files from "${displayLabel}" as "${zipName}" (${formatBytes(zipBytes.byteLength)})`,
-        });
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'success',
+            text: `Downloaded ${extractedSummary.regularFileCount} file(s)${
+              extractedSummary.emptyFolderCount > 0
+                ? ` and ${extractedSummary.emptyFolderCount} empty folder(s)`
+                : ''
+            } from "${displayLabel}" as "${zipName}" (${formatBytes(
+              zipBytes.byteLength
+            )})`,
+          },
+        }));
       }
     } catch (err: unknown) {
-      const friendly = normalizeMemoryLimitError(err, 'download');
-      setActionBanner({
-        type: 'error',
-        text: friendly.message,
-      });
+      if (isAbortError(err)) {
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'warning',
+            text: 'Download cancelled.',
+          },
+        }));
+      } else {
+        const friendly = normalizeMemoryLimitError(err, 'download');
+        setVersionNotices((prev) => ({
+          ...prev,
+          [vKey]: {
+            type: 'error',
+            text: friendly.message,
+          },
+        }));
+      }
     } finally {
+      if (downloadAbortRef.current === abortCtrl) {
+        downloadAbortRef.current = null;
+      }
       setDownloadingKey(null);
       setDownloadProgress(null);
     }
+  }
+
+  function recordDeletedPkgTombstone(pkg: GitHubPackageItem, message: string) {
+    const pkgKey = pkg.name.toLowerCase();
+    const repoIdx = repoPackages.findIndex((p) => p.name.toLowerCase() === pkgKey);
+    const otherIdx = otherPackages.findIndex((p) => p.name.toLowerCase() === pkgKey);
+    const isOther = repoIdx === -1 && otherIdx !== -1;
+    const index = isOther ? otherIdx : Math.max(0, repoIdx);
+
+    setDeletedPkgTombstones((prev) => ({
+      ...prev,
+      [pkgKey]: { pkg, index, isOther, message },
+    }));
+    setPkgNotices((prev) => {
+      if (!prev[pkgKey]) return prev;
+      const next = { ...prev };
+      delete next[pkgKey];
+      return next;
+    });
+  }
+
+  function dismissDeletedTombstone(pkgName: string) {
+    const pkgKey = pkgName.toLowerCase();
+    setDeletedPkgTombstones((prev) => {
+      const next = { ...prev };
+      delete next[pkgKey];
+      return next;
+    });
+    setRepoPackages((prev) => prev.filter((p) => p.name.toLowerCase() !== pkgKey));
+    setOtherPackages((prev) => prev.filter((p) => p.name.toLowerCase() !== pkgKey));
+  }
+
+  function dismissPkgNotice(pkgKey: string) {
+    setPkgNotices((prev) => {
+      if (!prev[pkgKey]) return prev;
+      const next = { ...prev };
+      delete next[pkgKey];
+      return next;
+    });
+  }
+
+  function dismissVersionNotice(vKey: string) {
+    setVersionNotices((prev) => {
+      if (!prev[vKey]) return prev;
+      const next = { ...prev };
+      delete next[vKey];
+      return next;
+    });
+  }
+
+  function renderInlineNotice(
+    notice: InlineNotice | undefined,
+    onDismiss: () => void
+  ) {
+    if (!notice) return null;
+    const bannerClass =
+      notice.type === 'success'
+        ? 'theme-success-banner'
+        : notice.type === 'warning'
+        ? 'theme-warning-banner'
+        : 'theme-error-banner';
+    const Icon = notice.type === 'success' ? CheckCircle2 : AlertCircle;
+
+    return (
+      <div
+        className={`p-3 rounded-md text-xs flex items-center justify-between gap-2 ${bannerClass}`}
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <Icon className="w-4 h-4 shrink-0" />
+          <span className="break-words">{notice.text}</span>
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="modal-close-btn p-1 shrink-0 cursor-pointer"
+          title="Dismiss notice"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+    );
   }
 
   async function handleDeleteVersionConfirmed(target: {
@@ -2016,14 +2515,19 @@ export default function App() {
   }) {
     if (!selectedRepo || !user || !authToken) return;
     const { pkg, version } = target;
+    const pkgKey = pkg.name.toLowerCase();
     const vKey = makeVersionStateKey(pkg.name, version.name);
     const info = getVersionReferenceInfo(version);
-    const siblingVersions = packageVersionsMap[pkg.name.toLowerCase()] || [];
+    const siblingVersions = packageVersionsMap[pkgKey] || [];
 
     setDeletingVersionKey(vKey);
     setConfirmDeleteVersion(null);
     setConfirmDeletePkg(null);
-    setActionBanner(null);
+    setVersionNotices((prev) => {
+      const next = { ...prev };
+      delete next[vKey];
+      return next;
+    });
 
     try {
       if (siblingVersions.length <= 1) {
@@ -2034,10 +2538,10 @@ export default function App() {
           ownerType: pkg.owner.type,
           packageName: pkg.name,
         });
-        setActionBanner({
-          type: 'success',
-          text: `Removed "${pkg.name}" (last remaining version deleted) from GitHub Packages.`,
-        });
+        recordDeletedPkgTombstone(
+          pkg,
+          `Removed "${pkg.name}" (last remaining version deleted) from GitHub Packages.`
+        );
       } else {
         await deletePackageVersion({
           githubToken: authToken,
@@ -2047,17 +2551,23 @@ export default function App() {
           packageName: pkg.name,
           versionId: version.id,
         });
-        setActionBanner({
-          type: 'success',
-          text: `Removed version "${pkg.name}${info.pullSuffix}" from GitHub Packages.`,
-        });
+        setPkgNotices((prev) => ({
+          ...prev,
+          [pkgKey]: {
+            type: 'success',
+            text: `Removed version "${pkg.name}${info.pullSuffix}" from GitHub Packages.`,
+          },
+        }));
       }
       await refreshPackages();
     } catch (err: unknown) {
-      setActionBanner({
-        type: 'error',
-        text: err instanceof Error ? err.message : String(err),
-      });
+      setVersionNotices((prev) => ({
+        ...prev,
+        [vKey]: {
+          type: 'error',
+          text: err instanceof Error ? err.message : String(err),
+        },
+      }));
     } finally {
       setDeletingVersionKey(null);
     }
@@ -2065,9 +2575,9 @@ export default function App() {
 
   async function handleDeletePackageConfirmed(pkg: GitHubPackageItem) {
     if (!selectedRepo || !user || !authToken) return;
+    const pkgKey = pkg.name.toLowerCase();
     setDeletingPkgName(pkg.name);
     setConfirmDeletePkg(null);
-    setActionBanner(null);
     try {
       await deleteGitHubPackage({
         githubToken: authToken,
@@ -2076,16 +2586,19 @@ export default function App() {
         ownerType: pkg.owner.type,
         packageName: pkg.name,
       });
-      setActionBanner({
-        type: 'success',
-        text: `Removed package "${pkg.name}" from GitHub Packages.`,
-      });
+      recordDeletedPkgTombstone(
+        pkg,
+        `Removed package "${pkg.name}" from GitHub Packages.`
+      );
       await refreshPackages();
     } catch (err: unknown) {
-      setActionBanner({
-        type: 'error',
-        text: err instanceof Error ? err.message : String(err),
-      });
+      setPkgNotices((prev) => ({
+        ...prev,
+        [pkgKey]: {
+          type: 'error',
+          text: err instanceof Error ? err.message : String(err),
+        },
+      }));
     } finally {
       setDeletingPkgName(null);
     }
@@ -2849,8 +3362,18 @@ export default function App() {
                                         child,
                                         relPath
                                       );
-                                      for (let k = 0; k < nested.length; k++) {
-                                        out.push(nested[k]);
+                                      if (nested.length === 0) {
+                                        out.push({
+                                          relativePath: relPath,
+                                          name: child.name,
+                                          size: 0,
+                                          mtime: Math.floor(Date.now() / 1000),
+                                          isDirectory: true,
+                                        });
+                                      } else {
+                                        for (let k = 0; k < nested.length; k++) {
+                                          out.push(nested[k]);
+                                        }
                                       }
                                     }
                                   }
@@ -3136,8 +3659,7 @@ export default function App() {
                                     </span>
                                     {item.kind === 'folder' && (
                                       <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium shrink-0">
-                                        Folder ({item.files.length} file
-                                        {item.files.length === 1 ? '' : 's'})
+                                        {formatFolderSummaryBadge(item.files, 'Folder')}
                                       </span>
                                     )}
                                     <span className="text-gray-500 shrink-0">
@@ -3517,9 +4039,10 @@ export default function App() {
                                           <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
                                             {item.kind === 'root-file'
                                               ? 'Root File → 1 Image'
-                                              : `Sub-folder (${item.files.length} file${
-                                                  item.files.length === 1 ? '' : 's'
-                                                }) → 1 Image`}
+                                              : `${formatFolderSummaryBadge(
+                                                  item.files,
+                                                  'Sub-folder'
+                                                )} → 1 Image`}
                                           </span>
                                           <span className="text-xs text-gray-500">
                                             ({formatBytes(item.size)})
@@ -3691,7 +4214,7 @@ export default function App() {
                         <button
                           type="button"
                           disabled={packagesLoading}
-                          onClick={refreshPackages}
+                          onClick={() => refreshPackages({ clearTransientNotices: true })}
                           className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
                         >
                           <RefreshCw
@@ -3704,190 +4227,272 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Search Bar (Searches Package Names, Original Names, and Files Inside Images) */}
-                    {(repoPackages.length > 0 ||
-                      (showOtherPackages && otherPackages.length > 0)) && (
-                      <div className="relative">
-                        <Search className="w-4 h-4 text-gray-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="text"
-                          value={packageSearch}
-                          onChange={(e) => setPackageSearch(e.target.value)}
-                          placeholder="Search by package name or file name inside images (e.g. config.json, .pdf)..."
-                          className="w-full pl-10 pr-9 py-2 rounded-md bg-[#0d1117] border border-[#30363d] text-xs text-white focus:outline-none"
-                        />
-                        {packageSearch && (
-                          <button
-                            type="button"
-                            onClick={() => setPackageSearch('')}
-                            className="modal-close-btn absolute right-2.5 top-1/2 -translate-y-1/2 p-1"
-                            title="Clear search"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </div>
-                    )}
+                    {(() => {
+                      type MergedPackageEntry =
+                        | { kind: 'pkg'; pkg: GitHubPackageItem }
+                        | {
+                            kind: 'tombstone';
+                            tombstone: {
+                              pkg: GitHubPackageItem;
+                              index: number;
+                              isOther: boolean;
+                              message: string;
+                            };
+                          };
 
-                    {actionBanner && (
-                      <div
-                        className={`p-3.5 rounded-md text-xs flex items-center justify-between gap-2 ${
-                          actionBanner.type === 'success'
-                            ? 'theme-success-banner'
-                            : 'theme-error-banner'
-                        }`}
-                      >
-                        <span>{actionBanner.text}</span>
-                        <button
-                          type="button"
-                          onClick={() => setActionBanner(null)}
-                          className="modal-close-btn p-1"
-                        >
-                          <X className="w-4 h-4" />
-                        </button>
-                      </div>
-                    )}
+                      const mergeWithTombstones = (
+                        baseList: GitHubPackageItem[],
+                        isOtherList: boolean
+                      ): MergedPackageEntry[] => {
+                        const seenPkgKeys = new Set<string>();
+                        const entries: MergedPackageEntry[] = baseList.map((pkg) => {
+                          const key = pkg.name.toLowerCase();
+                          const tombstone = deletedPkgTombstones[key];
+                          if (tombstone) {
+                            seenPkgKeys.add(key);
+                            return { kind: 'tombstone', tombstone };
+                          }
+                          return { kind: 'pkg', pkg };
+                        });
 
-                    {packagesError && (
-                      <div className="p-3.5 rounded-md theme-error-banner text-xs">
-                        {packagesError}
-                      </div>
-                    )}
+                        const missingTombstones = Object.values(
+                          deletedPkgTombstones
+                        )
+                          .filter(
+                            (t) =>
+                              t.isOther === isOtherList &&
+                              !seenPkgKeys.has(t.pkg.name.toLowerCase())
+                          )
+                          .sort((a, b) => a.index - b.index);
 
-                    {packagesLoading ? (
-                      <div className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2">
-                        <Loader2 className="w-6 h-6 animate-spin theme-spinner" />
-                        <span className="text-xs">Loading packages from GitHub...</span>
-                      </div>
-                    ) : repoPackages.length === 0 && !showOtherPackages ? (
-                      <div className="p-10 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-2">
-                        <Package className="w-8 h-8 text-gray-500 mx-auto" />
-                        <div className="text-sm font-semibold text-gray-300">
-                          No packages linked to {selectedRepo.full_name} yet
-                        </div>
-                        <p className="text-xs text-gray-500 max-w-md mx-auto">
-                          Use the &quot;Upload Files&quot; or &quot;Sync Root
-                          Folder&quot; tabs to create and push your first container
-                          package image.
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="space-y-3">
-                        {[
-                          ...repoPackages,
-                          ...(showOtherPackages ? otherPackages : []),
-                        ]
-                          .filter((pkg) => {
-                            const q = packageSearch.trim().toLowerCase();
-                            if (!q) return true;
-                            if (pkg.name.toLowerCase().includes(q)) return true;
-                            const versions =
-                              packageVersionsMap[pkg.name.toLowerCase()] || [];
-                            return versions.some((v) => {
-                              const tags = v.metadata?.container?.tags || [];
-                              if (tags.some((t) => t.toLowerCase().includes(q))) {
-                                return true;
-                              }
-                              if (v.name.toLowerCase().includes(q)) return true;
-                              const details =
-                                inspectedByKey[
-                                  makeVersionStateKey(pkg.name, v.name)
-                                ];
-                              if (!details) return false;
-                              return (
-                                details.originalName?.toLowerCase().includes(q) ||
-                                details.files?.some((f) =>
-                                  f.path.toLowerCase().includes(q)
-                                )
-                              );
-                            });
-                          })
-                          .map((pkg) => {
-                            const q = packageSearch.trim().toLowerCase();
-                            const pkgMatchesDirectly =
-                              !q || pkg.name.toLowerCase().includes(q);
-                            const allVersions =
-                              packageVersionsMap[pkg.name.toLowerCase()] || [];
-                            const displayedVersions = pkgMatchesDirectly
-                              ? allVersions
-                              : allVersions.filter((v) => {
-                                  const tags = v.metadata?.container?.tags || [];
-                                  if (tags.some((t) => t.toLowerCase().includes(q))) {
-                                    return true;
+                        for (const tombstone of missingTombstones) {
+                          const insertAt = Math.max(
+                            0,
+                            Math.min(tombstone.index, entries.length)
+                          );
+                          entries.splice(insertAt, 0, {
+                            kind: 'tombstone',
+                            tombstone,
+                          });
+                        }
+
+                        return entries;
+                      };
+
+                      const mergedEntries: MergedPackageEntry[] = [
+                        ...mergeWithTombstones(repoPackages, false),
+                        ...(showOtherPackages
+                          ? mergeWithTombstones(otherPackages, true)
+                          : []),
+                      ];
+
+                      return (
+                        <>
+                          {/* Search Bar (Searches Package Names, Original Names, and Files Inside Images) */}
+                          {(repoPackages.length > 0 ||
+                            (showOtherPackages && otherPackages.length > 0)) && (
+                            <div className="relative">
+                              <Search className="w-4 h-4 text-gray-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                              <input
+                                type="text"
+                                value={packageSearch}
+                                onChange={(e) => setPackageSearch(e.target.value)}
+                                placeholder="Search by package name or file name inside images (e.g. config.json, .pdf)..."
+                                className="w-full pl-10 pr-9 py-2 rounded-md bg-[#0d1117] border border-[#30363d] text-xs text-white focus:outline-none"
+                              />
+                              {packageSearch && (
+                                <button
+                                  type="button"
+                                  onClick={() => setPackageSearch('')}
+                                  className="modal-close-btn absolute right-2.5 top-1/2 -translate-y-1/2 p-1"
+                                  title="Clear search"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          )}
+
+                          {packagesError && (
+                            <div className="p-3.5 rounded-md theme-error-banner text-xs">
+                              {packagesError}
+                            </div>
+                          )}
+
+                          {packagesLoading ? (
+                            <div className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2">
+                              <Loader2 className="w-6 h-6 animate-spin theme-spinner" />
+                              <span className="text-xs">Loading packages from GitHub...</span>
+                            </div>
+                          ) : mergedEntries.length === 0 && !showOtherPackages ? (
+                            <div className="p-10 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-2">
+                              <Package className="w-8 h-8 text-gray-500 mx-auto" />
+                              <div className="text-sm font-semibold text-gray-300">
+                                No packages linked to {selectedRepo.full_name} yet
+                              </div>
+                              <p className="text-xs text-gray-500 max-w-md mx-auto">
+                                Use the &quot;Upload Files&quot; or &quot;Sync Root
+                                Folder&quot; tabs to create and push your first container
+                                package image.
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="space-y-3">
+                              {mergedEntries
+                                .filter((entry) => {
+                                  const q = packageSearch.trim().toLowerCase();
+                                  if (!q) return true;
+                                  if (entry.kind === 'tombstone') {
+                                    return entry.tombstone.pkg.name
+                                      .toLowerCase()
+                                      .includes(q);
                                   }
-                                  if (v.name.toLowerCase().includes(q)) return true;
-                                  const details =
-                                    inspectedByKey[
-                                      makeVersionStateKey(pkg.name, v.name)
-                                    ];
-                                  return Boolean(
-                                    details?.originalName?.toLowerCase().includes(q) ||
-                                      details?.files?.some((f) =>
+                                  const { pkg } = entry;
+                                  if (pkg.name.toLowerCase().includes(q)) return true;
+                                  const versions =
+                                    packageVersionsMap[pkg.name.toLowerCase()] || [];
+                                  return versions.some((v) => {
+                                    const tags = v.metadata?.container?.tags || [];
+                                    if (tags.some((t) => t.toLowerCase().includes(q))) {
+                                      return true;
+                                    }
+                                    if (v.name.toLowerCase().includes(q)) return true;
+                                    const details =
+                                      inspectedByKey[
+                                        makeVersionStateKey(pkg.name, v.name)
+                                      ];
+                                    if (!details) return false;
+                                    return (
+                                      details.originalName?.toLowerCase().includes(q) ||
+                                      details.files?.some((f) =>
                                         f.path.toLowerCase().includes(q)
                                       )
-                                  );
-                                });
-                            const settingsUrl = `${pkg.html_url}/settings`;
+                                    );
+                                  });
+                                })
+                                .map((entry) => {
+                                  if (entry.kind === 'tombstone') {
+                                    const { tombstone } = entry;
+                                    return (
+                                      <div
+                                        key={`deleted-${tombstone.pkg.name.toLowerCase()}`}
+                                        className="p-4 rounded-md theme-success-banner text-xs flex items-center justify-between gap-3"
+                                      >
+                                        <div className="flex items-center gap-2.5 min-w-0">
+                                          <CheckCircle2 className="w-4 h-4 shrink-0" />
+                                          <span className="font-semibold break-words [overflow-wrap:anywhere]">
+                                            {tombstone.message}
+                                          </span>
+                                        </div>
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            dismissDeletedTombstone(tombstone.pkg.name)
+                                          }
+                                          className="modal-close-btn p-1 shrink-0 cursor-pointer"
+                                          title="Dismiss confirmation"
+                                        >
+                                          <X className="w-4 h-4" />
+                                        </button>
+                                      </div>
+                                    );
+                                  }
 
-                            return (
-                              <div
-                                key={pkg.id}
-                                className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3"
-                              >
-                                <div className="flex flex-wrap items-center justify-between gap-3">
-                                  <div className="flex items-center gap-2 flex-wrap">
-                                    <Package className="w-4 h-4 icon-packages" />
-                                    <span className="text-sm font-bold text-white font-mono">
-                                      {pkg.name}
-                                    </span>
-                                    <span
-                                      className={`text-[10px] px-2 py-0.5 rounded border ${
-                                        pkg.visibility === 'private'
-                                          ? 'status-badge-warning'
-                                          : 'status-badge-valid'
-                                      }`}
+                                  const { pkg } = entry;
+                                  const pkgKey = pkg.name.toLowerCase();
+                                  const q = packageSearch.trim().toLowerCase();
+                                  const pkgMatchesDirectly =
+                                    !q || pkgKey.includes(q);
+                                  const allVersions =
+                                    packageVersionsMap[pkgKey] || [];
+                                  const displayedVersions = pkgMatchesDirectly
+                                    ? allVersions
+                                    : allVersions.filter((v) => {
+                                        const tags = v.metadata?.container?.tags || [];
+                                        if (
+                                          tags.some((t) => t.toLowerCase().includes(q))
+                                        ) {
+                                          return true;
+                                        }
+                                        if (v.name.toLowerCase().includes(q)) return true;
+                                        const details =
+                                          inspectedByKey[
+                                            makeVersionStateKey(pkg.name, v.name)
+                                          ];
+                                        return Boolean(
+                                          details?.originalName
+                                            ?.toLowerCase()
+                                            .includes(q) ||
+                                            details?.files?.some((f) =>
+                                              f.path.toLowerCase().includes(q)
+                                            )
+                                        );
+                                      });
+                                  const settingsUrl = `${pkg.html_url}/settings`;
+
+                                  return (
+                                    <div
+                                      key={pkg.id}
+                                      className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3"
                                     >
-                                      {pkg.visibility === 'private' && (
-                                        <Lock className="w-2.5 h-2.5 inline mr-1" />
+                                      <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                          <Package className="w-4 h-4 icon-packages" />
+                                          <span className="text-sm font-bold text-white font-mono">
+                                            {pkg.name}
+                                          </span>
+                                          <span
+                                            className={`text-[10px] px-2 py-0.5 rounded border ${
+                                              pkg.visibility === 'private'
+                                                ? 'status-badge-warning'
+                                                : 'status-badge-valid'
+                                            }`}
+                                          >
+                                            {pkg.visibility === 'private' && (
+                                              <Lock className="w-2.5 h-2.5 inline mr-1" />
+                                            )}
+                                            {pkg.visibility}
+                                          </span>
+                                          <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
+                                            {allVersions.length} version
+                                            {allVersions.length === 1 ? '' : 's'}
+                                          </span>
+                                          <a
+                                            href={settingsUrl}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
+                                            className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
+                                          >
+                                            Visibility Settings
+                                            <ExternalLink className="w-3 h-3" />
+                                          </a>
+                                        </div>
+
+                                        <button
+                                          type="button"
+                                          disabled={deletingPkgName === pkg.name}
+                                          onClick={() => {
+                                            setConfirmDeleteVersion(null);
+                                            setConfirmDeletePkg(pkg);
+                                          }}
+                                          className="btn-modal-action px-2.5 py-1 rounded-md text-xs hover:text-red-400 transition cursor-pointer flex items-center gap-1.5"
+                                          title="Remove entire package and all its versions from GitHub"
+                                        >
+                                          {deletingPkgName === pkg.name ? (
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                          ) : (
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          )}
+                                          Remove Package
+                                        </button>
+                                      </div>
+
+                                      {renderInlineNotice(pkgNotices[pkgKey], () =>
+                                        dismissPkgNotice(pkgKey)
                                       )}
-                                      {pkg.visibility}
-                                    </span>
-                                    <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
-                                      {allVersions.length} version
-                                      {allVersions.length === 1 ? '' : 's'}
-                                    </span>
-                                    <a
-                                      href={settingsUrl}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
-                                      className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
-                                    >
-                                      Visibility Settings
-                                      <ExternalLink className="w-3 h-3" />
-                                    </a>
-                                  </div>
 
-                                  <button
-                                    type="button"
-                                    disabled={deletingPkgName === pkg.name}
-                                    onClick={() => {
-                                      setConfirmDeleteVersion(null);
-                                      setConfirmDeletePkg(pkg);
-                                    }}
-                                    className="btn-modal-action px-2.5 py-1 rounded-md text-xs hover:text-red-400 transition cursor-pointer flex items-center gap-1.5"
-                                    title="Remove entire package and all its versions from GitHub"
-                                  >
-                                    {deletingPkgName === pkg.name ? (
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    ) : (
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    )}
-                                    Remove Package
-                                  </button>
-                                </div>
-
-                                {displayedVersions.length === 0 ? (
+                                      {displayedVersions.length === 0 ? (
                                   <div className="p-3 rounded-md bg-[#161b22] border border-[#30363d] text-xs text-gray-500">
                                     No tagged or untagged versions returned for this package.
                                   </div>
@@ -3993,6 +4598,18 @@ export default function App() {
                                                 Download & Extract
                                               </button>
 
+                                              {downloadingKey === vKey && (
+                                                <button
+                                                  type="button"
+                                                  onClick={handleCancelDownload}
+                                                  className="btn-modal-action px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                                                  title="Cancel active download"
+                                                >
+                                                  <X className="w-3.5 h-3.5" />
+                                                  Cancel
+                                                </button>
+                                              )}
+
                                               <button
                                                 type="button"
                                                 disabled={deletingVersionKey === vKey}
@@ -4032,6 +4649,11 @@ export default function App() {
                                             </div>
                                           )}
 
+                                          {renderInlineNotice(
+                                            versionNotices[vKey],
+                                            () => dismissVersionNotice(vKey)
+                                          )}
+
                                           {details && isDetailsExpanded && (
                                             <VersionFileDetailsPanel
                                               details={details}
@@ -4049,6 +4671,9 @@ export default function App() {
                           })}
                       </div>
                     )}
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </>
@@ -4153,6 +4778,107 @@ export default function App() {
         );
       })()}
 
+      {extractConflict &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+            onClick={() => setExtractConflict(null)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-[#161b22] border border-[#30363d] rounded-xl w-full max-w-md overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-150"
+            >
+              <div className="flex items-center justify-between p-5 border-b border-[#30363d] bg-[#0d1117]">
+                <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Folder className="w-4 h-4 icon-packages" />
+                  Folder Already Exists
+                </h4>
+                <button
+                  type="button"
+                  onClick={() => setExtractConflict(null)}
+                  aria-label="Close folder conflict dialog"
+                  className="modal-close-btn p-1"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="p-3.5 rounded-md theme-warning-banner text-xs leading-relaxed">
+                  A folder named{' '}
+                  <strong className="font-mono break-all">
+                    {extractConflict.folderName}
+                  </strong>{' '}
+                  already exists inside{' '}
+                  <span className="font-mono break-all">
+                    {extractConflict.parentDir}
+                  </span>
+                  .
+                </div>
+
+                <p className="text-xs text-gray-300 leading-relaxed">
+                  How would you like to extract{' '}
+                  <strong className="font-mono break-all">
+                    {extractConflict.displayLabel}
+                  </strong>
+                  ?
+                </p>
+
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setExtractConflict(null)}
+                    className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const pending = extractConflict;
+                      setExtractConflict(null);
+                      void runDesktopDownloadAndExtract({
+                        pkg: pending.pkg,
+                        version: pending.version,
+                        vKey: pending.vKey,
+                        displayLabel: pending.displayLabel,
+                        details: pending.details,
+                        parentDir: pending.parentDir,
+                        folderName: pending.folderName,
+                        replaceExisting: true,
+                      });
+                    }}
+                    className="btn-modal-action px-3.5 py-1.5 rounded-md text-xs font-semibold hover:text-red-400 transition cursor-pointer"
+                  >
+                    Replace Existing
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const pending = extractConflict;
+                      setExtractConflict(null);
+                      void runDesktopDownloadAndExtract({
+                        pkg: pending.pkg,
+                        version: pending.version,
+                        vKey: pending.vKey,
+                        displayLabel: pending.displayLabel,
+                        details: pending.details,
+                        parentDir: pending.parentDir,
+                        folderName: pending.suggestedName,
+                        replaceExisting: false,
+                      });
+                    }}
+                    className="px-3.5 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
+                  >
+                    Save as &quot;{extractConflict.suggestedName}&quot;
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
       {selectedRepo && (
         <UploadVersionModal
           isOpen={showUploadVersionModal}
@@ -4187,6 +4913,7 @@ export default function App() {
           uploadProgress={uploadProgress}
           uploadError={uploadError}
           onConfirmUpload={handleExecuteVersionedUpload}
+          onCancelUpload={handleCancelUpload}
         />
       )}
 
@@ -4222,6 +4949,7 @@ export default function App() {
           syncOverallProgress={syncOverallProgress}
           syncModalError={syncModalError}
           onConfirmSync={handleExecuteBatchSync}
+          onCancelSync={handleCancelSync}
         />
       )}
 

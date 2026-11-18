@@ -5,6 +5,7 @@ import {
   extractFilesFromOciLayer,
   normalizeMemoryLimitError,
   sha256Hex,
+  summarizeArchiveEntries,
   type TarInputFile,
 } from './tar';
 import { toOciImageName } from './naming';
@@ -108,6 +109,7 @@ const EXTERNAL_LAYER_CACHE_KEY = 'ghpm_external_layer_cache_v1';
 export interface OciManifestFileMeta {
   path: string;
   size: number;
+  isDirectory?: boolean;
 }
 
 export interface OciPackageDetails {
@@ -145,6 +147,7 @@ export interface DesktopStreamingInputFile {
   relativePath: string;
   size?: number;
   mtime?: number;
+  isDirectory?: boolean;
 }
 
 const encoder = new TextEncoder();
@@ -369,7 +372,8 @@ async function uploadBlobToGhcr(
   ownerLower: string,
   pkgLower: string,
   digest: string,
-  blobBytes: Uint8Array
+  blobBytes: Uint8Array,
+  signal?: AbortSignal
 ): Promise<void> {
   // 1. Check if blob already exists in registry
   const headRes = await crossPlatformHttpRequest({
@@ -378,6 +382,7 @@ async function uploadBlobToGhcr(
     headers: {
       Authorization: `Bearer ${registryToken}`,
     },
+    signal,
   });
   if (headRes.status === 200) {
     return; // Already uploaded!
@@ -391,6 +396,7 @@ async function uploadBlobToGhcr(
       Authorization: `Bearer ${registryToken}`,
       'Content-Length': '0',
     },
+    signal,
   });
 
   if (startRes.status !== 202) {
@@ -417,6 +423,7 @@ async function uploadBlobToGhcr(
       'Content-Type': 'application/octet-stream',
     },
     body: blobBytes,
+    signal,
   });
 
   if (putRes.status !== 201 && putRes.status !== 202) {
@@ -443,6 +450,7 @@ export async function buildAndPushOciImage(opts: {
   files?: TarInputFile[];
   desktopFiles?: DesktopStreamingInputFile[];
   onProgress?: (update: PushProgressUpdate) => void;
+  signal?: AbortSignal;
 }): Promise<OciPackageDetails> {
   const {
     username,
@@ -454,17 +462,29 @@ export async function buildAndPushOciImage(opts: {
     files = [],
     desktopFiles,
     onProgress,
+    signal,
   } = opts;
+
+  if (signal?.aborted) {
+    throw new DOMException('Upload cancelled', 'AbortError');
+  }
 
   const canStreamDesktop =
     Boolean(desktopFiles && desktopFiles.length > 0) &&
     Boolean(window.electronAPI?.buildOciLayerFile) &&
     Boolean(window.electronAPI?.uploadBlobFromFile);
 
-  const itemCount = canStreamDesktop ? desktopFiles!.length : files.length;
-  if (itemCount === 0) {
-    throw new Error('Cannot create an image with zero files.');
+  const sourceEntries = canStreamDesktop ? desktopFiles! : files;
+  if (sourceEntries.length === 0) {
+    throw new Error('Cannot create an image with zero files or folders.');
   }
+
+  const { regularFileCount: itemCount, emptyFolderCount } = summarizeArchiveEntries(
+    sourceEntries.map((f) => ({
+      path: f.relativePath,
+      isDirectory: f.isDirectory,
+    }))
+  );
 
   const ociPackageName = toOciImageName(rawImageName);
   if (!ociPackageName) {
@@ -486,12 +506,26 @@ export async function buildAndPushOciImage(opts: {
         })
       : undefined;
 
+  const abortHandler = signal
+    ? () => {
+        window.electronAPI?.cancelTransfer?.(requestId);
+      }
+    : undefined;
+  if (signal && abortHandler) {
+    signal.addEventListener('abort', abortHandler, { once: true });
+  }
+
   let tempLayerPath: string | null = null;
 
   try {
     onProgress?.({
       stage: 'archiving',
-      message: `Building OCI image "${ociPackageName}" from ${itemCount} file(s)...`,
+      message:
+        itemCount > 0
+          ? `Building OCI image "${ociPackageName}" from ${itemCount} file(s)...`
+          : `Building OCI image "${ociPackageName}" (empty folder${
+              emptyFolderCount === 1 ? '' : 's'
+            })...`,
       percent: 10,
     });
 
@@ -526,10 +560,13 @@ export async function buildAndPushOciImage(opts: {
       compressedSize = layer.compressedSize;
       totalFileBytes = layer.totalFileBytes;
       inMemoryTargz = layer.targzBytes;
-      fileMetaList = files.slice(0, 150).map((f) => ({
-        path: f.relativePath,
-        size: f.data.byteLength,
-      }));
+      fileMetaList = files.slice(0, 150).map((f) => {
+        const clean =
+          f.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') || '.';
+        return f.isDirectory
+          ? { path: clean, size: 0, isDirectory: true }
+          : { path: clean, size: f.data.byteLength };
+      });
     }
 
     const createdAt = new Date().toISOString();
@@ -617,6 +654,7 @@ export async function buildAndPushOciImage(opts: {
     );
 
     // 5. Upload Config Blob
+    if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
     onProgress?.({
       stage: 'uploading-config',
       message: `Uploading image configuration (${configBytes.byteLength} B)...`,
@@ -628,10 +666,12 @@ export async function buildAndPushOciImage(opts: {
       ownerLower,
       ociPackageName,
       configDigest,
-      configBytes
+      configBytes,
+      signal
     );
 
     // 6. Upload Layer Blob (.tar.gz)
+    if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
     onProgress?.({
       stage: 'uploading-layer',
       message: `Uploading compressed image layer (${formatBytes(compressedSize)})...`,
@@ -643,6 +683,7 @@ export async function buildAndPushOciImage(opts: {
         url: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/${compressedDigest}`,
         method: 'HEAD',
         headers: { Authorization: `Bearer ${registryToken}` },
+        signal,
       });
 
       if (headRes.status !== 200) {
@@ -667,7 +708,8 @@ export async function buildAndPushOciImage(opts: {
           ownerLower,
           ociPackageName,
           compressedDigest,
-          inMemoryTargz
+          inMemoryTargz,
+          signal
         );
       } catch (err) {
         throw normalizeMemoryLimitError(err, 'upload');
@@ -675,6 +717,7 @@ export async function buildAndPushOciImage(opts: {
     }
 
     // 7. Publish Manifest
+    if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
     onProgress?.({
       stage: 'publishing-manifest',
       message: `Publishing manifest ghcr.io/${ownerLower}/${ociPackageName}:${tag}...`,
@@ -689,6 +732,7 @@ export async function buildAndPushOciImage(opts: {
         'Content-Type': 'application/vnd.oci.image.manifest.v1+json',
       },
       body: manifestBytes,
+      signal,
     });
 
     if (manifestRes.status !== 201 && manifestRes.status !== 200) {
@@ -723,6 +767,9 @@ export async function buildAndPushOciImage(opts: {
     };
   } finally {
     unsubscribeProgress?.();
+    if (signal && abortHandler) {
+      signal.removeEventListener('abort', abortHandler);
+    }
     if (tempLayerPath && window.electronAPI?.deleteTempFile) {
       await window.electronAPI.deleteTempFile(tempLayerPath).catch(() => {});
     }
@@ -983,12 +1030,28 @@ export async function inspectPackageManifest(opts: {
     }
   }
 
+  const { regularFileCount } = summarizeArchiveEntries(files);
   const computedTotalBytes =
-    files.length > 0 ? files.reduce((acc, f) => acc + f.size, 0) : compressedSize;
-  const totalUncompressedBytes =
-    Number(annotations['io.ghpm.total-bytes']) || computedTotalBytes;
-  const fileCount =
-    Number(annotations['io.ghpm.file-count']) || (files.length > 0 ? files.length : 1);
+    files.length > 0
+      ? files.reduce((acc, f) => acc + (f.isDirectory ? 0 : f.size), 0)
+      : compressedSize;
+  const hasTotalBytesAnnotation =
+    annotations['io.ghpm.total-bytes'] !== undefined &&
+    annotations['io.ghpm.total-bytes'] !== '' &&
+    Number.isFinite(Number(annotations['io.ghpm.total-bytes']));
+  const totalUncompressedBytes = hasTotalBytesAnnotation
+    ? Number(annotations['io.ghpm.total-bytes'])
+    : computedTotalBytes;
+
+  const hasFileCountAnnotation =
+    annotations['io.ghpm.file-count'] !== undefined &&
+    annotations['io.ghpm.file-count'] !== '' &&
+    Number.isFinite(Number(annotations['io.ghpm.file-count']));
+  const fileCount = hasFileCountAnnotation
+    ? Number(annotations['io.ghpm.file-count'])
+    : files.length > 0
+    ? regularFileCount
+    : 1;
 
   return {
     packageName: pkgLower,
@@ -1020,26 +1083,37 @@ export async function downloadAndExtractPackageToDiskDesktop(opts: {
   packageName: string;
   tag?: string;
   reference?: string;
+  preloadedDetails?: OciPackageDetails;
+  parentDir: string;
+  folderName: string;
+  replaceExisting?: boolean;
+  signal?: AbortSignal;
   onProgress?: (update: { message: string; percent: number }) => void;
 }): Promise<{
   details: OciPackageDetails;
   saved: boolean;
   outputPath?: string;
   fileCount: number;
+  emptyFolderCount: number;
 }> {
   if (!window.electronAPI?.downloadAndExtractLayer) {
     throw new Error('Desktop streaming extraction API is unavailable.');
   }
+  if (opts.signal?.aborted) {
+    throw new DOMException('Download cancelled', 'AbortError');
+  }
 
-  const details = await inspectPackageManifest({
-    username: opts.username,
-    githubToken: opts.githubToken,
-    owner: opts.owner,
-    packageName: opts.packageName,
-    tag: opts.tag,
-    reference: opts.reference,
-    skipLayerScan: true,
-  });
+  const details =
+    opts.preloadedDetails ||
+    (await inspectPackageManifest({
+      username: opts.username,
+      githubToken: opts.githubToken,
+      owner: opts.owner,
+      packageName: opts.packageName,
+      tag: opts.tag,
+      reference: opts.reference,
+      skipLayerScan: true,
+    }));
   if (!details.layerDigest) {
     throw new Error('Package manifest does not contain a downloadable layer.');
   }
@@ -1055,31 +1129,47 @@ export async function downloadAndExtractPackageToDiskDesktop(opts: {
     'pull'
   );
 
+  if (opts.signal?.aborted) {
+    throw new DOMException('Download cancelled', 'AbortError');
+  }
+
   const requestId = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const unsubscribe = window.electronAPI.onTransferProgress?.((payload) => {
     if (payload.requestId !== requestId) return;
     opts.onProgress?.({ message: payload.message, percent: payload.percent });
   });
 
-  const knownSingleFile =
-    details.mode !== 'external-oci-image'
-      ? details.fileCount === 1
-      : details.files.length === 1;
+  const abortHandler = opts.signal
+    ? () => {
+        window.electronAPI?.cancelTransfer?.(requestId);
+      }
+    : undefined;
+  if (opts.signal && abortHandler) {
+    opts.signal.addEventListener('abort', abortHandler, { once: true });
+  }
 
   try {
     const res = await window.electronAPI.downloadAndExtractLayer({
       url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${details.layerDigest}`,
       registryToken,
-      defaultFolderName: details.originalName || opts.packageName,
+      parentDir: opts.parentDir,
+      folderName: opts.folderName,
+      replaceExisting: opts.replaceExisting,
       expectedSize: details.compressedSize,
-      knownSingleFile,
       requestId,
     });
 
+    const extractedSummary = summarizeArchiveEntries(
+      res.files.length > 0 ? res.files : details.files
+    );
+
     if (res.saved && res.files.length > 0 && details.files.length === 0) {
       details.files = res.files;
-      details.fileCount = res.files.length;
-      details.totalUncompressedBytes = res.files.reduce((acc, f) => acc + f.size, 0);
+      details.fileCount = extractedSummary.regularFileCount;
+      details.totalUncompressedBytes = res.files.reduce(
+        (acc, f) => acc + (f.isDirectory ? 0 : f.size),
+        0
+      );
       setCachedExternalLayerFiles(details.layerDigest, res.files);
     }
 
@@ -1087,10 +1177,15 @@ export async function downloadAndExtractPackageToDiskDesktop(opts: {
       details,
       saved: res.saved,
       outputPath: res.outputPath,
-      fileCount: res.files.length || details.fileCount,
+      fileCount:
+        res.files.length > 0 ? extractedSummary.regularFileCount : details.fileCount,
+      emptyFolderCount: extractedSummary.emptyFolderCount,
     };
   } finally {
     unsubscribe?.();
+    if (opts.signal && abortHandler) {
+      opts.signal.removeEventListener('abort', abortHandler);
+    }
   }
 }
 
@@ -1104,10 +1199,15 @@ export async function downloadAndExtractPackage(opts: {
   packageName: string;
   tag?: string;
   reference?: string;
+  signal?: AbortSignal;
 }): Promise<{
   details: OciPackageDetails;
   extractedFiles: TarInputFile[];
 }> {
+  if (opts.signal?.aborted) {
+    throw new DOMException('Download cancelled', 'AbortError');
+  }
+
   const details = await inspectPackageManifest({
     username: opts.username,
     githubToken: opts.githubToken,
@@ -1116,6 +1216,7 @@ export async function downloadAndExtractPackage(opts: {
     tag: opts.tag,
     reference: opts.reference,
     skipLayerScan: true,
+    signal: opts.signal,
   });
   if (!details.layerDigest) {
     throw new Error('Package manifest does not contain a downloadable layer.');
@@ -1140,6 +1241,7 @@ export async function downloadAndExtractPackage(opts: {
       headers: {
         Authorization: `Bearer ${registryToken}`,
       },
+      signal: opts.signal,
     });
 
     if (blobRes.status !== 200) {
@@ -1152,13 +1254,18 @@ export async function downloadAndExtractPackage(opts: {
   }
 
   if (details.files.length === 0 && extractedFiles.length > 0) {
-    const fileMeta = extractedFiles.map((f) => ({
+    const fileMeta: OciManifestFileMeta[] = extractedFiles.map((f) => ({
       path: f.relativePath,
-      size: f.data.byteLength,
+      size: f.isDirectory ? 0 : f.data.byteLength,
+      ...(f.isDirectory ? { isDirectory: true } : {}),
     }));
+    const { regularFileCount } = summarizeArchiveEntries(fileMeta);
     details.files = fileMeta;
-    details.fileCount = fileMeta.length;
-    details.totalUncompressedBytes = fileMeta.reduce((acc, f) => acc + f.size, 0);
+    details.fileCount = regularFileCount;
+    details.totalUncompressedBytes = fileMeta.reduce(
+      (acc, f) => acc + (f.isDirectory ? 0 : f.size),
+      0
+    );
     setCachedExternalLayerFiles(details.layerDigest, fileMeta);
   }
   return { details, extractedFiles };

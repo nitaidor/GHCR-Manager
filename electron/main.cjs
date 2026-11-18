@@ -6,14 +6,37 @@ const fs = require('node:fs/promises');
 const zlib = require('node:zlib');
 const {
   buildOciLayerToFile,
+  createAbortError,
   createNodeTarStreamParser,
+  resolveExtractDestinationInfo,
   resolveSafeExtractPath,
+  sanitizeFolderName,
   writeStreamChunk,
 } = require('./streaming-tar.cjs');
 
 const activeLayerStreams = new Map();
+const activeTransfers = new Map();
 const activeTempFiles = new Set();
+const activeStagingDirs = new Set();
 const BLOB_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024; // 16 MiB per OCI PATCH request
+
+async function renameWithRetry(srcPath, destPath) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await fs.rename(srcPath, destPath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (err && (err.code === 'EPERM' || err.code === 'EBUSY')) {
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
 
 function formatBytesNode(bytes) {
   if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, bytes)} B`;
@@ -333,12 +356,31 @@ async function collectFilesRecursively(dirPath, baseDir, scanState = { count: 0,
           name: entry.name,
           size: stat.size,
           mtime: Math.floor(stat.mtimeMs / 1000),
+          isDirectory: false,
         });
       } catch {
         // Ignore unreadable transient files
       }
     }
   }
+
+  if (results.length === 0 && dirPath !== baseDir) {
+    try {
+      const dirStat = await fs.stat(dirPath);
+      const relPath = path.relative(baseDir, dirPath).split(path.sep).join('/');
+      results.push({
+        fullPath: dirPath,
+        relativePath: relPath,
+        name: path.basename(dirPath),
+        size: 0,
+        mtime: Math.floor(dirStat.mtimeMs / 1000),
+        isDirectory: true,
+      });
+    } catch {
+      // Ignore unreadable transient directory
+    }
+  }
+
   return results;
 }
 
@@ -380,16 +422,14 @@ async function scanRootFolderEntries(rootFolderPath, scanId = null) {
       });
     } else if (entry.isDirectory()) {
       const files = await collectFilesRecursively(fullPath, fullPath, scanState);
-      if (files.length > 0) {
-        const totalSize = files.reduce((acc, f) => acc + f.size, 0);
-        subFolders.push({
-          kind: 'root-subfolder',
-          name: entry.name,
-          fullPath,
-          size: totalSize,
-          files,
-        });
-      }
+      const totalSize = files.reduce((acc, f) => acc + f.size, 0);
+      subFolders.push({
+        kind: 'root-subfolder',
+        name: entry.name,
+        fullPath,
+        size: totalSize,
+        files,
+      });
     }
   }
 
@@ -509,6 +549,18 @@ app.whenReady().then(() => {
     return new Uint8Array(buf);
   });
 
+  ipcMain.handle('desktop:prepareExtractDestination', async (_event, { defaultFolderName }) => {
+    const res = await dialog.showOpenDialog({
+      title: `Select Destination Folder to Extract "${defaultFolderName}"`,
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (res.canceled || res.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    const info = resolveExtractDestinationInfo(res.filePaths[0], defaultFolderName);
+    return { canceled: false, ...info };
+  });
+
   ipcMain.handle('desktop:saveExtractedFiles', async (_event, defaultFolderName, files) => {
     const res = await dialog.showOpenDialog({
       title: `Select Destination Folder to Extract "${defaultFolderName}"`,
@@ -516,21 +568,33 @@ app.whenReady().then(() => {
     });
     if (res.canceled || res.filePaths.length === 0) return { saved: false };
 
-    const baseDest =
-      files.length === 1
-        ? res.filePaths[0]
-        : path.join(res.filePaths[0], defaultFolderName);
+    const info = resolveExtractDestinationInfo(res.filePaths[0], defaultFolderName);
+    const baseDest = info.exists ? info.suggestedPath : info.targetPath;
+    await fs.mkdir(baseDest, { recursive: true });
 
     for (const file of files) {
-      const safeRel = path
-        .normalize(file.relativePath)
-        .replace(/^(\.\.(\/|\\|$))+/, '');
-      const destPath = path.join(baseDest, safeRel);
+      if (file.isDirectory) {
+        const cleanDir = String(file.relativePath || '').replace(/^\/+|\/+$/g, '');
+        if (cleanDir && cleanDir !== '.') {
+          const dirDest = resolveSafeExtractPath(baseDest, cleanDir);
+          await fs.mkdir(dirDest, { recursive: true });
+        }
+        continue;
+      }
+      const destPath = resolveSafeExtractPath(baseDest, file.relativePath);
       await fs.mkdir(path.dirname(destPath), { recursive: true });
       await fs.writeFile(destPath, Buffer.from(file.data));
     }
 
     return { saved: true, outputPath: baseDest };
+  });
+
+  ipcMain.on('desktop:cancelTransfer', (_event, requestId) => {
+    const ac = activeTransfers.get(requestId);
+    if (ac) {
+      ac.abort();
+      activeTransfers.delete(requestId);
+    }
   });
 
   ipcMain.handle('desktop:httpRequest', async (_event, reqOpts) => {
@@ -557,11 +621,15 @@ app.whenReady().then(() => {
     const tempPath = path.join(os.tmpdir(), tempName);
     activeTempFiles.add(tempPath);
 
+    const abortController = new AbortController();
+    if (requestId) activeTransfers.set(requestId, abortController);
+
     let lastSentPct = -1;
     try {
       return await buildOciLayerToFile({
         files,
         outFilePath: tempPath,
+        signal: abortController.signal,
         onProgress: ({ processedBytes, totalBytes, percent }) => {
           const scaledPct = 10 + Math.round((percent / 100) * 35); // 10% -> 45%
           if (requestId && scaledPct !== lastSentPct) {
@@ -579,6 +647,8 @@ app.whenReady().then(() => {
       activeTempFiles.delete(tempPath);
       await fs.unlink(tempPath).catch(() => {});
       throw err;
+    } finally {
+      if (requestId) activeTransfers.delete(requestId);
     }
   });
 
@@ -603,12 +673,16 @@ app.whenReady().then(() => {
         requestId,
       }
     ) => {
+      const abortController = new AbortController();
+      if (requestId) activeTransfers.set(requestId, abortController);
       let token = registryToken;
       let fileHandle = null;
+      let sessionUrl = '';
 
       async function readExactChunk(fh, buf, length, position) {
         let totalRead = 0;
         while (totalRead < length) {
+          if (abortController.signal.aborted) throw createAbortError('Upload cancelled');
           const { bytesRead } = await fh.read(buf, totalRead, length - totalRead, position + totalRead);
           if (bytesRead === 0) break;
           totalRead += bytesRead;
@@ -617,12 +691,19 @@ app.whenReady().then(() => {
       }
 
       async function sendRequestWithAuthRetry(url, initBuilder) {
-        let res = await fetchWithSafeRedirects(url, initBuilder(token));
+        if (abortController.signal.aborted) throw createAbortError('Upload cancelled');
+        let res = await fetchWithSafeRedirects(url, {
+          ...initBuilder(token),
+          signal: abortController.signal,
+        });
         if (res.status === 401 && basicAuthHeader && scopeParam) {
           const nextToken = await refreshGhcrTokenNode(basicAuthHeader, scopeParam);
           if (nextToken) {
             token = nextToken;
-            res = await fetchWithSafeRedirects(url, initBuilder(token));
+            res = await fetchWithSafeRedirects(url, {
+              ...initBuilder(token),
+              signal: abortController.signal,
+            });
           }
         }
         return res;
@@ -653,7 +734,7 @@ app.whenReady().then(() => {
           throw new Error('ghcr.io blob upload response missing Location header.');
         }
 
-        let sessionUrl = new URL(locationHeader, 'https://ghcr.io').toString();
+        sessionUrl = new URL(locationHeader, 'https://ghcr.io').toString();
 
         if (totalSize <= BLOB_UPLOAD_CHUNK_BYTES) {
           const singleBuf = Buffer.allocUnsafe(totalSize);
@@ -694,6 +775,9 @@ app.whenReady().then(() => {
         let lastSentPct = -1;
 
         while (offset < totalSize) {
+          if (abortController.signal.aborted) {
+            throw createAbortError('Upload cancelled');
+          }
           const toRead = Math.min(BLOB_UPLOAD_CHUNK_BYTES, totalSize - offset);
           const bytesRead = await readExactChunk(fileHandle, chunkBuf, toRead, offset);
           if (bytesRead === 0) {
@@ -756,7 +840,16 @@ app.whenReady().then(() => {
         }
 
         return { registryToken: token };
+      } catch (err) {
+        if (abortController.signal.aborted && sessionUrl) {
+          await fetchWithSafeRedirects(sessionUrl, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${token}` },
+          }).catch(() => {});
+        }
+        throw err;
       } finally {
+        if (requestId) activeTransfers.delete(requestId);
         if (fileHandle) {
           await fileHandle.close().catch(() => {});
         }
@@ -768,44 +861,39 @@ app.whenReady().then(() => {
     'desktop:downloadAndExtractLayer',
     async (
       event,
-      { url, registryToken, defaultFolderName, expectedSize, knownSingleFile, requestId }
+      {
+        url,
+        registryToken,
+        parentDir,
+        folderName,
+        replaceExisting = false,
+        defaultFolderName,
+        expectedSize,
+        requestId,
+      }
     ) => {
-      const dialogRes = await dialog.showOpenDialog({
-        title: `Select Destination Folder to Extract "${defaultFolderName}"`,
-        properties: ['openDirectory', 'createDirectory'],
-      });
-      if (dialogRes.canceled || dialogRes.filePaths.length === 0) {
-        return { saved: false, files: [] };
-      }
+      let chosenParentDir = parentDir;
+      let desiredFolderName = folderName || defaultFolderName || 'package';
 
-      const baseDest = knownSingleFile
-        ? dialogRes.filePaths[0]
-        : path.join(dialogRes.filePaths[0], defaultFolderName);
-
-      if (requestId) {
-        event.sender.send('desktop:transferProgress', {
-          requestId,
-          stage: 'downloading',
-          message: 'Connecting to ghcr.io...',
-          percent: 2,
+      if (!chosenParentDir) {
+        const dialogRes = await dialog.showOpenDialog({
+          title: `Select Destination Folder to Extract "${desiredFolderName}"`,
+          properties: ['openDirectory', 'createDirectory'],
         });
+        if (dialogRes.canceled || dialogRes.filePaths.length === 0) {
+          return { saved: false, files: [] };
+        }
+        chosenParentDir = dialogRes.filePaths[0];
       }
 
-      const upstreamRes = await fetchWithSafeRedirects(url, {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${registryToken}` },
-      });
+      const abortController = new AbortController();
+      if (requestId) activeTransfers.set(requestId, abortController);
 
-      if (!upstreamRes || !upstreamRes.ok || !upstreamRes.body) {
-        throw new Error(
-          `Failed to download layer blob (HTTP ${upstreamRes?.status || 'unknown'})`
-        );
-      }
+      const safeFolderName = sanitizeFolderName(desiredFolderName);
+      const stagingName = `.ghcr-extract-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const stagingDest = path.join(chosenParentDir, stagingName);
+      activeStagingDirs.add(stagingDest);
 
-      const totalBytes =
-        Number(upstreamRes.headers.get('content-length')) || expectedSize || 0;
-      let receivedBytes = 0;
-      let lastEmittedPct = -1;
       let activeOutStream = null;
       let activeOutStreamError = null;
 
@@ -833,31 +921,78 @@ app.whenReady().then(() => {
         });
       }
 
-      const parser = createNodeTarStreamParser({
-        onFileStart: async (meta) => {
-          await closeActiveStream();
-          const destPath = resolveSafeExtractPath(baseDest, meta.path);
-          await fs.mkdir(path.dirname(destPath), { recursive: true });
-          activeOutStreamError = null;
-          const ws = fsSync.createWriteStream(destPath);
-          ws.on('error', (err) => {
-            activeOutStreamError = err;
-          });
-          activeOutStream = ws;
-        },
-        onFileData: async (chunk) => {
-          if (activeOutStreamError) throw activeOutStreamError;
-          if (activeOutStream) {
-            await writeStreamChunk(activeOutStream, chunk);
-          }
-        },
-        onFileEnd: async () => {
-          await closeActiveStream();
-        },
-      });
+      async function destroyActiveStream() {
+        if (!activeOutStream) return;
+        const streamRef = activeOutStream;
+        activeOutStream = null;
+        await new Promise((resolve) => {
+          if (streamRef.closed) return resolve();
+          streamRef.once('close', resolve);
+          streamRef.destroy();
+        });
+      }
 
       try {
+        if (requestId) {
+          event.sender.send('desktop:transferProgress', {
+            requestId,
+            stage: 'downloading',
+            message: 'Connecting to ghcr.io...',
+            percent: 2,
+          });
+        }
+
+        const upstreamRes = await fetchWithSafeRedirects(url, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${registryToken}` },
+          signal: abortController.signal,
+        });
+
+        if (!upstreamRes || !upstreamRes.ok || !upstreamRes.body) {
+          throw new Error(
+            `Failed to download layer blob (HTTP ${upstreamRes?.status || 'unknown'})`
+          );
+        }
+
+        await fs.mkdir(stagingDest, { recursive: true });
+
+        const totalBytes =
+          Number(upstreamRes.headers.get('content-length')) || expectedSize || 0;
+        let receivedBytes = 0;
+        let lastEmittedPct = -1;
+
+        const parser = createNodeTarStreamParser({
+          onDirectory: async (meta) => {
+            if (meta.path && meta.path !== '.') {
+              const dirDest = resolveSafeExtractPath(stagingDest, meta.path);
+              await fs.mkdir(dirDest, { recursive: true });
+            }
+          },
+          onFileStart: async (meta) => {
+            await closeActiveStream();
+            const destPath = resolveSafeExtractPath(stagingDest, meta.path);
+            await fs.mkdir(path.dirname(destPath), { recursive: true });
+            activeOutStreamError = null;
+            const ws = fsSync.createWriteStream(destPath);
+            ws.on('error', (err) => {
+              activeOutStreamError = err;
+            });
+            activeOutStream = ws;
+          },
+          onFileData: async (chunk) => {
+            if (abortController.signal.aborted) throw createAbortError('Download cancelled');
+            if (activeOutStreamError) throw activeOutStreamError;
+            if (activeOutStream) {
+              await writeStreamChunk(activeOutStream, chunk);
+            }
+          },
+          onFileEnd: async () => {
+            await closeActiveStream();
+          },
+        });
+
         await pumpResponseStream(upstreamRes.body, {
+          signal: abortController.signal,
           onProgress: (delta) => {
             receivedBytes += delta;
             if (requestId) {
@@ -884,34 +1019,46 @@ app.whenReady().then(() => {
             return parser.isDone();
           },
         });
+
         await closeActiveStream();
-      } catch (err) {
-        if (activeOutStream) {
-          try {
-            activeOutStream.destroy();
-          } catch {
-            // ignore
-          }
-          activeOutStream = null;
+
+        const extractedMeta = parser.getFiles();
+        if (extractedMeta.length === 0) {
+          throw new Error('No files or folders were found inside the image layer.');
         }
+
+        let finalDest = resolveSafeExtractPath(chosenParentDir, safeFolderName);
+        if (replaceExisting) {
+          await fs.rm(finalDest, { recursive: true, force: true });
+        } else if (fsSync.existsSync(finalDest)) {
+          finalDest = resolveExtractDestinationInfo(chosenParentDir, safeFolderName).suggestedPath;
+        }
+
+        await renameWithRetry(stagingDest, finalDest);
+        activeStagingDirs.delete(stagingDest);
+
+        const extractedRegularCount = extractedMeta.filter((m) => !m.isDirectory).length;
+        if (requestId) {
+          event.sender.send('desktop:transferProgress', {
+            requestId,
+            stage: 'downloading',
+            message:
+              extractedRegularCount > 0
+                ? `Extracted ${extractedRegularCount} file(s)`
+                : 'Extracted empty folder',
+            percent: 100,
+          });
+        }
+
+        return { saved: true, outputPath: finalDest, files: extractedMeta };
+      } catch (err) {
+        await destroyActiveStream();
         throw err;
+      } finally {
+        if (requestId) activeTransfers.delete(requestId);
+        activeStagingDirs.delete(stagingDest);
+        await fs.rm(stagingDest, { recursive: true, force: true }).catch(() => {});
       }
-
-      const extractedMeta = parser.getFiles();
-      if (extractedMeta.length === 0) {
-        throw new Error('No files were found inside the image layer.');
-      }
-
-      if (requestId) {
-        event.sender.send('desktop:transferProgress', {
-          requestId,
-          stage: 'downloading',
-          message: `Extracted ${extractedMeta.length} file(s)`,
-          percent: 100,
-        });
-      }
-
-      return { saved: true, outputPath: baseDest, files: extractedMeta };
     }
   );
 
@@ -999,6 +1146,15 @@ app.on('before-quit', () => {
     }
   }
   activeTempFiles.clear();
+
+  for (const stagingDir of activeStagingDirs) {
+    try {
+      fsSync.rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      // ignore staging cleanup error on quit
+    }
+  }
+  activeStagingDirs.clear();
 });
 
 app.on('window-all-closed', () => {

@@ -13,17 +13,22 @@ import {
 } from '../src/lib/naming.ts';
 import {
   buildOciLayerFromFiles,
+  createZipFromExtractedFiles,
   extractFileMetaListStreaming,
   extractFilesFromOciLayer,
   normalizeMemoryLimitError,
+  summarizeArchiveEntries,
   type TarInputFile,
 } from '../src/lib/tar.ts';
+import { unzipSync } from 'fflate';
 
 const require = createRequire(import.meta.url);
 const {
   buildOciLayerToFile,
   createNodeTarStreamParser,
+  resolveExtractDestinationInfo,
   resolveSafeExtractPath,
+  sanitizeFolderName,
 } = require('../electron/streaming-tar.cjs');
 
 async function runTests() {
@@ -227,6 +232,111 @@ async function runTests() {
     // Verify friendly OOM message normalization for Web/Mobile
     const oomErr = normalizeMemoryLimitError(new RangeError('Array buffer allocation failed'), 'upload');
     assert.match(oomErr.message, /browser\/mobile memory limits/i);
+
+    console.log('7. Testing package-folder naming, conflict numbering, and aborted TAR cleanup...');
+    assert.equal(sanitizeFolderName('report.pdf'), 'report.pdf');
+    assert.equal(sanitizeFolderName('  bad:folder/name*  '), 'bad_folder_name_');
+    assert.equal(sanitizeFolderName('..'), 'package');
+    assert.equal(sanitizeFolderName(''), 'package');
+
+    const conflictParent = path.join(tmpWorkDir, 'extract-parent');
+    await fs.mkdir(conflictParent, { recursive: true });
+    const cleanDest = resolveExtractDestinationInfo(conflictParent, 'temp');
+    assert.equal(cleanDest.folderName, 'temp');
+    assert.equal(cleanDest.exists, false);
+    assert.equal(cleanDest.targetPath, path.join(conflictParent, 'temp'));
+    assert.equal(cleanDest.suggestedName, 'temp');
+    assert.equal(cleanDest.suggestedPath, path.join(conflictParent, 'temp'));
+
+    await fs.mkdir(path.join(conflictParent, 'temp'));
+    const firstConflict = resolveExtractDestinationInfo(conflictParent, 'temp');
+    assert.equal(firstConflict.exists, true);
+    assert.equal(firstConflict.suggestedName, 'temp (1)');
+    assert.equal(firstConflict.suggestedPath, path.join(conflictParent, 'temp (1)'));
+
+    await fs.mkdir(path.join(conflictParent, 'temp (1)'));
+    const secondConflict = resolveExtractDestinationInfo(conflictParent, 'temp');
+    assert.equal(secondConflict.exists, true);
+    assert.equal(secondConflict.suggestedName, 'temp (2)');
+    assert.equal(secondConflict.suggestedPath, path.join(conflictParent, 'temp (2)'));
+
+    const abortCtrl = new AbortController();
+    const abortedTargz = path.join(tmpWorkDir, 'aborted-layer.tar.gz');
+    await assert.rejects(
+      () =>
+        buildOciLayerToFile({
+          files: desktopInputs,
+          outFilePath: abortedTargz,
+          signal: abortCtrl.signal,
+          onProgress: () => {
+            abortCtrl.abort();
+          },
+        }),
+      (err: unknown) => err instanceof Error && err.name === 'AbortError'
+    );
+    await assert.rejects(() => fs.stat(abortedTargz), /ENOENT/);
+
+    console.log('8. Testing empty folders (TAR typeflag 5, PAX long dir paths, streaming parser, ZIP & summary)...');
+    const emptyLongDir = `empty_parent/${'deep_segment_'.repeat(8)}empty_leaf`;
+    const mixedEmptyDir = path.join(tmpWorkDir, 'empty-real-dir');
+    await fs.mkdir(mixedEmptyDir, { recursive: true });
+    const mixedTargz = path.join(tmpWorkDir, 'mixed-empty.tar.gz');
+
+    const mixedStreamed = await buildOciLayerToFile({
+      files: [
+        { fullPath: srcFile1, relativePath: 'FolderA/alpha.txt', mtime: 1700000010 },
+        { fullPath: mixedEmptyDir, relativePath: 'FolderA/empty-sub', size: 0, mtime: 1700000011, isDirectory: true },
+        { fullPath: '', relativePath: emptyLongDir, size: 0, mtime: 1700000012, isDirectory: true },
+        { fullPath: '', relativePath: '.', size: 0, mtime: 1700000013, isDirectory: true },
+      ],
+      outFilePath: mixedTargz,
+    });
+    assert.equal(mixedStreamed.fileCount, 1);
+
+    const mixedInMem = await buildOciLayerFromFiles([
+      { relativePath: 'FolderA/alpha.txt', data: await fs.readFile(srcFile1), mtime: 1700000010 },
+      { relativePath: 'FolderA/empty-sub', data: new Uint8Array(0), mtime: 1700000011, isDirectory: true },
+      { relativePath: emptyLongDir, data: new Uint8Array(0), mtime: 1700000012, isDirectory: true },
+      { relativePath: '.', data: new Uint8Array(0), mtime: 1700000013, isDirectory: true },
+    ]);
+    assert.equal(mixedStreamed.uncompressedDigest, mixedInMem.uncompressedDigest);
+
+    const parsedMeta = await extractFileMetaListStreaming(mixedInMem.targzBytes);
+    assert.deepEqual(parsedMeta, [
+      { path: 'FolderA/alpha.txt', size: 22 },
+      { path: 'FolderA/empty-sub', size: 0, isDirectory: true },
+      { path: emptyLongDir, size: 0, isDirectory: true },
+      { path: '.', size: 0, isDirectory: true },
+    ]);
+
+    const summary = summarizeArchiveEntries(parsedMeta);
+    assert.deepEqual(summary, { regularFileCount: 1, emptyFolderCount: 2 });
+
+    const extractedMixed = extractFilesFromOciLayer(mixedInMem.targzBytes);
+    assert.equal(extractedMixed.length, 4);
+    assert.equal(extractedMixed[1].relativePath, 'FolderA/empty-sub');
+    assert.equal(extractedMixed[1].isDirectory, true);
+    assert.equal(extractedMixed[2].relativePath, emptyLongDir);
+    assert.equal(extractedMixed[2].isDirectory, true);
+    assert.equal(extractedMixed[3].relativePath, '.');
+    assert.equal(extractedMixed[3].isDirectory, true);
+
+    const createdDirs: string[] = [];
+    const mixedNodeParser = createNodeTarStreamParser({
+      onDirectory: async (meta: { path: string }) => {
+        createdDirs.push(meta.path);
+      },
+    });
+    const mixedTarRaw = zlib.gunzipSync(await fs.readFile(mixedTargz));
+    await mixedNodeParser.feed(mixedTarRaw);
+    assert.deepEqual(createdDirs, ['FolderA/empty-sub', emptyLongDir, '.']);
+
+    const zipBytes = createZipFromExtractedFiles(extractedMixed);
+    const unzippedKeys = Object.keys(unzipSync(zipBytes));
+    assert.ok(unzippedKeys.includes('FolderA/alpha.txt'));
+    assert.ok(unzippedKeys.includes('FolderA/empty-sub/'));
+    assert.ok(unzippedKeys.includes(`${emptyLongDir}/`));
+    assert.equal(unzippedKeys.includes('./'), false);
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }
