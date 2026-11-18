@@ -3,13 +3,13 @@
 A package manager to build, sync, inspect, download, and manage OCI container images on GitHub Packages (ghcr.io).
 
 ## About The Project
-Pushing files or folders to GitHub Packages (`ghcr.io`) traditionally requires installing Docker or complex command-line tools like `oras` and `skopeo`, making it tedious on desktop and impossible on mobile devices. GHCR Manager was built to turn GitHub Container Registry into an effortless, visual file and folder package manager, building compliant OCI container layers directly in-memory and linking them automatically to your GitHub repositories.
+Pushing compiled binaries, build outputs, configs, or project folders to GitHub Packages (`ghcr.io`) traditionally requires running a Docker daemon or complex command-line tools like `oras` and `skopeo`, making quick uploads tedious on desktop and impossible on mobile devices. **GHCR Manager** turns GitHub Container Registry into a straightforward visual file and artifact package manager, building OCI container layers directly in-memory and linking them automatically to your GitHub repositories.
 
 ## Key Features
 
-* **File & Folder Image Builder:** Package a single file/folder or bundle multiple items into one OCI image, inspect nested folder trees, check existing versions live on GitHub, and replace older versions.
+* **File, Folder & Artifact Builder:** Package a single file/folder or bundle multiple items into one OCI image, inspect nested folder trees, check existing versions live on GitHub, and tag with live timestamps or replace older versions.
 * **Desktop Root Folder Auto-Sync:** Choose a root directory on Windows, Linux, or macOS, select specific files or sub-folders, preview nested contents, and review tags, conflicts, and replacements before pushing, turning direct files into separate packages and immediate sub-folders into bundled packages.
-* **Package Explorer & Extractor:** Browse packages across all tagged and untagged versions, inspect nested file trees, search package names/tags/files, extract back to disk or `.zip`, and remove individual versions or whole packages.
+* **Package Explorer & Extractor:** Browse packages across all tagged and untagged versions, inspect nested file trees, search package names/tags/files, extract contents to disk (Desktop) or file / `.zip` (Mobile & local web dev), and remove individual versions or whole packages.
 * **Zero-Docker Architecture:** Generates POSIX USTAR/PAX `.tar.gz` layers, SHA-256 digests, and OCI manifests natively in TypeScript.
 * **Saved Credentials Manager:** Supports GitHub Personal Access Tokens and OAuth Device Flow, automatically saving credentials under your username with masked suffixes (`ghp_••••xxxx` / `Ov23••••xxxx`), inline renaming, and one-click sign-in.
 * **Configurable Timestamp Tags & 5 Themes:** Live timestamp tags with `12h`/`24h` and date-format settings, plus Dark, Light, Green on Black, Red on Black, and Monochrome themes.
@@ -29,15 +29,10 @@ Download the latest installer or portable executable directly from the [Releases
 Before you begin, ensure you have Node.js installed.
 
 1. Clone the repository:
-
-   **SSH:**
-     ```bash
-     git clone git@github.com:nitaidor/GHCR-Manager.git
-     ```
-   **HTTPS:**
-     ```bash
-     git clone https://github.com/nitaidor/GHCR-Manager.git
-     ```
+   ```bash
+   git clone git@github.com:nitaidor/GHCR-Manager.git      # SSH
+   git clone https://github.com/nitaidor/GHCR-Manager.git  # HTTPS
+   ```
 2. Navigate to the project directory:
    ```bash
    cd GHCR-Manager
