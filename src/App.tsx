@@ -53,6 +53,7 @@ import {
   deletePackageVersion,
   deleteReplacedVersions,
   downloadAndExtractPackage,
+  downloadAndExtractPackageToDiskDesktop,
   fetchGitHubAuthInfo,
   fetchLivePackageState,
   formatBytes,
@@ -63,6 +64,7 @@ import {
   listUserRepositories,
   pollGitHubDeviceFlowToken,
   startGitHubDeviceFlow,
+  type DesktopStreamingInputFile,
   type GitHubPackageItem,
   type GitHubPackageVersion,
   type GitHubRepo,
@@ -85,7 +87,11 @@ import {
   validateFilesSelectionName,
   type DateFormat,
 } from './lib/naming';
-import { createZipFromExtractedFiles, type TarInputFile } from './lib/tar';
+import {
+  createZipFromExtractedFiles,
+  normalizeMemoryLimitError,
+  type TarInputFile,
+} from './lib/tar';
 
 interface SyncItemStatus {
   state: 'idle' | 'uploading' | 'done' | 'skipped' | 'error';
@@ -386,6 +392,10 @@ export default function App() {
   const inspectAbortRef = useRef<AbortController | null>(null);
   const refreshSeqRef = useRef<number>(0);
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<{
+    message: string;
+    percent: number;
+  } | null>(null);
   const [deletingPkgName, setDeletingPkgName] = useState<string | null>(null);
   const [deletingVersionKey, setDeletingVersionKey] = useState<string | null>(null);
   const [confirmDeletePkg, setConfirmDeletePkg] = useState<GitHubPackageItem | null>(null);
@@ -816,27 +826,40 @@ export default function App() {
     });
   }
 
+  function getNativeFilePath(file: File): string | undefined {
+    return (
+      window.electronAPI?.getPathForFile?.(file) ||
+      (file as unknown as { path?: string }).path ||
+      undefined
+    );
+  }
+
   function handleFilesAdded(newFiles: FileList | File[]) {
     setShowUploadPickerPrompt(false);
     const incomingFiles = Array.from(newFiles);
     if (incomingFiles.length === 0) return;
 
-    const items: UploadSelectionItem[] = incomingFiles.map((f) => ({
-      kind: 'file',
-      name: f.name,
-      size: f.size,
-      mtime: Math.floor(f.lastModified / 1000),
-      rawFile: f,
-      files: [
-        {
-          relativePath: f.name,
-          name: f.name,
-          size: f.size,
-          mtime: Math.floor(f.lastModified / 1000),
-          rawFile: f,
-        },
-      ],
-    }));
+    const items: UploadSelectionItem[] = incomingFiles.map((f) => {
+      const nativePath = getNativeFilePath(f);
+      return {
+        kind: 'file',
+        name: f.name,
+        fullPath: nativePath,
+        size: f.size,
+        mtime: Math.floor(f.lastModified / 1000),
+        rawFile: nativePath ? undefined : f,
+        files: [
+          {
+            fullPath: nativePath,
+            relativePath: f.name,
+            name: f.name,
+            size: f.size,
+            mtime: Math.floor(f.lastModified / 1000),
+            rawFile: nativePath ? undefined : f,
+          },
+        ],
+      };
+    });
 
     handleUploadItemsAdded(items);
   }
@@ -937,13 +960,15 @@ export default function App() {
         const lastPart = insideParts[insideParts.length - 1] || file.name;
         if (lastPart === '.DS_Store' || lastPart === 'Thumbs.db') continue;
 
+        const nativePath = getNativeFilePath(file);
         totalSize += file.size;
         entries.push({
+          fullPath: nativePath,
           relativePath: relInside,
           name: lastPart,
           size: file.size,
           mtime: Math.floor(file.lastModified / 1000),
-          rawFile: file,
+          rawFile: nativePath ? undefined : file,
         });
       }
 
@@ -1083,33 +1108,77 @@ export default function App() {
     setUploadSuccess(null);
 
     try {
-      const tarInputs: TarInputFile[] = [];
       const isSingleFolderOnly =
         pickedItems.length === 1 && pickedItems[0].kind === 'folder';
+
+      const pendingEntries: Array<{
+        relativePath: string;
+        mtime?: number;
+        size: number;
+        fullPath?: string;
+        rawFile?: File;
+        entry: DesktopRootFolderFileEntry;
+      }> = [];
 
       for (const item of pickedItems) {
         if (item.kind === 'file') {
           const entry = item.files[0];
-          const bytes = item.rawFile
-            ? new Uint8Array(await item.rawFile.arrayBuffer())
-            : await readUploadEntryBytes(entry);
-          tarInputs.push({
+          pendingEntries.push({
             relativePath: item.name,
-            data: bytes,
             mtime: item.mtime,
+            size: item.size,
+            fullPath: entry?.fullPath || item.fullPath,
+            rawFile: item.rawFile,
+            entry,
           });
         } else {
           for (const entry of item.files) {
-            const bytes = await readUploadEntryBytes(entry);
             const archivePath = isSingleFolderOnly
               ? entry.relativePath
               : `${item.name}/${entry.relativePath}`;
-            tarInputs.push({
+            pendingEntries.push({
               relativePath: archivePath,
-              data: bytes,
               mtime: entry.mtime,
+              size: entry.size,
+              fullPath: entry.fullPath,
+              rawFile: entry.rawFile,
+              entry,
             });
           }
+        }
+      }
+
+      const canStreamDesktop =
+        Boolean(window.electronAPI?.buildOciLayerFile) &&
+        Boolean(window.electronAPI?.uploadBlobFromFile) &&
+        pendingEntries.length > 0 &&
+        pendingEntries.every((p) => Boolean(p.fullPath));
+
+      let tarInputs: TarInputFile[] | undefined;
+      let desktopFiles: DesktopStreamingInputFile[] | undefined;
+
+      if (canStreamDesktop) {
+        desktopFiles = pendingEntries.map((p) => ({
+          fullPath: p.fullPath!,
+          relativePath: p.relativePath,
+          size: p.size,
+          mtime: p.mtime,
+        }));
+      } else {
+        tarInputs = [];
+        try {
+          for (const p of pendingEntries) {
+            const bytes = p.rawFile
+              ? new Uint8Array(await p.rawFile.arrayBuffer())
+              : await readUploadEntryBytes(p.entry);
+            tarInputs.push({
+              relativePath: p.relativePath,
+              data: bytes,
+              mtime: p.mtime,
+            });
+          }
+        } catch (err) {
+          throw normalizeMemoryLimitError(err, 'upload');
         }
       }
 
@@ -1124,6 +1193,7 @@ export default function App() {
             ? 'single-file'
             : 'multi-file',
         files: tarInputs,
+        desktopFiles,
         onProgress: (p) => setUploadProgress(p),
       });
 
@@ -1624,7 +1694,30 @@ export default function App() {
       }));
 
       try {
-        const tarFiles = await readRootSyncItemFiles(plan.item);
+        const canStreamDesktop =
+          Boolean(window.electronAPI?.buildOciLayerFile) &&
+          Boolean(window.electronAPI?.uploadBlobFromFile) &&
+          plan.item.files.length > 0 &&
+          plan.item.files.every((f) => Boolean(f.fullPath));
+
+        let tarFiles: TarInputFile[] | undefined;
+        let desktopFiles: DesktopStreamingInputFile[] | undefined;
+
+        if (canStreamDesktop) {
+          desktopFiles = plan.item.files.map((f) => ({
+            fullPath: f.fullPath!,
+            relativePath: f.relativePath,
+            size: f.size,
+            mtime: f.mtime,
+          }));
+        } else {
+          try {
+            tarFiles = await readRootSyncItemFiles(plan.item);
+          } catch (err) {
+            throw normalizeMemoryLimitError(err, 'upload');
+          }
+        }
+
         const details = await buildAndPushOciImage({
           username: user.login,
           githubToken: authToken,
@@ -1633,6 +1726,7 @@ export default function App() {
           tag: plan.tag,
           mode: plan.item.kind,
           files: tarFiles,
+          desktopFiles,
           onProgress: (p) => {
             const overallPct = Math.min(
               99,
@@ -1825,8 +1919,36 @@ export default function App() {
     const vKey = makeVersionStateKey(pkg.name, version.name);
     const info = getVersionReferenceInfo(version);
     setDownloadingKey(vKey);
+    setDownloadProgress(null);
     setActionBanner(null);
     try {
+      const displayLabel = `${pkg.name}${info.pullSuffix}`;
+
+      if (window.electronAPI?.downloadAndExtractLayer) {
+        const res = await downloadAndExtractPackageToDiskDesktop({
+          username: user.login,
+          githubToken: authToken,
+          owner: pkg.owner.login,
+          packageName: pkg.name,
+          tag: info.primaryTag || info.shortDigest,
+          reference: info.inspectRef,
+          onProgress: (p) => setDownloadProgress(p),
+        });
+
+        setInspectedByKey((prev) => ({
+          ...prev,
+          [vKey]: res.details,
+        }));
+
+        if (res.saved) {
+          setActionBanner({
+            type: 'success',
+            text: `Extracted ${res.fileCount} file(s) from "${displayLabel}" to ${res.outputPath}`,
+          });
+        }
+        return;
+      }
+
       const { details, extractedFiles } = await downloadAndExtractPackage({
         username: user.login,
         githubToken: authToken,
@@ -1845,7 +1967,6 @@ export default function App() {
         throw new Error('No files were found inside the image layer.');
       }
 
-      const displayLabel = `${pkg.name}${info.pullSuffix}`;
       if (window.electronAPI?.saveExtractedFiles) {
         const res = await window.electronAPI.saveExtractedFiles(
           details.originalName || pkg.name,
@@ -1878,12 +1999,14 @@ export default function App() {
         });
       }
     } catch (err: unknown) {
+      const friendly = normalizeMemoryLimitError(err, 'download');
       setActionBanner({
         type: 'error',
-        text: err instanceof Error ? err.message : String(err),
+        text: friendly.message,
       });
     } finally {
       setDownloadingKey(null);
+      setDownloadProgress(null);
     }
   }
 
@@ -2594,7 +2717,7 @@ export default function App() {
 
                         const droppedFileObjs = Array.from(e.dataTransfer.files || []);
                         const nativePaths = droppedFileObjs
-                          .map((f) => (f as unknown as { path?: string }).path)
+                          .map((f) => getNativeFilePath(f))
                           .filter((p): p is string => Boolean(p));
 
                         const seq = ++uploadScanSeqRef.current;
@@ -3856,7 +3979,7 @@ export default function App() {
 
                                               <button
                                                 type="button"
-                                                disabled={downloadingKey === vKey}
+                                                disabled={downloadingKey !== null}
                                                 onClick={() =>
                                                   handleDownloadVersion(pkg, version)
                                                 }
@@ -3891,6 +4014,23 @@ export default function App() {
                                               </button>
                                             </div>
                                           </div>
+
+                                          {downloadingKey === vKey && downloadProgress && (
+                                            <div className="space-y-1.5">
+                                              <div className="flex justify-between text-xs text-gray-300">
+                                                <span>{downloadProgress.message}</span>
+                                                <span>{downloadProgress.percent}%</span>
+                                              </div>
+                                              <div className="w-full h-2 bg-[#0d1117] rounded-full overflow-hidden border border-[#30363d]">
+                                                <div
+                                                  className="h-full tab-indicator transition-all duration-300"
+                                                  style={{
+                                                    width: `${downloadProgress.percent}%`,
+                                                  }}
+                                                />
+                                              </div>
+                                            </div>
+                                          )}
 
                                           {details && isDetailsExpanded && (
                                             <VersionFileDetailsPanel

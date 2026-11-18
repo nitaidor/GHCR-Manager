@@ -46,6 +46,7 @@ declare global {
     electronAPI?: {
       isDesktop: boolean;
       platform: string;
+      getPathForFile?: (file: File) => string | undefined;
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void;
       pickDirectoryPath?: () => Promise<string | null>;
       pickDirectoriesForUpload?: () => Promise<string[]>;
@@ -64,6 +65,54 @@ declare global {
         defaultFolderName: string,
         files: Array<{ relativePath: string; data: Uint8Array }>
       ) => Promise<{ saved: boolean; outputPath?: string }>;
+      buildOciLayerFile?: (opts: {
+        files: Array<{
+          fullPath: string;
+          relativePath: string;
+          size?: number;
+          mtime?: number;
+        }>;
+        requestId?: string;
+      }) => Promise<{
+        tempPath: string;
+        uncompressedDigest: string;
+        compressedDigest: string;
+        compressedSize: number;
+        totalFileBytes: number;
+        fileCount: number;
+        fileMetaList: Array<{ path: string; size: number }>;
+      }>;
+      uploadBlobFromFile?: (opts: {
+        tempPath: string;
+        uploadInitUrl: string;
+        digest: string;
+        registryToken: string;
+        basicAuthHeader?: string;
+        scopeParam?: string;
+        compressedSize: number;
+        requestId?: string;
+      }) => Promise<{ registryToken?: string }>;
+      deleteTempFile?: (tempPath: string) => Promise<void>;
+      downloadAndExtractLayer?: (opts: {
+        url: string;
+        registryToken: string;
+        defaultFolderName: string;
+        expectedSize?: number;
+        knownSingleFile?: boolean;
+        requestId?: string;
+      }) => Promise<{
+        saved: boolean;
+        outputPath?: string;
+        files: Array<{ path: string; size: number }>;
+      }>;
+      onTransferProgress?: (
+        cb: (payload: {
+          requestId: string;
+          stage: string;
+          message: string;
+          percent: number;
+        }) => void
+      ) => () => void;
       httpRequest: (opts: {
         url: string;
         method?: string;

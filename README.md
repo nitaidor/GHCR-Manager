@@ -3,14 +3,14 @@
 A package manager to build, sync, inspect, download, and manage OCI container images on GitHub Packages (ghcr.io).
 
 ## About The Project
-Pushing compiled binaries, build outputs, configs, or project folders to GitHub Packages (`ghcr.io`) traditionally requires running a Docker daemon or complex command-line tools like `oras` and `skopeo`, making quick uploads tedious on desktop and impossible on mobile devices. **GHCR Manager** turns GitHub Container Registry into a straightforward visual file and artifact package manager, building OCI container layers directly in-memory and linking them automatically to your GitHub repositories.
+Pushing compiled binaries, build outputs, configs, or project folders to GitHub Packages (`ghcr.io`) traditionally requires running a Docker daemon or complex command-line tools like `oras` and `skopeo`, making quick uploads tedious on desktop and impossible on mobile devices. **GHCR Manager** turns GitHub Container Registry into a straightforward visual file and artifact package manager, building OCI container layers cleanly (disk-streamed in chunks on Desktop, or in-memory on Mobile and Web) and linking them automatically to your GitHub repositories.
 
 ## Key Features
 
 * **File, Folder & Artifact Builder:** Package a single file/folder or bundle multiple items into one OCI image, inspect nested folder trees, check existing versions live on GitHub, and tag with live timestamps or replace older versions.
 * **Desktop Root Folder Auto-Sync:** Choose a root directory on Windows, Linux, or macOS, select specific files or sub-folders, preview nested contents, and review tags, conflicts, and replacements before pushing, turning direct files into separate packages and immediate sub-folders into bundled packages.
 * **Package Explorer & Extractor:** Browse packages across all tagged and untagged versions, inspect nested file trees, search package names/tags/files, extract contents to disk (Desktop) or file / `.zip` (Mobile & local web dev), and remove individual versions or whole packages.
-* **Zero-Docker Architecture:** Generates POSIX USTAR/PAX `.tar.gz` layers, SHA-256 digests, and OCI manifests natively in TypeScript.
+* **Zero-Docker Architecture:** Generates POSIX USTAR/PAX `.tar.gz` layers, SHA-256 digests, and OCI manifests without Docker, using disk-streaming and chunked OCI uploads/extractions on Desktop for multi-GB packages (up to GHCR's 10 GB layer limit).
 * **Saved Credentials Manager:** Supports GitHub Personal Access Tokens and OAuth Device Flow, automatically saving credentials under your username with masked suffixes (`ghp_••••xxxx` / `Ov23••••xxxx`), inline renaming, and one-click sign-in.
 * **Configurable Timestamp Tags & 5 Themes:** Live timestamp tags with `12h`/`24h` and date-format settings, plus Dark, Light, Green on Black, Red on Black, and Monochrome themes.
 
@@ -19,7 +19,7 @@ Run GHCR Manager directly in your browser: [nitaidor.github.io/GHCR-Manager](htt
 
 * **Supported in Live Demo:** Personal Access Token sign-in, repository browsing, viewing linked packages & versions, and removing versions or packages.
 * **Requires Installed App or Local `npm run dev`:** OCI image creation & uploads, layer file inspection (`Load Files`), package downloads & extraction from `ghcr.io`, and OAuth Device Flow (blocked by browser CORS on static GitHub Pages).
-* **Requires Desktop App:** Root Folder Auto-Sync (`Sync Root Folder` tab) and direct multi-file folder extraction to disk.
+* **Requires Desktop App:** Root Folder Auto-Sync (`Sync Root Folder` tab), direct extraction to a destination disk folder, and multi-GB package uploads, downloads, and external layer inspection (streamed in chunks instead of held in browser/mobile RAM).
 
 ## Installation
 ### Option 1: Download Pre-Built Executables

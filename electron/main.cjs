@@ -1,143 +1,201 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeTheme } = require('electron');
 const path = require('node:path');
+const os = require('node:os');
 const fsSync = require('node:fs');
 const fs = require('node:fs/promises');
 const zlib = require('node:zlib');
+const {
+  buildOciLayerToFile,
+  createNodeTarStreamParser,
+  resolveSafeExtractPath,
+  writeStreamChunk,
+} = require('./streaming-tar.cjs');
 
 const activeLayerStreams = new Map();
+const activeTempFiles = new Set();
+const BLOB_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024; // 16 MiB per OCI PATCH request
 
-function createNodeTarMetaParser() {
-  const files = [];
-  let pendingBuf = Buffer.alloc(4096);
-  let pendingLen = 0;
-  let skipRemaining = 0;
-  let metaNeededBlocks = 0;
-  let metaExactSize = 0;
-  let metaType = null;
-  let pendingPaxPath = null;
-  let done = false;
+function formatBytesNode(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, bytes)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let val = bytes / 1024;
+  let unitIdx = 0;
+  while (val >= 1024 && unitIdx < units.length - 1) {
+    val /= 1024;
+    unitIdx++;
+  }
+  return `${val.toFixed(val >= 100 ? 0 : val >= 10 ? 1 : 2)} ${units[unitIdx]}`;
+}
 
-  function appendToPending(slice) {
-    const needed = pendingLen + slice.length;
-    if (needed > pendingBuf.length) {
-      const next = Buffer.alloc(Math.max(pendingBuf.length * 2, needed));
-      pendingBuf.copy(next, 0, 0, pendingLen);
-      pendingBuf = next;
+/**
+ * Performs fetch with manual redirect handling so Authorization headers are stripped
+ * when redirecting across different hostnames (e.g. ghcr.io -> Azure Blob Storage CDN).
+ */
+async function fetchWithSafeRedirects(url, opts = {}) {
+  let currentUrl = url;
+  let currentMethod = opts.method || 'GET';
+  let currentHeaders = { ...(opts.headers || {}) };
+  let currentBody = opts.body;
+
+  let upstreamRes = null;
+  for (let hops = 0; hops < 5; hops++) {
+    upstreamRes = await fetch(currentUrl, {
+      method: currentMethod,
+      headers: currentHeaders,
+      body:
+        currentMethod !== 'GET' && currentMethod !== 'HEAD' ? currentBody : undefined,
+      redirect: 'manual',
+      signal: opts.signal,
+    });
+
+    if ([301, 302, 303, 307, 308].includes(upstreamRes.status)) {
+      const loc = upstreamRes.headers.get('location');
+      if (!loc) break;
+      const nextUrl = new URL(loc, currentUrl).toString();
+      const nextHost = new URL(nextUrl).hostname;
+      const prevHost = new URL(currentUrl).hostname;
+      if (nextHost !== prevHost) {
+        delete currentHeaders['Authorization'];
+        delete currentHeaders['authorization'];
+      }
+      if (upstreamRes.status === 303) {
+        currentMethod = 'GET';
+        currentBody = undefined;
+      }
+      currentUrl = nextUrl;
+      continue;
     }
-    Buffer.from(slice).copy(pendingBuf, pendingLen);
-    pendingLen += slice.length;
+    break;
   }
 
-  function readNullStr(buf, offset, maxLen) {
-    let end = offset;
-    const limit = offset + maxLen;
-    while (end < limit && buf[end] !== 0) end++;
-    return buf.subarray(offset, end).toString('utf8');
-  }
+  return upstreamRes;
+}
 
-  function readOctal(buf, offset, maxLen) {
-    const s = readNullStr(buf, offset, maxLen).trim();
-    return s ? parseInt(s, 8) || 0 : 0;
-  }
+async function refreshGhcrTokenNode(basicAuthHeader, scopeParam) {
+  const tokenUrl = `https://ghcr.io/token?service=ghcr.io&scope=${encodeURIComponent(scopeParam)}`;
+  const res = await fetch(tokenUrl, {
+    method: 'GET',
+    headers: {
+      Authorization: basicAuthHeader,
+      Accept: 'application/json',
+    },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.token || data.access_token || null;
+}
 
-  function feed(chunk) {
-    if (done || !chunk || chunk.length === 0) return;
-    let pos = 0;
+async function pumpResponseStream(responseBody, { onProgress, onFirstDetectGzip, onUncompressedChunk, signal }) {
+  const reader = responseBody.getReader();
+  const parserMode = { gunzip: null, detectBuf: Buffer.alloc(0), initialized: false };
 
-    while (pos < chunk.length && !done) {
-      if (skipRemaining > 0) {
-        const avail = chunk.length - pos;
-        const toSkip = Math.min(avail, skipRemaining);
-        pos += toSkip;
-        skipRemaining -= toSkip;
-        continue;
-      }
+  let pumpErr = null;
+  let consumePromise = null;
+  let stopEarly = false;
 
-      if (metaNeededBlocks > 0) {
-        const need = metaNeededBlocks - pendingLen;
-        const take = Math.min(need, chunk.length - pos);
-        appendToPending(chunk.subarray(pos, pos + take));
-        pos += take;
+  function ensureDecompressor(magicBuf) {
+    const isGzip = magicBuf.length >= 2 && magicBuf[0] === 0x1f && magicBuf[1] === 0x8b;
+    if (onFirstDetectGzip) onFirstDetectGzip(isGzip);
+    if (!isGzip) return;
 
-        if (pendingLen === metaNeededBlocks) {
-          const payload = pendingBuf.subarray(0, metaExactSize);
-          if (metaType === 'x' || metaType === 'g') {
-            const paxText = payload.toString('utf8');
-            for (const line of paxText.split('\n')) {
-              const spaceIdx = line.indexOf(' ');
-              if (spaceIdx > 0) {
-                const kv = line.slice(spaceIdx + 1);
-                if (kv.startsWith('path=')) {
-                  pendingPaxPath = kv.slice(5);
-                }
-              }
-            }
-          } else if (metaType === 'L') {
-            pendingPaxPath = readNullStr(payload, 0, payload.length);
-          }
-          pendingLen = 0;
-          metaNeededBlocks = 0;
-          metaExactSize = 0;
-          metaType = null;
-        }
-        continue;
-      }
-
-      const need = 512 - pendingLen;
-      const take = Math.min(need, chunk.length - pos);
-      appendToPending(chunk.subarray(pos, pos + take));
-      pos += take;
-
-      if (pendingLen === 512) {
-        const header = pendingBuf.subarray(0, 512);
-        pendingLen = 0;
-
-        let allZero = true;
-        for (let i = 0; i < 512; i++) {
-          if (header[i] !== 0) {
-            allZero = false;
+    const gunzip = zlib.createGunzip();
+    parserMode.gunzip = gunzip;
+    consumePromise = (async () => {
+      try {
+        for await (const decompressed of gunzip) {
+          if (stopEarly) break;
+          const shouldStop = await onUncompressedChunk(decompressed);
+          if (shouldStop) {
+            stopEarly = true;
+            await reader.cancel().catch(() => {});
+            gunzip.destroy();
             break;
           }
         }
-        if (allZero) {
-          done = true;
-          break;
-        }
-
-        const name = readNullStr(header, 0, 100);
-        const prefix = readNullStr(header, 345, 155);
-        const size = readOctal(header, 124, 12);
-        const typeflag = header[156] === 0 ? '0' : String.fromCharCode(header[156]);
-        const blocks = Math.ceil(size / 512) * 512;
-
-        if (typeflag === 'x' || typeflag === 'g' || typeflag === 'L') {
-          if (blocks > 0) {
-            metaType = typeflag;
-            metaExactSize = size;
-            metaNeededBlocks = blocks;
-          }
-        } else if (typeflag === '0' || typeflag === '\0') {
-          const fullPath = (
-            pendingPaxPath || (prefix ? `${prefix}/${name}` : name)
-          ).replace(/^\/+/, '');
-          pendingPaxPath = null;
-          if (fullPath) {
-            files.push({ path: fullPath, size });
-          }
-          skipRemaining = blocks;
-        } else {
-          pendingPaxPath = null;
-          skipRemaining = blocks;
-        }
+      } catch (err) {
+        gunzip.destroy(err);
+        await reader.cancel(err).catch(() => {});
+        throw err;
       }
-    }
+    })();
   }
 
-  return {
-    feed,
-    getFiles: () => files,
-    isDone: () => done,
-  };
+  const pumpPromise = (async () => {
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          const abortErr = new Error('Operation aborted');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+        if (stopEarly) break;
+
+        const { done, value } = await reader.read();
+        if (done || stopEarly) break;
+        if (!value || value.byteLength === 0) continue;
+
+        onProgress?.(value.byteLength);
+        const chunk = Buffer.from(value);
+
+        if (!parserMode.initialized) {
+          parserMode.detectBuf =
+            parserMode.detectBuf.length > 0
+              ? Buffer.concat([parserMode.detectBuf, chunk])
+              : chunk;
+          if (parserMode.detectBuf.length < 2) continue;
+
+          parserMode.initialized = true;
+          ensureDecompressor(parserMode.detectBuf);
+
+          if (parserMode.gunzip) {
+            await writeStreamChunk(parserMode.gunzip, parserMode.detectBuf);
+          } else {
+            const shouldStop = await onUncompressedChunk(parserMode.detectBuf);
+            if (shouldStop) {
+              stopEarly = true;
+              await reader.cancel().catch(() => {});
+              break;
+            }
+          }
+          parserMode.detectBuf = Buffer.alloc(0);
+          continue;
+        }
+
+        if (parserMode.gunzip) {
+          await writeStreamChunk(parserMode.gunzip, chunk);
+        } else {
+          const shouldStop = await onUncompressedChunk(chunk);
+          if (shouldStop) {
+            stopEarly = true;
+            await reader.cancel().catch(() => {});
+            break;
+          }
+        }
+      }
+
+      if (!parserMode.initialized && parserMode.detectBuf.length > 0 && !stopEarly) {
+        parserMode.initialized = true;
+        ensureDecompressor(parserMode.detectBuf);
+        if (parserMode.gunzip) {
+          await writeStreamChunk(parserMode.gunzip, parserMode.detectBuf);
+        } else {
+          await onUncompressedChunk(parserMode.detectBuf);
+        }
+        parserMode.detectBuf = Buffer.alloc(0);
+      }
+
+      if (parserMode.gunzip && !parserMode.gunzip.destroyed) {
+        parserMode.gunzip.end();
+      }
+    } catch (err) {
+      pumpErr = err;
+      if (parserMode.gunzip) parserMode.gunzip.destroy(err);
+      await reader.cancel(err).catch(() => {});
+    }
+  })();
+
+  await Promise.all([pumpPromise, consumePromise].filter(Boolean));
+  if (pumpErr) throw pumpErr;
 }
 
 app.setName('GHCR Manager');
@@ -476,40 +534,11 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('desktop:httpRequest', async (_event, reqOpts) => {
-    let currentUrl = reqOpts.url;
-    let currentMethod = reqOpts.method || 'GET';
-    let currentHeaders = { ...(reqOpts.headers || {}) };
-    let currentBody = reqOpts.body ? Buffer.from(reqOpts.body) : undefined;
-
-    let upstreamRes = null;
-    for (let hops = 0; hops < 5; hops++) {
-      upstreamRes = await fetch(currentUrl, {
-        method: currentMethod,
-        headers: currentHeaders,
-        body:
-          currentMethod !== 'GET' && currentMethod !== 'HEAD' ? currentBody : undefined,
-        redirect: 'manual',
-      });
-
-      if ([301, 302, 303, 307, 308].includes(upstreamRes.status)) {
-        const loc = upstreamRes.headers.get('location');
-        if (!loc) break;
-        const nextUrl = new URL(loc, currentUrl).toString();
-        const nextHost = new URL(nextUrl).hostname;
-        const prevHost = new URL(currentUrl).hostname;
-        if (nextHost !== prevHost) {
-          delete currentHeaders['Authorization'];
-          delete currentHeaders['authorization'];
-        }
-        if (upstreamRes.status === 303) {
-          currentMethod = 'GET';
-          currentBody = undefined;
-        }
-        currentUrl = nextUrl;
-        continue;
-      }
-      break;
-    }
+    const upstreamRes = await fetchWithSafeRedirects(reqOpts.url, {
+      method: reqOpts.method || 'GET',
+      headers: reqOpts.headers || {},
+      body: reqOpts.body ? Buffer.from(reqOpts.body) : undefined,
+    });
 
     const headersObj = {};
     upstreamRes.headers.forEach((val, key) => {
@@ -522,6 +551,369 @@ app.whenReady().then(() => {
       body: new Uint8Array(arrayBuf),
     };
   });
+
+  ipcMain.handle('desktop:buildOciLayerFile', async (event, { files, requestId }) => {
+    const tempName = `ghcr-manager-layer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tar.gz`;
+    const tempPath = path.join(os.tmpdir(), tempName);
+    activeTempFiles.add(tempPath);
+
+    let lastSentPct = -1;
+    try {
+      return await buildOciLayerToFile({
+        files,
+        outFilePath: tempPath,
+        onProgress: ({ processedBytes, totalBytes, percent }) => {
+          const scaledPct = 10 + Math.round((percent / 100) * 35); // 10% -> 45%
+          if (requestId && scaledPct !== lastSentPct) {
+            lastSentPct = scaledPct;
+            event.sender.send('desktop:transferProgress', {
+              requestId,
+              stage: 'archiving',
+              message: `Archiving & compressing layer (${formatBytesNode(processedBytes)} / ${formatBytesNode(totalBytes)})...`,
+              percent: scaledPct,
+            });
+          }
+        },
+      });
+    } catch (err) {
+      activeTempFiles.delete(tempPath);
+      await fs.unlink(tempPath).catch(() => {});
+      throw err;
+    }
+  });
+
+  ipcMain.handle('desktop:deleteTempFile', async (_event, tempPath) => {
+    if (!tempPath || !activeTempFiles.has(tempPath)) return;
+    activeTempFiles.delete(tempPath);
+    await fs.unlink(tempPath).catch(() => {});
+  });
+
+  ipcMain.handle(
+    'desktop:uploadBlobFromFile',
+    async (
+      event,
+      {
+        tempPath,
+        uploadInitUrl,
+        digest,
+        registryToken,
+        basicAuthHeader,
+        scopeParam,
+        compressedSize,
+        requestId,
+      }
+    ) => {
+      let token = registryToken;
+      let fileHandle = null;
+
+      async function readExactChunk(fh, buf, length, position) {
+        let totalRead = 0;
+        while (totalRead < length) {
+          const { bytesRead } = await fh.read(buf, totalRead, length - totalRead, position + totalRead);
+          if (bytesRead === 0) break;
+          totalRead += bytesRead;
+        }
+        return totalRead;
+      }
+
+      async function sendRequestWithAuthRetry(url, initBuilder) {
+        let res = await fetchWithSafeRedirects(url, initBuilder(token));
+        if (res.status === 401 && basicAuthHeader && scopeParam) {
+          const nextToken = await refreshGhcrTokenNode(basicAuthHeader, scopeParam);
+          if (nextToken) {
+            token = nextToken;
+            res = await fetchWithSafeRedirects(url, initBuilder(token));
+          }
+        }
+        return res;
+      }
+
+      try {
+        fileHandle = await fs.open(tempPath, 'r');
+        const st = await fileHandle.stat();
+        const totalSize = typeof compressedSize === 'number' && compressedSize > 0 ? compressedSize : st.size;
+
+        const startRes = await sendRequestWithAuthRetry(uploadInitUrl, (tok) => ({
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${tok}`,
+            'Content-Length': '0',
+          },
+        }));
+
+        if (startRes.status !== 202) {
+          const bodyText = await startRes.text().catch(() => '');
+          throw new Error(
+            `Failed to initiate blob upload to ghcr.io (HTTP ${startRes.status}): ${bodyText}`
+          );
+        }
+
+        const locationHeader = startRes.headers.get('location');
+        if (!locationHeader) {
+          throw new Error('ghcr.io blob upload response missing Location header.');
+        }
+
+        let sessionUrl = new URL(locationHeader, 'https://ghcr.io').toString();
+
+        if (totalSize <= BLOB_UPLOAD_CHUNK_BYTES) {
+          const singleBuf = Buffer.allocUnsafe(totalSize);
+          const bytesRead = await readExactChunk(fileHandle, singleBuf, totalSize, 0);
+          const putUrlObj = new URL(sessionUrl);
+          putUrlObj.searchParams.set('digest', digest);
+
+          const putRes = await sendRequestWithAuthRetry(putUrlObj.toString(), (tok) => ({
+            method: 'PUT',
+            headers: {
+              Authorization: `Bearer ${tok}`,
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(bytesRead),
+            },
+            body: bytesRead === singleBuf.length ? singleBuf : singleBuf.subarray(0, bytesRead),
+          }));
+
+          if (putRes.status !== 201 && putRes.status !== 202) {
+            const bodyText = await putRes.text().catch(() => '');
+            throw new Error(
+              `Failed to finish blob upload to ghcr.io (HTTP ${putRes.status}): ${bodyText}`
+            );
+          }
+
+          if (requestId) {
+            event.sender.send('desktop:transferProgress', {
+              requestId,
+              stage: 'uploading-layer',
+              message: `Uploaded compressed image layer (${formatBytesNode(totalSize)})`,
+              percent: 90,
+            });
+          }
+          return { registryToken: token };
+        }
+
+        const chunkBuf = Buffer.allocUnsafe(BLOB_UPLOAD_CHUNK_BYTES);
+        let offset = 0;
+        let lastSentPct = -1;
+
+        while (offset < totalSize) {
+          const toRead = Math.min(BLOB_UPLOAD_CHUNK_BYTES, totalSize - offset);
+          const bytesRead = await readExactChunk(fileHandle, chunkBuf, toRead, offset);
+          if (bytesRead === 0) {
+            throw new Error('Unexpected end of temporary archive file while uploading.');
+          }
+          const payload = bytesRead === chunkBuf.length ? chunkBuf : chunkBuf.subarray(0, bytesRead);
+          const rangeHeader = `${offset}-${offset + bytesRead - 1}`;
+
+          const patchRes = await sendRequestWithAuthRetry(sessionUrl, (tok) => ({
+            method: 'PATCH',
+            headers: {
+              Authorization: `Bearer ${tok}`,
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(bytesRead),
+              'Content-Range': rangeHeader,
+            },
+            body: payload,
+          }));
+
+          if (patchRes.status !== 202 && patchRes.status !== 201 && patchRes.status !== 204) {
+            const bodyText = await patchRes.text().catch(() => '');
+            throw new Error(
+              `Failed to upload layer chunk at byte ${offset} (HTTP ${patchRes.status}): ${bodyText}`
+            );
+          }
+
+          const nextLoc = patchRes.headers.get('location');
+          if (nextLoc) {
+            sessionUrl = new URL(nextLoc, sessionUrl).toString();
+          }
+
+          offset += bytesRead;
+          const scaledPct = 55 + Math.round((offset / totalSize) * 35); // 55% -> 90%
+          if (requestId && scaledPct !== lastSentPct) {
+            lastSentPct = scaledPct;
+            event.sender.send('desktop:transferProgress', {
+              requestId,
+              stage: 'uploading-layer',
+              message: `Uploading compressed image layer (${formatBytesNode(offset)} / ${formatBytesNode(totalSize)})...`,
+              percent: scaledPct,
+            });
+          }
+        }
+
+        const finalUrlObj = new URL(sessionUrl);
+        finalUrlObj.searchParams.set('digest', digest);
+        const finalPutRes = await sendRequestWithAuthRetry(finalUrlObj.toString(), (tok) => ({
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${tok}`,
+            'Content-Length': '0',
+          },
+        }));
+
+        if (finalPutRes.status !== 201 && finalPutRes.status !== 202) {
+          const bodyText = await finalPutRes.text().catch(() => '');
+          throw new Error(
+            `Failed to commit chunked blob upload to ghcr.io (HTTP ${finalPutRes.status}): ${bodyText}`
+          );
+        }
+
+        return { registryToken: token };
+      } finally {
+        if (fileHandle) {
+          await fileHandle.close().catch(() => {});
+        }
+      }
+    }
+  );
+
+  ipcMain.handle(
+    'desktop:downloadAndExtractLayer',
+    async (
+      event,
+      { url, registryToken, defaultFolderName, expectedSize, knownSingleFile, requestId }
+    ) => {
+      const dialogRes = await dialog.showOpenDialog({
+        title: `Select Destination Folder to Extract "${defaultFolderName}"`,
+        properties: ['openDirectory', 'createDirectory'],
+      });
+      if (dialogRes.canceled || dialogRes.filePaths.length === 0) {
+        return { saved: false, files: [] };
+      }
+
+      const baseDest = knownSingleFile
+        ? dialogRes.filePaths[0]
+        : path.join(dialogRes.filePaths[0], defaultFolderName);
+
+      if (requestId) {
+        event.sender.send('desktop:transferProgress', {
+          requestId,
+          stage: 'downloading',
+          message: 'Connecting to ghcr.io...',
+          percent: 2,
+        });
+      }
+
+      const upstreamRes = await fetchWithSafeRedirects(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${registryToken}` },
+      });
+
+      if (!upstreamRes || !upstreamRes.ok || !upstreamRes.body) {
+        throw new Error(
+          `Failed to download layer blob (HTTP ${upstreamRes?.status || 'unknown'})`
+        );
+      }
+
+      const totalBytes =
+        Number(upstreamRes.headers.get('content-length')) || expectedSize || 0;
+      let receivedBytes = 0;
+      let lastEmittedPct = -1;
+      let activeOutStream = null;
+      let activeOutStreamError = null;
+
+      function closeActiveStream() {
+        if (activeOutStreamError) {
+          const err = activeOutStreamError;
+          activeOutStreamError = null;
+          activeOutStream = null;
+          return Promise.reject(err);
+        }
+        if (!activeOutStream) return Promise.resolve();
+        const streamRef = activeOutStream;
+        activeOutStream = null;
+        return new Promise((resolve, reject) => {
+          streamRef.once('error', reject);
+          streamRef.end(() => {
+            if (activeOutStreamError) {
+              const err = activeOutStreamError;
+              activeOutStreamError = null;
+              reject(err);
+            } else {
+              resolve();
+            }
+          });
+        });
+      }
+
+      const parser = createNodeTarStreamParser({
+        onFileStart: async (meta) => {
+          await closeActiveStream();
+          const destPath = resolveSafeExtractPath(baseDest, meta.path);
+          await fs.mkdir(path.dirname(destPath), { recursive: true });
+          activeOutStreamError = null;
+          const ws = fsSync.createWriteStream(destPath);
+          ws.on('error', (err) => {
+            activeOutStreamError = err;
+          });
+          activeOutStream = ws;
+        },
+        onFileData: async (chunk) => {
+          if (activeOutStreamError) throw activeOutStreamError;
+          if (activeOutStream) {
+            await writeStreamChunk(activeOutStream, chunk);
+          }
+        },
+        onFileEnd: async () => {
+          await closeActiveStream();
+        },
+      });
+
+      try {
+        await pumpResponseStream(upstreamRes.body, {
+          onProgress: (delta) => {
+            receivedBytes += delta;
+            if (requestId) {
+              const pct =
+                totalBytes > 0
+                  ? Math.min(99, Math.round((receivedBytes / totalBytes) * 100))
+                  : 50;
+              if (pct !== lastEmittedPct) {
+                lastEmittedPct = pct;
+                event.sender.send('desktop:transferProgress', {
+                  requestId,
+                  stage: 'downloading',
+                  message:
+                    totalBytes > 0
+                      ? `Downloading & extracting (${formatBytesNode(receivedBytes)} / ${formatBytesNode(totalBytes)})...`
+                      : `Downloading & extracting (${formatBytesNode(receivedBytes)})...`,
+                  percent: pct,
+                });
+              }
+            }
+          },
+          onUncompressedChunk: async (decompressed) => {
+            await parser.feed(decompressed);
+            return parser.isDone();
+          },
+        });
+        await closeActiveStream();
+      } catch (err) {
+        if (activeOutStream) {
+          try {
+            activeOutStream.destroy();
+          } catch {
+            // ignore
+          }
+          activeOutStream = null;
+        }
+        throw err;
+      }
+
+      const extractedMeta = parser.getFiles();
+      if (extractedMeta.length === 0) {
+        throw new Error('No files were found inside the image layer.');
+      }
+
+      if (requestId) {
+        event.sender.send('desktop:transferProgress', {
+          requestId,
+          stage: 'downloading',
+          message: `Extracted ${extractedMeta.length} file(s)`,
+          percent: 100,
+        });
+      }
+
+      return { saved: true, outputPath: baseDest, files: extractedMeta };
+    }
+  );
 
   ipcMain.on('desktop:cancelLayerStream', (_event, requestId) => {
     const ac = activeLayerStreams.get(requestId);
@@ -538,32 +930,11 @@ app.whenReady().then(() => {
       if (requestId) activeLayerStreams.set(requestId, abortController);
 
       try {
-        let currentUrl = url;
-        const headers = { Authorization: `Bearer ${registryToken}` };
-        let upstreamRes = null;
-
-        for (let hops = 0; hops < 5; hops++) {
-          upstreamRes = await fetch(currentUrl, {
-            method: 'GET',
-            headers,
-            redirect: 'manual',
-            signal: abortController.signal,
-          });
-
-          if ([301, 302, 303, 307, 308].includes(upstreamRes.status)) {
-            const loc = upstreamRes.headers.get('location');
-            if (!loc) break;
-            const nextUrl = new URL(loc, currentUrl).toString();
-            const nextHost = new URL(nextUrl).hostname;
-            const prevHost = new URL(currentUrl).hostname;
-            if (nextHost !== prevHost) {
-              delete headers['Authorization'];
-            }
-            currentUrl = nextUrl;
-            continue;
-          }
-          break;
-        }
+        const upstreamRes = await fetchWithSafeRedirects(url, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${registryToken}` },
+          signal: abortController.signal,
+        });
 
         if (!upstreamRes || !upstreamRes.ok || !upstreamRes.body) {
           throw new Error(
@@ -573,77 +944,30 @@ app.whenReady().then(() => {
 
         const totalBytes =
           Number(upstreamRes.headers.get('content-length')) || expectedSize || 0;
-        const parser = createNodeTarMetaParser();
-        const reader = upstreamRes.body.getReader();
-
-        let gunzip = null;
-        let gunzipDone = null;
-        let isFirstChunk = true;
+        const parser = createNodeTarStreamParser();
         let receivedBytes = 0;
         let lastEmittedPct = -1;
 
-        while (true) {
-          if (abortController.signal.aborted) {
-            const abortErr = new Error('Layer scan aborted');
-            abortErr.name = 'AbortError';
-            throw abortErr;
-          }
-
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!value || value.byteLength === 0) continue;
-
-          receivedBytes += value.byteLength;
-          if (totalBytes > 0 && requestId) {
-            const pct = Math.min(99, Math.round((receivedBytes / totalBytes) * 100));
-            if (pct !== lastEmittedPct) {
-              lastEmittedPct = pct;
-              event.sender.send('desktop:layerStreamProgress', {
-                requestId,
-                percent: pct,
-              });
-            }
-          }
-
-          const buf = Buffer.from(value);
-          if (isFirstChunk) {
-            isFirstChunk = false;
-            const isGzip = buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
-            if (isGzip) {
-              gunzip = zlib.createGunzip();
-              gunzipDone = new Promise((resolve, reject) => {
-                gunzip.on('data', (decompressed) => {
-                  try {
-                    parser.feed(decompressed);
-                  } catch (err) {
-                    reject(err);
-                  }
+        await pumpResponseStream(upstreamRes.body, {
+          signal: abortController.signal,
+          onProgress: (delta) => {
+            receivedBytes += delta;
+            if (totalBytes > 0 && requestId) {
+              const pct = Math.min(99, Math.round((receivedBytes / totalBytes) * 100));
+              if (pct !== lastEmittedPct) {
+                lastEmittedPct = pct;
+                event.sender.send('desktop:layerStreamProgress', {
+                  requestId,
+                  percent: pct,
                 });
-                gunzip.on('end', resolve);
-                gunzip.on('error', reject);
-              });
+              }
             }
-          }
-
-          if (gunzip) {
-            const canContinue = gunzip.write(buf);
-            if (!canContinue) {
-              await new Promise((resolve) => gunzip.once('drain', resolve));
-            }
-          } else {
-            parser.feed(buf);
-          }
-
-          if (parser.isDone()) {
-            await reader.cancel().catch(() => {});
-            break;
-          }
-        }
-
-        if (gunzip) {
-          gunzip.end();
-          await gunzipDone;
-        }
+          },
+          onUncompressedChunk: async (decompressed) => {
+            await parser.feed(decompressed);
+            return parser.isDone();
+          },
+        });
 
         if (requestId) {
           event.sender.send('desktop:layerStreamProgress', {
@@ -664,6 +988,17 @@ app.whenReady().then(() => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('before-quit', () => {
+  for (const tempPath of activeTempFiles) {
+    try {
+      fsSync.unlinkSync(tempPath);
+    } catch {
+      // ignore cleanup error on quit
+    }
+  }
+  activeTempFiles.clear();
 });
 
 app.on('window-all-closed', () => {

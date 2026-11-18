@@ -96,10 +96,10 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
           {/* 2. Upload Files Tab */}
           <section className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md">
             <h2 className="text-xl font-semibold mb-4 flex items-center gap-2 icon-upload">
-              <Upload className="w-5 h-5 icon-upload" /> 2. Upload Files Tab — Naming, Tags &amp; Version Replace
+              <Upload className="w-5 h-5 icon-upload" /> 2. Upload Files Tab (Naming, Tags &amp; Version Replace)
             </h2>
             <p className="text-sm text-gray-400 mb-4">
-              Available on Windows, Linux, macOS, Android, and iOS. Select a target repository, choose or drag-and-drop files or folders (expandable to preview nested contents), review the package name, and click <strong>Create Image</strong>:
+              Available on Windows, Linux, macOS, Android, and iOS (multi-GB packages require the Desktop app). Select a target repository, choose or drag-and-drop files or folders (expandable to preview nested contents), review the package name, and click <strong>Create Image</strong>:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -173,7 +173,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                 <strong>Auto-Indexing, Folder Trees &amp; Search:</strong> Switching to <strong>Repo Packages</strong> or clicking <strong>Refresh</strong> lists all tagged and untagged versions and caches their file lists by SHA-256 digest in expandable nested folder trees. External layers under 50 MB index automatically; larger layers load on demand via <strong>Load Files</strong> header streaming. Searching filters package names, tags, and inner files and auto-expands matching folders.
               </li>
               <li>
-                <strong>Download &amp; Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts files directly to a destination folder on Desktop, or downloads the file / <code>.zip</code> bundle on Web and Mobile.
+                <strong>Download &amp; Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts files directly to a destination folder on Desktop (supporting multi-GB images), or downloads the file / <code>.zip</code> bundle on Web and Mobile.
               </li>
               <li>
                 <strong>Confirmed Deletion:</strong> Removing a single version or an entire package opens a confirmation popup before permanently deleting it on GitHub (requires <code>delete:packages</code>).
@@ -200,7 +200,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                   Default Timestamp Tags
                 </h4>
                 <p className="text-sm text-gray-300">
-                  Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This affects only new uploads—existing tags on GitHub remain unchanged.
+                  Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This affects only new uploads; existing tags on GitHub remain unchanged.
                 </p>
               </div>
             </div>

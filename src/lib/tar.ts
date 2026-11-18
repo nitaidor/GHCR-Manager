@@ -27,11 +27,40 @@ export interface BuiltOciLayer {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+const MEMORY_LIMIT_ACTIONS: Record<'upload' | 'download' | 'inspect', string> = {
+  upload: 'stream multi-GB packages directly from disk',
+  download: 'download and extract multi-GB images directly to disk',
+  inspect: 'inspect multi-GB external layers via streaming',
+};
+
+export function normalizeMemoryLimitError(
+  err: unknown,
+  direction: 'upload' | 'download' | 'inspect'
+): Error {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    err instanceof RangeError ||
+    /array\s*buffer\s*allocation\s*failed|out\s*of\s*memory|allocation\s*failed/i.test(msg)
+  ) {
+    return new Error(
+      `This package exceeds browser/mobile memory limits (~1-2 GB max in-memory). Use the GHCR Manager desktop app to ${MEMORY_LIMIT_ACTIONS[direction]}.`
+    );
+  }
+  return err instanceof Error ? err : new Error(msg);
+}
+
 export async function sha256Hex(data: Uint8Array): Promise<string> {
-  // Copy into a guaranteed ArrayBuffer slice for Web Crypto compatibility
-  const copy = new Uint8Array(data.byteLength);
-  copy.set(data);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', copy.buffer);
+  const digestBuffer =
+    data.buffer instanceof ArrayBuffer &&
+    data.byteOffset === 0 &&
+    data.byteLength === data.buffer.byteLength
+      ? data.buffer
+      : (() => {
+          const copy = new Uint8Array(data.byteLength);
+          copy.set(data);
+          return copy.buffer;
+        })();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', digestBuffer);
   const hashArray = new Uint8Array(hashBuffer);
   let hex = '';
   for (let i = 0; i < hashArray.length; i++) {

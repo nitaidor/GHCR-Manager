@@ -3,6 +3,7 @@ import {
   buildOciLayerFromFiles,
   extractFileMetaListStreaming,
   extractFilesFromOciLayer,
+  normalizeMemoryLimitError,
   sha256Hex,
   type TarInputFile,
 } from './tar';
@@ -137,6 +138,13 @@ export interface PushProgressUpdate {
   stage: PushProgressStage;
   message: string;
   percent: number;
+}
+
+export interface DesktopStreamingInputFile {
+  fullPath: string;
+  relativePath: string;
+  size?: number;
+  mtime?: number;
 }
 
 const encoder = new TextEncoder();
@@ -420,8 +428,8 @@ async function uploadBlobToGhcr(
 }
 
 /**
- * Creates an OCI container image from the given files and pushes it to GitHub Packages (ghcr.io),
- * automatically linking it to the selected GitHub repository.
+ * Creates an OCI container image from the given files (or Desktop disk paths for zero-RAM streaming)
+ * and pushes it to GitHub Packages (ghcr.io), automatically linking it to the selected GitHub repository.
  *
  * Package Name === Image Name (normalized for OCI compliance).
  */
@@ -432,7 +440,8 @@ export async function buildAndPushOciImage(opts: {
   rawImageName: string;
   tag?: string;
   mode: 'single-file' | 'multi-file' | 'root-file' | 'root-subfolder';
-  files: TarInputFile[];
+  files?: TarInputFile[];
+  desktopFiles?: DesktopStreamingInputFile[];
   onProgress?: (update: PushProgressUpdate) => void;
 }): Promise<OciPackageDetails> {
   const {
@@ -442,11 +451,18 @@ export async function buildAndPushOciImage(opts: {
     rawImageName,
     tag = 'latest',
     mode,
-    files,
+    files = [],
+    desktopFiles,
     onProgress,
   } = opts;
 
-  if (files.length === 0) {
+  const canStreamDesktop =
+    Boolean(desktopFiles && desktopFiles.length > 0) &&
+    Boolean(window.electronAPI?.buildOciLayerFile) &&
+    Boolean(window.electronAPI?.uploadBlobFromFile);
+
+  const itemCount = canStreamDesktop ? desktopFiles!.length : files.length;
+  if (itemCount === 0) {
     throw new Error('Cannot create an image with zero files.');
   }
 
@@ -456,182 +472,261 @@ export async function buildAndPushOciImage(opts: {
   }
 
   const ownerLower = repo.owner.login.toLowerCase();
+  const requestId = `push_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const unsubscribeProgress =
+    canStreamDesktop && window.electronAPI?.onTransferProgress
+      ? window.electronAPI.onTransferProgress((payload) => {
+          if (payload.requestId !== requestId) return;
+          onProgress?.({
+            stage:
+              payload.stage === 'uploading-layer' ? 'uploading-layer' : 'archiving',
+            message: payload.message,
+            percent: payload.percent,
+          });
+        })
+      : undefined;
 
-  onProgress?.({
-    stage: 'archiving',
-    message: `Building OCI image "${ociPackageName}" from ${files.length} file(s)...`,
-    percent: 15,
-  });
+  let tempLayerPath: string | null = null;
 
-  // 1. Build .tar.gz layer and compute digests
-  const layer = await buildOciLayerFromFiles(files);
-  const createdAt = new Date().toISOString();
+  try {
+    onProgress?.({
+      stage: 'archiving',
+      message: `Building OCI image "${ociPackageName}" from ${itemCount} file(s)...`,
+      percent: 10,
+    });
 
-  // Summarize files for fast inspection in annotations (capped so manifest stays compact)
-  const fileMetaList: OciManifestFileMeta[] = files.slice(0, 150).map((f) => ({
-    path: f.relativePath,
-    size: f.data.byteLength,
-  }));
+    // 1. Build .tar.gz layer (streaming via disk on Desktop, or in-memory on Web/Mobile)
+    let uncompressedDigest: string;
+    let compressedDigest: string;
+    let compressedSize: number;
+    let totalFileBytes: number;
+    let fileMetaList: OciManifestFileMeta[];
+    let inMemoryTargz: Uint8Array | null = null;
 
-  // 2. Build OCI Image Config JSON
-  // Including "org.opencontainers.image.source" links the package to the chosen GitHub repo!
-  const configObj = {
-    created: createdAt,
-    architecture: 'amd64',
-    os: 'linux',
-    config: {
-      Labels: {
-        'org.opencontainers.image.source': repo.html_url,
-        'org.opencontainers.image.title': ociPackageName,
-        'org.opencontainers.image.description': `Created by GHCR Manager (${files.length} file(s), mode: ${mode})`,
-        'io.ghpm.original-name': rawImageName,
-        'io.ghpm.mode': mode,
-        'io.ghpm.file-count': String(files.length),
-        'io.ghpm.total-bytes': String(layer.totalFileBytes),
-      },
-    },
-    rootfs: {
-      type: 'layers',
-      diff_ids: [layer.uncompressedDigest],
-    },
-    history: [
-      {
-        created: createdAt,
-        created_by: `ghcr-manager (${mode})`,
-      },
-    ],
-  };
+    if (canStreamDesktop) {
+      const built = await window.electronAPI!.buildOciLayerFile!({
+        files: desktopFiles!,
+        requestId,
+      });
+      tempLayerPath = built.tempPath;
+      uncompressedDigest = built.uncompressedDigest;
+      compressedDigest = built.compressedDigest;
+      compressedSize = built.compressedSize;
+      totalFileBytes = built.totalFileBytes;
+      fileMetaList = built.fileMetaList;
+    } else {
+      let layer;
+      try {
+        layer = await buildOciLayerFromFiles(files);
+      } catch (err) {
+        throw normalizeMemoryLimitError(err, 'upload');
+      }
+      uncompressedDigest = layer.uncompressedDigest;
+      compressedDigest = layer.compressedDigest;
+      compressedSize = layer.compressedSize;
+      totalFileBytes = layer.totalFileBytes;
+      inMemoryTargz = layer.targzBytes;
+      fileMetaList = files.slice(0, 150).map((f) => ({
+        path: f.relativePath,
+        size: f.data.byteLength,
+      }));
+    }
 
-  const configBytes = encoder.encode(JSON.stringify(configObj));
-  const configHex = await sha256Hex(configBytes);
-  const configDigest = `sha256:${configHex}`;
+    const createdAt = new Date().toISOString();
 
-  // 3. Build OCI Image Manifest JSON
-  const manifestObj = {
-    schemaVersion: 2,
-    mediaType: 'application/vnd.oci.image.manifest.v1+json',
-    config: {
-      mediaType: 'application/vnd.oci.image.config.v1+json',
-      size: configBytes.byteLength,
-      digest: configDigest,
-    },
-    layers: [
-      {
-        mediaType: 'application/vnd.oci.image.layer.v1.tar+gzip',
-        size: layer.compressedSize,
-        digest: layer.compressedDigest,
-        annotations: {
-          'org.opencontainers.image.title': `${ociPackageName}.tar.gz`,
+    // 2. Build OCI Image Config JSON
+    // Including "org.opencontainers.image.source" links the package to the chosen GitHub repo!
+    const configObj = {
+      created: createdAt,
+      architecture: 'amd64',
+      os: 'linux',
+      config: {
+        Labels: {
+          'org.opencontainers.image.source': repo.html_url,
+          'org.opencontainers.image.title': ociPackageName,
+          'org.opencontainers.image.description': `Created by GHCR Manager (${itemCount} file(s), mode: ${mode})`,
+          'io.ghpm.original-name': rawImageName,
+          'io.ghpm.mode': mode,
+          'io.ghpm.file-count': String(itemCount),
+          'io.ghpm.total-bytes': String(totalFileBytes),
         },
       },
-    ],
-    annotations: {
-      'org.opencontainers.image.source': repo.html_url,
-      'org.opencontainers.image.created': createdAt,
-      'org.opencontainers.image.title': ociPackageName,
-      'org.opencontainers.image.description': `Package "${rawImageName}" (${files.length} file(s)) linked to ${repo.full_name}`,
-      'io.ghpm.original-name': rawImageName,
-      'io.ghpm.mode': mode,
-      'io.ghpm.file-count': String(files.length),
-      'io.ghpm.total-bytes': String(layer.totalFileBytes),
-      'io.ghpm.file-list': JSON.stringify(fileMetaList),
-    },
-  };
+      rootfs: {
+        type: 'layers',
+        diff_ids: [uncompressedDigest],
+      },
+      history: [
+        {
+          created: createdAt,
+          created_by: `ghcr-manager (${mode})`,
+        },
+      ],
+    };
 
-  const manifestBytes = encoder.encode(JSON.stringify(manifestObj, null, 2));
+    const configBytes = encoder.encode(JSON.stringify(configObj));
+    const configHex = await sha256Hex(configBytes);
+    const configDigest = `sha256:${configHex}`;
 
-  // 4. Authenticate with ghcr.io
-  onProgress?.({
-    stage: 'authenticating',
-    message: `Authenticating with ghcr.io/${ownerLower}/${ociPackageName}...`,
-    percent: 35,
-  });
+    // 3. Build OCI Image Manifest JSON
+    const manifestObj = {
+      schemaVersion: 2,
+      mediaType: 'application/vnd.oci.image.manifest.v1+json',
+      config: {
+        mediaType: 'application/vnd.oci.image.config.v1+json',
+        size: configBytes.byteLength,
+        digest: configDigest,
+      },
+      layers: [
+        {
+          mediaType: 'application/vnd.oci.image.layer.v1.tar+gzip',
+          size: compressedSize,
+          digest: compressedDigest,
+          annotations: {
+            'org.opencontainers.image.title': `${ociPackageName}.tar.gz`,
+          },
+        },
+      ],
+      annotations: {
+        'org.opencontainers.image.source': repo.html_url,
+        'org.opencontainers.image.created': createdAt,
+        'org.opencontainers.image.title': ociPackageName,
+        'org.opencontainers.image.description': `Package "${rawImageName}" (${itemCount} file(s)) linked to ${repo.full_name}`,
+        'io.ghpm.original-name': rawImageName,
+        'io.ghpm.mode': mode,
+        'io.ghpm.file-count': String(itemCount),
+        'io.ghpm.total-bytes': String(totalFileBytes),
+        'io.ghpm.file-list': JSON.stringify(fileMetaList),
+      },
+    };
 
-  const registryToken = await getGhcrBearerToken(
-    username,
-    githubToken,
-    ownerLower,
-    ociPackageName,
-    'pull,push'
-  );
+    const manifestBytes = encoder.encode(JSON.stringify(manifestObj, null, 2));
 
-  // 5. Upload Config Blob
-  onProgress?.({
-    stage: 'uploading-config',
-    message: `Uploading image configuration (${configBytes.byteLength} B)...`,
-    percent: 50,
-  });
+    // 4. Authenticate with ghcr.io
+    onProgress?.({
+      stage: 'authenticating',
+      message: `Authenticating with ghcr.io/${ownerLower}/${ociPackageName}...`,
+      percent: 48,
+    });
 
-  await uploadBlobToGhcr(
-    registryToken,
-    ownerLower,
-    ociPackageName,
-    configDigest,
-    configBytes
-  );
-
-  // 6. Upload Layer Blob (.tar.gz)
-  onProgress?.({
-    stage: 'uploading-layer',
-    message: `Uploading compressed image layer (${formatBytes(layer.compressedSize)})...`,
-    percent: 75,
-  });
-
-  await uploadBlobToGhcr(
-    registryToken,
-    ownerLower,
-    ociPackageName,
-    layer.compressedDigest,
-    layer.targzBytes
-  );
-
-  // 7. Publish Manifest
-  onProgress?.({
-    stage: 'publishing-manifest',
-    message: `Publishing manifest ghcr.io/${ownerLower}/${ociPackageName}:${tag}...`,
-    percent: 92,
-  });
-
-  const manifestRes = await crossPlatformHttpRequest({
-    url: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/manifests/${encodeURIComponent(tag)}`,
-    method: 'PUT',
-    headers: {
-      Authorization: `Bearer ${registryToken}`,
-      'Content-Type': 'application/vnd.oci.image.manifest.v1+json',
-    },
-    body: manifestBytes,
-  });
-
-  if (manifestRes.status !== 201 && manifestRes.status !== 200) {
-    const errText = decodeText(manifestRes.body);
-    throw new Error(
-      `Failed to publish image manifest to ghcr.io (HTTP ${manifestRes.status}): ${errText}`
+    let registryToken = await getGhcrBearerToken(
+      username,
+      githubToken,
+      ownerLower,
+      ociPackageName,
+      'pull,push'
     );
+
+    // 5. Upload Config Blob
+    onProgress?.({
+      stage: 'uploading-config',
+      message: `Uploading image configuration (${configBytes.byteLength} B)...`,
+      percent: 52,
+    });
+
+    await uploadBlobToGhcr(
+      registryToken,
+      ownerLower,
+      ociPackageName,
+      configDigest,
+      configBytes
+    );
+
+    // 6. Upload Layer Blob (.tar.gz)
+    onProgress?.({
+      stage: 'uploading-layer',
+      message: `Uploading compressed image layer (${formatBytes(compressedSize)})...`,
+      percent: 55,
+    });
+
+    if (canStreamDesktop && tempLayerPath) {
+      const headRes = await crossPlatformHttpRequest({
+        url: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/${compressedDigest}`,
+        method: 'HEAD',
+        headers: { Authorization: `Bearer ${registryToken}` },
+      });
+
+      if (headRes.status !== 200) {
+        const uploadResult = await window.electronAPI!.uploadBlobFromFile!({
+          tempPath: tempLayerPath,
+          uploadInitUrl: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/uploads/`,
+          digest: compressedDigest,
+          registryToken,
+          basicAuthHeader: `Basic ${toBase64(`${username}:${githubToken.trim()}`)}`,
+          scopeParam: `repository:${ownerLower}/${ociPackageName}:pull,push`,
+          compressedSize,
+          requestId,
+        });
+        if (uploadResult?.registryToken) {
+          registryToken = uploadResult.registryToken;
+        }
+      }
+    } else if (inMemoryTargz) {
+      try {
+        await uploadBlobToGhcr(
+          registryToken,
+          ownerLower,
+          ociPackageName,
+          compressedDigest,
+          inMemoryTargz
+        );
+      } catch (err) {
+        throw normalizeMemoryLimitError(err, 'upload');
+      }
+    }
+
+    // 7. Publish Manifest
+    onProgress?.({
+      stage: 'publishing-manifest',
+      message: `Publishing manifest ghcr.io/${ownerLower}/${ociPackageName}:${tag}...`,
+      percent: 94,
+    });
+
+    const manifestRes = await crossPlatformHttpRequest({
+      url: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/manifests/${encodeURIComponent(tag)}`,
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${registryToken}`,
+        'Content-Type': 'application/vnd.oci.image.manifest.v1+json',
+      },
+      body: manifestBytes,
+    });
+
+    if (manifestRes.status !== 201 && manifestRes.status !== 200) {
+      const errText = decodeText(manifestRes.body);
+      throw new Error(
+        `Failed to publish image manifest to ghcr.io (HTTP ${manifestRes.status}): ${errText}`
+      );
+    }
+
+    const manifestDigest =
+      manifestRes.headers['docker-content-digest'] || `sha256:${await sha256Hex(manifestBytes)}`;
+
+    onProgress?.({
+      stage: 'done',
+      message: `Successfully uploaded package "${ociPackageName}"!`,
+      percent: 100,
+    });
+
+    return {
+      packageName: ociPackageName,
+      tag,
+      manifestDigest,
+      layerDigest: compressedDigest,
+      compressedSize,
+      totalUncompressedBytes: totalFileBytes,
+      fileCount: itemCount,
+      originalName: rawImageName,
+      mode,
+      createdAt,
+      sourceRepoUrl: repo.html_url,
+      files: fileMetaList,
+    };
+  } finally {
+    unsubscribeProgress?.();
+    if (tempLayerPath && window.electronAPI?.deleteTempFile) {
+      await window.electronAPI.deleteTempFile(tempLayerPath).catch(() => {});
+    }
   }
-
-  const manifestDigest =
-    manifestRes.headers['docker-content-digest'] || `sha256:${await sha256Hex(manifestBytes)}`;
-
-  onProgress?.({
-    stage: 'done',
-    message: `Successfully uploaded package "${ociPackageName}"!`,
-    percent: 100,
-  });
-
-  return {
-    packageName: ociPackageName,
-    tag,
-    manifestDigest,
-    layerDigest: layer.compressedDigest,
-    compressedSize: layer.compressedSize,
-    totalUncompressedBytes: layer.totalFileBytes,
-    fileCount: files.length,
-    originalName: rawImageName,
-    mode,
-    createdAt,
-    sourceRepoUrl: repo.html_url,
-    files: fileMetaList,
-  };
 }
 
 /**
@@ -861,23 +956,27 @@ export async function inspectPackageManifest(opts: {
           throw new DOMException('Layer scan aborted', 'AbortError');
         }
         onProgress?.(5);
-        const blobRes = await crossPlatformHttpRequest({
-          url: layerUrl,
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${registryToken}`,
-          },
-        });
-        if (signal?.aborted) {
-          throw new DOMException('Layer scan aborted', 'AbortError');
+        try {
+          const blobRes = await crossPlatformHttpRequest({
+            url: layerUrl,
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${registryToken}`,
+            },
+          });
+          if (signal?.aborted) {
+            throw new DOMException('Layer scan aborted', 'AbortError');
+          }
+          if (blobRes.status !== 200) {
+            throw new Error(`Failed to download layer blob (HTTP ${blobRes.status})`);
+          }
+          files = await extractFileMetaListStreaming(blobRes.body, {
+            onProgress: (pct) => onProgress?.(Math.max(5, pct)),
+            signal,
+          });
+        } catch (err) {
+          throw normalizeMemoryLimitError(err, 'inspect');
         }
-        if (blobRes.status !== 200) {
-          throw new Error(`Failed to download layer blob (HTTP ${blobRes.status})`);
-        }
-        files = await extractFileMetaListStreaming(blobRes.body, {
-          onProgress: (pct) => onProgress?.(Math.max(5, pct)),
-          signal,
-        });
       }
 
       setCachedExternalLayerFiles(layerDigest, files);
@@ -911,20 +1010,36 @@ export async function inspectPackageManifest(opts: {
 }
 
 /**
- * Downloads the OCI image layer from ghcr.io and extracts all original files from the .tar.gz layer.
+ * Streams a remote OCI image layer from ghcr.io directly to a user-selected Desktop folder
+ * without buffering the archive in RAM.
  */
-export async function downloadAndExtractPackage(opts: {
+export async function downloadAndExtractPackageToDiskDesktop(opts: {
   username: string;
   githubToken: string;
   owner: string;
   packageName: string;
   tag?: string;
   reference?: string;
+  onProgress?: (update: { message: string; percent: number }) => void;
 }): Promise<{
   details: OciPackageDetails;
-  extractedFiles: TarInputFile[];
+  saved: boolean;
+  outputPath?: string;
+  fileCount: number;
 }> {
-  const details = await inspectPackageManifest({ ...opts, skipLayerScan: true });
+  if (!window.electronAPI?.downloadAndExtractLayer) {
+    throw new Error('Desktop streaming extraction API is unavailable.');
+  }
+
+  const details = await inspectPackageManifest({
+    username: opts.username,
+    githubToken: opts.githubToken,
+    owner: opts.owner,
+    packageName: opts.packageName,
+    tag: opts.tag,
+    reference: opts.reference,
+    skipLayerScan: true,
+  });
   if (!details.layerDigest) {
     throw new Error('Package manifest does not contain a downloadable layer.');
   }
@@ -940,19 +1055,102 @@ export async function downloadAndExtractPackage(opts: {
     'pull'
   );
 
-  const blobRes = await crossPlatformHttpRequest({
-    url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${details.layerDigest}`,
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${registryToken}`,
-    },
+  const requestId = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const unsubscribe = window.electronAPI.onTransferProgress?.((payload) => {
+    if (payload.requestId !== requestId) return;
+    opts.onProgress?.({ message: payload.message, percent: payload.percent });
   });
 
-  if (blobRes.status !== 200) {
-    throw new Error(`Failed to download layer blob (HTTP ${blobRes.status})`);
+  const knownSingleFile =
+    details.mode !== 'external-oci-image'
+      ? details.fileCount === 1
+      : details.files.length === 1;
+
+  try {
+    const res = await window.electronAPI.downloadAndExtractLayer({
+      url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${details.layerDigest}`,
+      registryToken,
+      defaultFolderName: details.originalName || opts.packageName,
+      expectedSize: details.compressedSize,
+      knownSingleFile,
+      requestId,
+    });
+
+    if (res.saved && res.files.length > 0 && details.files.length === 0) {
+      details.files = res.files;
+      details.fileCount = res.files.length;
+      details.totalUncompressedBytes = res.files.reduce((acc, f) => acc + f.size, 0);
+      setCachedExternalLayerFiles(details.layerDigest, res.files);
+    }
+
+    return {
+      details,
+      saved: res.saved,
+      outputPath: res.outputPath,
+      fileCount: res.files.length || details.fileCount,
+    };
+  } finally {
+    unsubscribe?.();
+  }
+}
+
+/**
+ * Downloads the OCI image layer from ghcr.io and extracts all original files from the .tar.gz layer.
+ */
+export async function downloadAndExtractPackage(opts: {
+  username: string;
+  githubToken: string;
+  owner: string;
+  packageName: string;
+  tag?: string;
+  reference?: string;
+}): Promise<{
+  details: OciPackageDetails;
+  extractedFiles: TarInputFile[];
+}> {
+  const details = await inspectPackageManifest({
+    username: opts.username,
+    githubToken: opts.githubToken,
+    owner: opts.owner,
+    packageName: opts.packageName,
+    tag: opts.tag,
+    reference: opts.reference,
+    skipLayerScan: true,
+  });
+  if (!details.layerDigest) {
+    throw new Error('Package manifest does not contain a downloadable layer.');
   }
 
-  const extractedFiles = extractFilesFromOciLayer(blobRes.body);
+  const ownerLower = opts.owner.toLowerCase();
+  const pkgLower = opts.packageName.toLowerCase();
+
+  const registryToken = await getGhcrBearerToken(
+    opts.username,
+    opts.githubToken,
+    ownerLower,
+    pkgLower,
+    'pull'
+  );
+
+  let extractedFiles: TarInputFile[];
+  try {
+    const blobRes = await crossPlatformHttpRequest({
+      url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${details.layerDigest}`,
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${registryToken}`,
+      },
+    });
+
+    if (blobRes.status !== 200) {
+      throw new Error(`Failed to download layer blob (HTTP ${blobRes.status})`);
+    }
+
+    extractedFiles = extractFilesFromOciLayer(blobRes.body);
+  } catch (err) {
+    throw normalizeMemoryLimitError(err, 'download');
+  }
+
   if (details.files.length === 0 && extractedFiles.length > 0) {
     const fileMeta = extractedFiles.map((f) => ({
       path: f.relativePath,

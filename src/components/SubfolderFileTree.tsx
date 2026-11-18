@@ -253,6 +253,8 @@ export interface SubfolderFileTreeProps {
   highlightQuery?: string;
   /** Optional heading rendered above the tree */
   title?: string;
+  /** Total files in archive when only a preview subset is indexed in manifest annotations */
+  totalArchiveFileCount?: number;
   /** Override the outer container classes */
   containerClassName?: string;
 }
@@ -262,6 +264,7 @@ export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
   iconClassName = 'icon-sync',
   highlightQuery = '',
   title,
+  totalArchiveFileCount,
   containerClassName,
 }) => {
   const root = useMemo(() => buildTree(files), [files]);
@@ -270,6 +273,10 @@ export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
     () => collectMatchedFolders(files, query),
     [files, query]
   );
+  const unshownCount =
+    totalArchiveFileCount && totalArchiveFileCount > files.length
+      ? totalArchiveFileCount - files.length
+      : 0;
 
   return (
     <div
@@ -288,6 +295,11 @@ export const SubfolderFileTree: React.FC<SubfolderFileTreeProps> = ({
         query={query}
         matchedFolders={matchedFolders}
       />
+      {unshownCount > 0 && (
+        <div className="mt-1.5 pt-1.5 border-t border-[#30363d] px-1.5 text-[11px] font-mono text-gray-400">
+          ... and {unshownCount.toLocaleString()} more file{unshownCount === 1 ? '' : 's'} ({totalArchiveFileCount!.toLocaleString()} total in archive)
+        </div>
+      )}
     </div>
   );
 };

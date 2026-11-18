@@ -85,6 +85,7 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
   }
 
   if (details) {
+    const displayedFileCount = Math.max(details.fileCount, details.files.length);
     return (
       <button
         type="button"
@@ -99,7 +100,7 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
         ) : (
           <ChevronRight className="w-3.5 h-3.5" />
         )}
-        {isExpanded ? 'Hide Files' : `Files (${details.files.length})`}
+        {isExpanded ? 'Hide Files' : `Files (${displayedFileCount})`}
       </button>
     );
   }
@@ -167,6 +168,7 @@ export const VersionFileDetailsPanel: React.FC<VersionFileDetailsPanelProps> = (
           iconClassName="icon-packages"
           highlightQuery={highlightQuery}
           title="Files inside image layer:"
+          totalArchiveFileCount={details.fileCount}
           containerClassName={`${containerBgClass} rounded-md p-2.5 border border-[#30363d] max-h-60 overflow-y-auto`}
         />
       ) : (

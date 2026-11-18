@@ -1,4 +1,10 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { createRequire } from 'node:module';
 import {
   formatTimestampTag,
   toOciImageName,
@@ -9,8 +15,16 @@ import {
   buildOciLayerFromFiles,
   extractFileMetaListStreaming,
   extractFilesFromOciLayer,
+  normalizeMemoryLimitError,
   type TarInputFile,
 } from '../src/lib/tar.ts';
+
+const require = createRequire(import.meta.url);
+const {
+  buildOciLayerToFile,
+  createNodeTarStreamParser,
+  resolveSafeExtractPath,
+} = require('../electron/streaming-tar.cjs');
 
 async function runTests() {
   console.log('1. Testing single-file and multi-file naming rules...');
@@ -119,6 +133,103 @@ async function runTests() {
   assert.equal(validateOciTag('2026/11/16').valid, false);
   assert.equal(validateOciTag('a b').valid, false);
   assert.equal(validateOciTag('a'.repeat(129)).valid, false);
+
+  console.log('6. Testing Desktop Node streaming TAR builder, extractor & PAX >8GiB header support...');
+  const tmpWorkDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ghcr-mgr-test-'));
+  try {
+    const srcFile1 = path.join(tmpWorkDir, 'alpha.txt');
+    const srcEmpty = path.join(tmpWorkDir, 'empty.txt');
+    const srcBigChunked = path.join(tmpWorkDir, 'chunked.bin');
+    const srcLong = path.join(tmpWorkDir, 'long.txt');
+    const outTargz = path.join(tmpWorkDir, 'layer.tar.gz');
+    const extractDir = path.join(tmpWorkDir, 'extracted');
+
+    const chunkPayload = crypto.randomBytes(2.5 * 1024 * 1024); // Spans > 2x 1 MiB READ_CHUNK_BYTES
+    await fs.writeFile(srcFile1, 'Hello streaming world!');
+    await fs.writeFile(srcEmpty, '');
+    await fs.writeFile(srcBigChunked, chunkPayload);
+    await fs.writeFile(srcLong, 'PAX path payload');
+
+    const desktopInputs = [
+      { fullPath: srcFile1, relativePath: 'alpha.txt', mtime: 1700000000 },
+      { fullPath: srcEmpty, relativePath: 'empty.txt', mtime: 1700000001 },
+      { fullPath: srcBigChunked, relativePath: 'nested/chunked.bin', mtime: 1700000002 },
+      { fullPath: srcLong, relativePath: longSubPath, mtime: 1700000003 },
+    ];
+
+    const streamedLayer = await buildOciLayerToFile({
+      files: desktopInputs,
+      outFilePath: outTargz,
+    });
+
+    // Must match in-memory tar.ts digests byte-for-byte for identical content + mtime
+    const inMemoryInputs: TarInputFile[] = [
+      { relativePath: 'alpha.txt', data: await fs.readFile(srcFile1), mtime: 1700000000 },
+      { relativePath: 'empty.txt', data: await fs.readFile(srcEmpty), mtime: 1700000001 },
+      { relativePath: 'nested/chunked.bin', data: chunkPayload, mtime: 1700000002 },
+      { relativePath: longSubPath, data: await fs.readFile(srcLong), mtime: 1700000003 },
+    ];
+    const inMemLayer = await buildOciLayerFromFiles(inMemoryInputs);
+    assert.equal(streamedLayer.uncompressedDigest, inMemLayer.uncompressedDigest);
+    assert.equal(streamedLayer.totalFileBytes, inMemLayer.totalFileBytes);
+    assert.equal(streamedLayer.fileCount, 4);
+
+    // Extract streamed layer back via Node streaming parser in awkward tiny 313-byte slices
+    const rawTargz = await fs.readFile(outTargz);
+    const rawTar = zlib.gunzipSync(rawTargz);
+    const extractedMap = new Map<string, Buffer[]>();
+    let currentKey = '';
+    const nodeParser = createNodeTarStreamParser({
+      onFileStart: async (meta: { path: string; size: number }) => {
+        currentKey = meta.path;
+        extractedMap.set(currentKey, []);
+      },
+      onFileData: async (chunk: Buffer) => {
+        extractedMap.get(currentKey)?.push(Buffer.from(chunk));
+      },
+    });
+    for (let i = 0; i < rawTar.length; i += 313) {
+      await nodeParser.feed(rawTar.subarray(i, Math.min(rawTar.length, i + 313)));
+    }
+    assert.equal(nodeParser.isDone(), true);
+    assert.equal(Buffer.concat(extractedMap.get('alpha.txt') || []).toString('utf8'), 'Hello streaming world!');
+    assert.equal(Buffer.concat(extractedMap.get('empty.txt') || []).length, 0);
+    assert.equal(Buffer.concat(extractedMap.get('nested/chunked.bin') || []).equals(chunkPayload), true);
+    assert.equal(Buffer.concat(extractedMap.get(longSubPath) || []).toString('utf8'), 'PAX path payload');
+
+    // Verify extraction path safety against zip-slip
+    assert.throws(
+      () => resolveSafeExtractPath(extractDir, '../../outside.txt'),
+      /Unsafe archive entry path rejected/
+    );
+    const safeNested = resolveSafeExtractPath(extractDir, 'sub/ok.txt');
+    assert.ok(safeNested.startsWith(path.resolve(extractDir) + path.sep));
+
+    // Verify PAX >8 GiB size header parsing without allocating 9 GB
+    const largeSizeStr = '9000000000';
+    const paxLineBody = ` size=${largeSizeStr}\n`;
+    const paxLineLen = Buffer.byteLength(paxLineBody, 'utf8') + 2;
+    const paxLine = Buffer.from(`${paxLineLen}${paxLineBody}`, 'utf8');
+    const paxHdr = Buffer.alloc(512);
+    Buffer.from('PaxHeader/big.bin').copy(paxHdr, 0);
+    Buffer.from('0000644\0').copy(paxHdr, 100);
+    Buffer.from(paxLine.length.toString(8).padStart(11, '0') + '\0').copy(paxHdr, 124);
+    paxHdr[156] = 'x'.charCodeAt(0);
+    const paxDataPad = Buffer.alloc((512 - (paxLine.length % 512)) % 512);
+    const regHdr = Buffer.alloc(512);
+    Buffer.from('big.bin').copy(regHdr, 0);
+    Buffer.from('00000000000\0').copy(regHdr, 124);
+    regHdr[156] = '0'.charCodeAt(0);
+    const metaOnlyParser = createNodeTarStreamParser();
+    await metaOnlyParser.feed(Buffer.concat([paxHdr, paxLine, paxDataPad, regHdr]));
+    assert.deepEqual(metaOnlyParser.getFiles(), [{ path: 'big.bin', size: 9000000000 }]);
+
+    // Verify friendly OOM message normalization for Web/Mobile
+    const oomErr = normalizeMemoryLimitError(new RangeError('Array buffer allocation failed'), 'upload');
+    assert.match(oomErr.message, /browser\/mobile memory limits/i);
+  } finally {
+    await fs.rm(tmpWorkDir, { recursive: true, force: true });
+  }
 
   console.log('All tests passed successfully!');
 }
