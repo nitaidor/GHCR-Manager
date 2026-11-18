@@ -915,3 +915,18 @@ html.theme-terminal-green .dropzone-container-sync.is-drag-over,
   border-color: #22c55e !important;
   background-color: rgba(21, 128, 61, 0.25) !important;
 }
+
+/* Subdued Repo Index Metadata Card (consistent across all 5 themes) */
+.theme-index-card {
+  background-color: var(--theme-surface) !important;
+  border: 1px dashed var(--theme-border) !important;
+  opacity: 0.78;
+  transition: opacity 150ms ease;
+}
+.theme-index-card:hover {
+  opacity: 1;
+}
+.theme-index-version-row {
+  background-color: var(--theme-bg) !important;
+  border: 1px solid var(--theme-border) !important;
+}

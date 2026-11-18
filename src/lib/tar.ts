@@ -546,27 +546,28 @@ export function summarizeArchiveEntries(
 ): { regularFileCount: number; emptyFolderCount: number } {
   let regularFileCount = 0;
   const dirPaths: string[] = [];
-  const nonDirPaths: string[] = [];
+  const populatedPrefixes = new Set<string>();
 
   for (const entry of entries) {
     const clean = entry.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!clean || clean === '.') continue;
+
+    let slashIdx = clean.indexOf('/');
+    while (slashIdx !== -1) {
+      populatedPrefixes.add(clean.slice(0, slashIdx));
+      slashIdx = clean.indexOf('/', slashIdx + 1);
+    }
+
     if (entry.isDirectory) {
-      if (clean && clean !== '.') {
-        dirPaths.push(clean);
-      }
+      dirPaths.push(clean);
     } else {
       regularFileCount += 1;
-      if (clean) nonDirPaths.push(clean);
     }
   }
 
   let emptyFolderCount = 0;
   for (const dir of dirPaths) {
-    const prefix = `${dir}/`;
-    const hasChild =
-      nonDirPaths.some((p) => p.startsWith(prefix)) ||
-      dirPaths.some((d) => d !== dir && d.startsWith(prefix));
-    if (!hasChild) {
+    if (!populatedPrefixes.has(dir)) {
       emptyFolderCount += 1;
     }
   }

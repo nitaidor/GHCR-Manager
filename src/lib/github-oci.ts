@@ -8,7 +8,16 @@ import {
   summarizeArchiveEntries,
   type TarInputFile,
 } from './tar';
-import { toOciImageName } from './naming';
+import {
+  formatTimestampTag,
+  getRepoIndexDisplayTitle,
+  getRepoIndexPackageName,
+  REPO_INDEX_KEEP_VERSIONS,
+  REPO_INDEX_MODE,
+  toOciImageName,
+  type ClockFormat,
+  type DateFormat,
+} from './naming';
 import pkg from '../../package.json';
 
 export interface GitHubUser {
@@ -103,9 +112,6 @@ export function getVersionReferenceInfo(version: GitHubPackageVersion): {
   return { tags, primaryTag, isUntagged, shortDigest, inspectRef, pullSuffix };
 }
 
-export const AUTO_INSPECT_EXTERNAL_MAX_BYTES = 50 * 1024 * 1024;
-const EXTERNAL_LAYER_CACHE_KEY = 'ghpm_external_layer_cache_v1';
-
 export interface OciManifestFileMeta {
   path: string;
   size: number;
@@ -125,7 +131,7 @@ export interface OciPackageDetails {
   createdAt: string;
   sourceRepoUrl: string;
   files: OciManifestFileMeta[];
-  needsManualLargeLayerLoad?: boolean;
+  needsManualLoad?: boolean;
 }
 
 export type PushProgressStage =
@@ -445,8 +451,9 @@ export async function buildAndPushOciImage(opts: {
   githubToken: string;
   repo: GitHubRepo;
   rawImageName: string;
+  ociPackageNameOverride?: string;
   tag?: string;
-  mode: 'single-file' | 'multi-file' | 'root-file' | 'root-subfolder';
+  mode: 'single-file' | 'multi-file' | 'root-file' | 'root-subfolder' | 'repo-index';
   files?: TarInputFile[];
   desktopFiles?: DesktopStreamingInputFile[];
   onProgress?: (update: PushProgressUpdate) => void;
@@ -457,6 +464,7 @@ export async function buildAndPushOciImage(opts: {
     githubToken,
     repo,
     rawImageName,
+    ociPackageNameOverride,
     tag = 'latest',
     mode,
     files = [],
@@ -486,7 +494,7 @@ export async function buildAndPushOciImage(opts: {
     }))
   );
 
-  const ociPackageName = toOciImageName(rawImageName);
+  const ociPackageName = ociPackageNameOverride || toOciImageName(rawImageName);
   if (!ociPackageName) {
     throw new Error(`Invalid image name: "${rawImageName}"`);
   }
@@ -560,7 +568,7 @@ export async function buildAndPushOciImage(opts: {
       compressedSize = layer.compressedSize;
       totalFileBytes = layer.totalFileBytes;
       inMemoryTargz = layer.targzBytes;
-      fileMetaList = files.slice(0, 150).map((f) => {
+      fileMetaList = files.map((f) => {
         const clean =
           f.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') || '.';
         return f.isDirectory
@@ -632,7 +640,6 @@ export async function buildAndPushOciImage(opts: {
         'io.ghpm.mode': mode,
         'io.ghpm.file-count': String(itemCount),
         'io.ghpm.total-bytes': String(totalFileBytes),
-        'io.ghpm.file-list': JSON.stringify(fileMetaList),
       },
     };
 
@@ -833,44 +840,83 @@ export async function listPackagesForRepo(
   return { repoPackages, otherOwnerPackages };
 }
 
-function readExternalLayerCache(): Record<string, OciManifestFileMeta[]> {
-  if (typeof localStorage === 'undefined') return {};
-  try {
-    const raw = localStorage.getItem(EXTERNAL_LAYER_CACHE_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw) as Record<string, OciManifestFileMeta[]>;
-  } catch {
-    return {};
-  }
+export interface RepoIndexVersionRecord {
+  packageName: string;
+  manifestDigest: string;
+  layerDigest: string;
+  compressedSize: number;
+  totalUncompressedBytes: number;
+  fileCount: number;
+  originalName: string;
+  mode: string;
+  createdAt: string;
+  sourceRepoUrl: string;
+  files: OciManifestFileMeta[];
 }
 
-function getCachedExternalLayerFiles(
-  layerDigest: string
-): OciManifestFileMeta[] | null {
-  if (!layerDigest) return null;
-  const cache = readExternalLayerCache();
-  return Array.isArray(cache[layerDigest]) ? cache[layerDigest] : null;
+export interface RepoIndexPayload {
+  schemaVersion: 1;
+  repoFullName: string;
+  updatedAt: string;
+  /** Keyed by `${packageName.toLowerCase()}@${manifestDigest}` */
+  versions: Record<string, RepoIndexVersionRecord>;
 }
 
-function setCachedExternalLayerFiles(
-  layerDigest: string,
-  files: OciManifestFileMeta[]
-): void {
-  if (!layerDigest || typeof localStorage === 'undefined') return;
-  try {
-    const cache = readExternalLayerCache();
-    // Cap stored items per external image in localStorage so giant images don't overflow quota
-    cache[layerDigest] = files.slice(0, 5000);
-    const keys = Object.keys(cache);
-    if (keys.length > 100) {
-      for (const oldKey of keys.slice(0, keys.length - 100)) {
-        delete cache[oldKey];
-      }
+export function sortPackageVersionsNewestFirst(
+  versions: GitHubPackageVersion[],
+  prioritizeDigest?: string
+): GitHubPackageVersion[] {
+  return [...versions].sort((a, b) => {
+    if (prioritizeDigest) {
+      if (a.name === prioritizeDigest && b.name !== prioritizeDigest) return -1;
+      if (b.name === prioritizeDigest && a.name !== prioritizeDigest) return 1;
     }
-    localStorage.setItem(EXTERNAL_LAYER_CACHE_KEY, JSON.stringify(cache));
-  } catch {
-    // ignore storage quota errors
-  }
+    const ta = new Date(a.updated_at || a.created_at || 0).getTime();
+    const tb = new Date(b.updated_at || b.created_at || 0).getTime();
+    if (tb !== ta) return tb - ta;
+    return b.id - a.id;
+  });
+}
+
+export function ociDetailsToIndexRecord(
+  pkgName: string,
+  manifestDigest: string,
+  details: OciPackageDetails
+): RepoIndexVersionRecord {
+  return {
+    packageName: pkgName.toLowerCase(),
+    manifestDigest,
+    layerDigest: details.layerDigest,
+    compressedSize: details.compressedSize,
+    totalUncompressedBytes: details.totalUncompressedBytes,
+    fileCount: details.fileCount,
+    originalName: details.originalName,
+    mode: details.mode,
+    createdAt: details.createdAt,
+    sourceRepoUrl: details.sourceRepoUrl,
+    files: details.files,
+  };
+}
+
+export function indexRecordToOciDetails(
+  record: RepoIndexVersionRecord,
+  tag: string
+): OciPackageDetails {
+  return {
+    packageName: record.packageName,
+    tag,
+    manifestDigest: record.manifestDigest,
+    layerDigest: record.layerDigest,
+    compressedSize: record.compressedSize,
+    totalUncompressedBytes: record.totalUncompressedBytes,
+    fileCount: record.fileCount,
+    originalName: record.originalName,
+    mode: record.mode,
+    createdAt: record.createdAt,
+    sourceRepoUrl: record.sourceRepoUrl,
+    files: record.files,
+    needsManualLoad: false,
+  };
 }
 
 /**
@@ -883,7 +929,7 @@ export async function inspectPackageManifest(opts: {
   packageName: string;
   tag?: string;
   reference?: string;
-  forceLoadLargeExternal?: boolean;
+  forceLoadLayer?: boolean;
   skipLayerScan?: boolean;
   onProgress?: (percent: number) => void;
   signal?: AbortSignal;
@@ -896,7 +942,7 @@ export async function inspectPackageManifest(opts: {
     packageName,
     tag = 'latest',
     reference,
-    forceLoadLargeExternal = false,
+    forceLoadLayer = false,
     skipLayerScan = false,
     onProgress,
     signal,
@@ -945,20 +991,17 @@ export async function inspectPackageManifest(opts: {
   const layerDigest = firstLayer?.digest || '';
 
   let files: OciManifestFileMeta[] = [];
-  let needsManualLargeLayerLoad = false;
+  let needsManualLoad = false;
 
-  if (annotations['io.ghpm.file-list']) {
+  if (annotations['io.ghpm.file-list'] && !forceLoadLayer) {
     try {
       files = JSON.parse(annotations['io.ghpm.file-list']) as OciManifestFileMeta[];
     } catch {
       files = [];
     }
   } else if (layerDigest && !skipLayerScan) {
-    const cachedFiles = getCachedExternalLayerFiles(layerDigest);
-    if (cachedFiles) {
-      files = cachedFiles;
-    } else if (!forceLoadLargeExternal && compressedSize > AUTO_INSPECT_EXTERNAL_MAX_BYTES) {
-      needsManualLargeLayerLoad = true;
+    if (!forceLoadLayer) {
+      needsManualLoad = true;
     } else {
       const layerUrl = `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${layerDigest}`;
       if (typeof window !== 'undefined' && window.electronAPI?.streamLayerFileList) {
@@ -1010,6 +1053,7 @@ export async function inspectPackageManifest(opts: {
             headers: {
               Authorization: `Bearer ${registryToken}`,
             },
+            signal,
           });
           if (signal?.aborted) {
             throw new DOMException('Layer scan aborted', 'AbortError');
@@ -1025,8 +1069,6 @@ export async function inspectPackageManifest(opts: {
           throw normalizeMemoryLimitError(err, 'inspect');
         }
       }
-
-      setCachedExternalLayerFiles(layerDigest, files);
     }
   }
 
@@ -1051,7 +1093,7 @@ export async function inspectPackageManifest(opts: {
     ? Number(annotations['io.ghpm.file-count'])
     : files.length > 0
     ? regularFileCount
-    : 1;
+    : 0;
 
   return {
     packageName: pkgLower,
@@ -1068,7 +1110,166 @@ export async function inspectPackageManifest(opts: {
     createdAt: annotations['org.opencontainers.image.created'] || '',
     sourceRepoUrl: annotations['org.opencontainers.image.source'] || '',
     files,
-    needsManualLargeLayerLoad,
+    needsManualLoad,
+  };
+}
+
+/**
+ * Fetches and parses the newest snapshot from `ghcr-manager-index_<repo>` into RAM.
+ */
+export async function fetchLatestRepoIndex(opts: {
+  username: string;
+  githubToken: string;
+  owner: string;
+  packageName: string;
+  versions: GitHubPackageVersion[];
+}): Promise<{
+  payload: RepoIndexPayload | null;
+  latestVersion: GitHubPackageVersion | null;
+  indexDetails: OciPackageDetails | null;
+}> {
+  const sorted = sortPackageVersionsNewestFirst(opts.versions);
+  const latest = sorted[0] || null;
+  if (!latest) {
+    return { payload: null, latestVersion: null, indexDetails: null };
+  }
+
+  const info = getVersionReferenceInfo(latest);
+  const manifestDetails = await inspectPackageManifest({
+    username: opts.username,
+    githubToken: opts.githubToken,
+    owner: opts.owner,
+    packageName: opts.packageName,
+    tag: info.primaryTag || info.shortDigest,
+    reference: info.inspectRef,
+    skipLayerScan: true,
+  });
+
+  if (!manifestDetails.layerDigest) {
+    return { payload: null, latestVersion: latest, indexDetails: manifestDetails };
+  }
+
+  const ownerLower = opts.owner.toLowerCase();
+  const pkgLower = opts.packageName.toLowerCase();
+  const registryToken = await getGhcrBearerToken(
+    opts.username,
+    opts.githubToken,
+    ownerLower,
+    pkgLower,
+    'pull'
+  );
+
+  const blobRes = await crossPlatformHttpRequest({
+    url: `https://ghcr.io/v2/${ownerLower}/${pkgLower}/blobs/${manifestDetails.layerDigest}`,
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${registryToken}`,
+    },
+  });
+
+  if (blobRes.status !== 200) {
+    throw new Error(`Failed to fetch repository index blob (HTTP ${blobRes.status})`);
+  }
+
+  const extracted = extractFilesFromOciLayer(blobRes.body);
+  const indexFile = extracted.find(
+    (f) => !f.isDirectory && f.relativePath.replace(/^\/+/, '') === 'index.json'
+  );
+  if (!indexFile) {
+    return { payload: null, latestVersion: latest, indexDetails: manifestDetails };
+  }
+
+  const parsed = decodeJson<RepoIndexPayload>(indexFile.data);
+  const normalizedDetails: OciPackageDetails = {
+    ...manifestDetails,
+    files: extracted.map((f) => ({
+      path: f.relativePath,
+      size: f.isDirectory ? 0 : f.data.byteLength,
+      ...(f.isDirectory ? { isDirectory: true } : {}),
+    })),
+    needsManualLoad: false,
+  };
+
+  return {
+    payload:
+      parsed && typeof parsed === 'object' && parsed.versions && typeof parsed.versions === 'object'
+        ? parsed
+        : null,
+    latestVersion: latest,
+    indexDetails: normalizedDetails,
+  };
+}
+
+/**
+ * Uploads a new timestamped `GHCR Manager Index - <repo>` snapshot and prunes older
+ * checkpoints beyond the newest 5 versions only after the upload succeeds.
+ */
+export async function publishRepoIndexSnapshot(opts: {
+  username: string;
+  githubToken: string;
+  currentUserLogin: string;
+  repo: GitHubRepo;
+  payload: RepoIndexPayload;
+  clockFormat: ClockFormat;
+  dateFormat: DateFormat;
+  canDeletePackages: boolean;
+}): Promise<{
+  indexPackage: GitHubPackageItem | null;
+  versions: GitHubPackageVersion[];
+  indexDetails: OciPackageDetails;
+}> {
+  const ociIndexPkgName = getRepoIndexPackageName(opts.repo.name);
+  const jsonBytes = encoder.encode(JSON.stringify(opts.payload));
+  const tag = formatTimestampTag(new Date(), opts.clockFormat, opts.dateFormat);
+
+  const details = await buildAndPushOciImage({
+    username: opts.username,
+    githubToken: opts.githubToken,
+    repo: opts.repo,
+    rawImageName: getRepoIndexDisplayTitle(opts.repo.name),
+    ociPackageNameOverride: ociIndexPkgName,
+    tag,
+    mode: REPO_INDEX_MODE,
+    files: [
+      {
+        relativePath: 'index.json',
+        data: jsonBytes,
+        mtime: Math.floor(Date.now() / 1000),
+      },
+    ],
+  });
+
+  const live = await fetchLivePackageState({
+    githubToken: opts.githubToken,
+    currentUserLogin: opts.currentUserLogin,
+    owner: opts.repo.owner.login,
+    ownerType: opts.repo.owner.type,
+    packageName: ociIndexPkgName,
+  });
+
+  const sorted = sortPackageVersionsNewestFirst(live.versions, details.manifestDigest);
+  const obsolete = sorted.slice(REPO_INDEX_KEEP_VERSIONS);
+  const deletedIds = new Set<number>();
+
+  if (obsolete.length > 0 && opts.canDeletePackages) {
+    const ownerLogin = live.packageItem?.owner.login || opts.repo.owner.login;
+    const ownerType = live.packageItem?.owner.type || opts.repo.owner.type;
+    await deleteReplacedVersions({
+      githubToken: opts.githubToken,
+      currentUserLogin: opts.currentUserLogin,
+      owner: ownerLogin,
+      ownerType,
+      packageName: ociIndexPkgName,
+      newManifestDigest: details.manifestDigest,
+      targets: obsolete,
+      onDeleted: (ver) => deletedIds.add(ver.id),
+    }).catch(() => {});
+  }
+
+  return {
+    indexPackage: live.packageItem,
+    versions: sorted.filter((v) => !deletedIds.has(v.id)),
+    indexDetails: details,
   };
 }
 
@@ -1170,7 +1371,7 @@ export async function downloadAndExtractPackageToDiskDesktop(opts: {
         (acc, f) => acc + (f.isDirectory ? 0 : f.size),
         0
       );
-      setCachedExternalLayerFiles(details.layerDigest, res.files);
+      details.needsManualLoad = false;
     }
 
     return {
@@ -1266,7 +1467,7 @@ export async function downloadAndExtractPackage(opts: {
       (acc, f) => acc + (f.isDirectory ? 0 : f.size),
       0
     );
-    setCachedExternalLayerFiles(details.layerDigest, fileMeta);
+    details.needsManualLoad = false;
   }
   return { details, extractedFiles };
 }
@@ -1415,6 +1616,7 @@ export async function deleteReplacedVersions(opts: {
   packageName: string;
   newManifestDigest?: string;
   targets: GitHubPackageVersion[];
+  onDeleted?: (version: GitHubPackageVersion) => void;
 }): Promise<string[]> {
   const toDelete = opts.targets.filter((v) => v.name !== opts.newManifestDigest);
   const errors: string[] = [];
@@ -1429,6 +1631,7 @@ export async function deleteReplacedVersions(opts: {
         packageName: opts.packageName,
         versionId: oldVer.id,
       });
+      opts.onDeleted?.(oldVer);
     } catch (delErr: unknown) {
       const info = getVersionReferenceInfo(oldVer);
       const label = info.primaryTag || info.shortDigest;

@@ -207,3 +207,21 @@ export function validateFilesSelectionName(
     ociPackageName: oci,
   };
 }
+
+export const REPO_INDEX_PACKAGE_PREFIX = 'ghcr-manager-index_';
+export const REPO_INDEX_MODE = 'repo-index';
+export const REPO_INDEX_KEEP_VERSIONS = 5;
+
+export function getRepoIndexPackageName(repoName: string): string {
+  const slug = toOciImageName(repoName) || 'repo';
+  const raw = `${REPO_INDEX_PACKAGE_PREFIX}${slug}`.slice(0, 128).replace(/[._-]+$/, '');
+  return raw || `${REPO_INDEX_PACKAGE_PREFIX}repo`;
+}
+
+export function getRepoIndexDisplayTitle(repoName: string): string {
+  return `GHCR Manager Index - ${repoName}`;
+}
+
+export function isRepoIndexPackageName(pkgName: string): boolean {
+  return pkgName.toLowerCase().startsWith(REPO_INDEX_PACKAGE_PREFIX);
+}

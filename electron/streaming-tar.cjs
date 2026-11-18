@@ -328,7 +328,7 @@ async function buildOciLayerToFile({ files, outFilePath, onProgress, signal }) {
     await pipeDone;
     reportProgress(true);
 
-    const fileMetaList = statList.slice(0, 150).map((f) => {
+    const fileMetaList = statList.map((f) => {
       const normalized = f.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') || '.';
       return f.isDirectory
         ? { path: normalized, size: 0, isDirectory: true }

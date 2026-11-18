@@ -170,7 +170,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                 <strong>Automatic Repository Linking:</strong> Uploaded images include <code>org.opencontainers.image.source</code> labels and annotations so GitHub automatically links them to the selected repository.
               </li>
               <li>
-                <strong>Auto-Indexing, Folder Trees &amp; Search:</strong> Switching to <strong>Repo Packages</strong> or clicking <strong>Refresh</strong> lists all tagged and untagged versions and caches their file lists by SHA-256 digest in expandable nested folder trees. External layers under 50 MB index automatically; larger layers load on demand via <strong>Load Files</strong> header streaming. Searching filters package names, tags, and inner files and auto-expands matching folders.
+                <strong>Shared Repo Index, Folder Trees &amp; Search:</strong> Switching to <strong>Repo Packages</strong> or clicking <strong>Refresh</strong> loads your repository&apos;s compressed <code>GHCR Manager Index</code> image into RAM (keeping the newest 5 checkpoints) so file lists and inner-folder search work immediately without storing path caches on your device. Any unindexed image loads on demand when you click <strong>Load Files</strong> (streaming only archive headers) and is added to the index afterward.
               </li>
               <li>
                 <strong>Download &amp; Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts files directly to a destination folder on Desktop (supporting multi-GB images), or downloads the file / <code>.zip</code> bundle on Web and Mobile.

@@ -7,6 +7,9 @@ import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import {
   formatTimestampTag,
+  getRepoIndexDisplayTitle,
+  getRepoIndexPackageName,
+  isRepoIndexPackageName,
   toOciImageName,
   validateFilesSelectionName,
   validateOciTag,
@@ -337,6 +340,36 @@ async function runTests() {
     assert.ok(unzippedKeys.includes('FolderA/empty-sub/'));
     assert.ok(unzippedKeys.includes(`${emptyLongDir}/`));
     assert.equal(unzippedKeys.includes('./'), false);
+
+    console.log('9. Testing Repo Index naming, >150 entries without slicing, and O(N) summary scale...');
+    assert.equal(getRepoIndexPackageName('My Cool Repo'), 'ghcr-manager-index_my-cool-repo');
+    assert.equal(getRepoIndexDisplayTitle('My Cool Repo'), 'GHCR Manager Index - My Cool Repo');
+    assert.equal(isRepoIndexPackageName('ghcr-manager-index_my-cool-repo'), true);
+    assert.equal(isRepoIndexPackageName('my-normal-pkg'), false);
+
+    const manyInputs = Array.from({ length: 250 }, (_, idx) => ({
+      fullPath: srcFile1,
+      relativePath: `batch/file-${idx}.txt`,
+      mtime: 1700000100,
+    }));
+    const manyTargz = path.join(tmpWorkDir, 'many-250.tar.gz');
+    const manyStreamed = await buildOciLayerToFile({
+      files: manyInputs,
+      outFilePath: manyTargz,
+    });
+    assert.equal(manyStreamed.fileCount, 250);
+    assert.equal(manyStreamed.fileMetaList.length, 250);
+
+    const scaleEntries = [
+      ...Array.from({ length: 5000 }, (_, i) => ({
+        path: `src/mod-${i % 20}/file-${i}.ts`,
+      })),
+      { path: 'src/mod-0', isDirectory: true },
+      { path: 'empty-root-child/nested-empty', isDirectory: true },
+      { path: 'empty-root-child', isDirectory: true },
+    ];
+    const scaleSummary = summarizeArchiveEntries(scaleEntries);
+    assert.deepEqual(scaleSummary, { regularFileCount: 5000, emptyFolderCount: 1 });
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }

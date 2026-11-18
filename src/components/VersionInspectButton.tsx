@@ -67,7 +67,7 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
     );
   }
 
-  if (details?.needsManualLargeLayerLoad) {
+  if (details?.needsManualLoad) {
     return (
       <button
         type="button"
@@ -77,7 +77,7 @@ export const VersionInspectButton: React.FC<VersionInspectButtonProps> = ({
           onLoadFiles();
         }}
         className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-        title="External image over 50 MB: click to stream file headers without loading full file contents into RAM"
+        title="Click to stream file headers from this image layer into RAM"
       >
         <ChevronRight className="w-3.5 h-3.5" />
         Load Files ({formatBytes(details.compressedSize)})
@@ -147,7 +147,7 @@ export const VersionFileDetailsPanel: React.FC<VersionFileDetailsPanelProps> = (
   highlightQuery = '',
   containerBgClass = 'bg-[#0d1117]',
 }) => {
-  if (details.needsManualLargeLayerLoad) return null;
+  if (details.needsManualLoad) return null;
   const { emptyFolderCount } = summarizeArchiveEntries(details.files);
   return (
     <div className="pt-2 border-t border-[#30363d] space-y-2">

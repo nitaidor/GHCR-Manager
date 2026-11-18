@@ -55,14 +55,19 @@ import {
   downloadAndExtractPackage,
   downloadAndExtractPackageToDiskDesktop,
   fetchGitHubAuthInfo,
+  fetchLatestRepoIndex,
   fetchLivePackageState,
   formatBytes,
   getVersionReferenceInfo,
+  indexRecordToOciDetails,
   inspectPackageManifest,
   listPackageVersions,
   listPackagesForRepo,
   listUserRepositories,
+  ociDetailsToIndexRecord,
   pollGitHubDeviceFlowToken,
+  publishRepoIndexSnapshot,
+  sortPackageVersionsNewestFirst,
   startGitHubDeviceFlow,
   type DesktopStreamingInputFile,
   type GitHubPackageItem,
@@ -72,6 +77,8 @@ import {
   type LivePackageState,
   type OciPackageDetails,
   type PushProgressUpdate,
+  type RepoIndexPayload,
+  type RepoIndexVersionRecord,
 } from './lib/github-oci';
 import {
   mapWithConcurrency,
@@ -84,6 +91,10 @@ import {
 } from './lib/http';
 import { isAbortError } from './lib/http';
 import {
+  getRepoIndexDisplayTitle,
+  getRepoIndexPackageName,
+  isRepoIndexPackageName,
+  REPO_INDEX_KEEP_VERSIONS,
   toOciImageName,
   validateFilesSelectionName,
   type DateFormat,
@@ -461,6 +472,22 @@ export default function App() {
   } | null>(null);
 
   type InlineNotice = { type: 'success' | 'warning' | 'error'; text: string };
+  const [repoIndexPkg, setRepoIndexPkg] = useState<GitHubPackageItem | null>(null);
+  const [repoIndexVersions, setRepoIndexVersions] = useState<GitHubPackageVersion[]>([]);
+  const [repoIndexEntries, setRepoIndexEntries] = useState<
+    Record<string, RepoIndexVersionRecord>
+  >({});
+  const repoIndexEntriesRef = useRef<Record<string, RepoIndexVersionRecord>>({});
+  repoIndexEntriesRef.current = repoIndexEntries;
+  const repoIndexLoadedForRepoIdRef = useRef<number | null>(null);
+  const repoIndexLoadPromiseRef = useRef<{
+    repoId: number;
+    promise: Promise<Record<string, RepoIndexVersionRecord>>;
+  } | null>(null);
+  const repoIndexWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const [repoIndexUpdating, setRepoIndexUpdating] = useState<boolean>(false);
+  const [repoIndexNotice, setRepoIndexNotice] = useState<InlineNotice | null>(null);
+
   const [deletedPkgTombstones, setDeletedPkgTombstones] = useState<
     Record<
       string,
@@ -632,6 +659,12 @@ export default function App() {
     setDeletedPkgTombstones({});
     setPkgNotices({});
     setVersionNotices({});
+    setRepoIndexPkg(null);
+    setRepoIndexVersions([]);
+    setRepoIndexEntries({});
+    setRepoIndexNotice(null);
+    repoIndexLoadedForRepoIdRef.current = null;
+    repoIndexLoadPromiseRef.current = null;
   }
 
   // Saved PAT handlers
@@ -743,6 +776,12 @@ export default function App() {
       setConfirmDeletePkg(null);
       setConfirmDeleteVersion(null);
       setExtractConflict(null);
+      setRepoIndexPkg(null);
+      setRepoIndexVersions([]);
+      setRepoIndexEntries({});
+      setRepoIndexNotice(null);
+      repoIndexLoadedForRepoIdRef.current = null;
+      repoIndexLoadPromiseRef.current = null;
       localStorage.setItem(STORAGE_REPO_KEY, String(selectedRepo.id));
       refreshPackages({ clearTransientNotices: true });
     }
@@ -755,19 +794,243 @@ export default function App() {
     }
   }, [activeTab]);
 
+  function applyIndexEntriesToInspectedMap(
+    rawMap: Record<string, RepoIndexVersionRecord>,
+    liveVKeys?: Set<string>
+  ) {
+    const nextInspected: Record<string, OciPackageDetails> = {};
+    for (const [k, rec] of Object.entries(rawMap)) {
+      if (liveVKeys && !liveVKeys.has(k)) continue;
+      nextInspected[k] = indexRecordToOciDetails(rec, '');
+    }
+    if (Object.keys(nextInspected).length === 0) return;
+    setInspectedByKey((prev) => {
+      const merged = { ...prev };
+      for (const [k, det] of Object.entries(nextInspected)) {
+        const existing = merged[k];
+        if (!existing || existing.needsManualLoad || existing.files.length === 0) {
+          merged[k] = det;
+        }
+      }
+      return merged;
+    });
+  }
+
+  async function ensureRepoIndexLoaded(
+    repo: GitHubRepo,
+    preloaded?: {
+      pkg: GitHubPackageItem | null;
+      versions: GitHubPackageVersion[];
+      liveVKeys?: Set<string>;
+    }
+  ): Promise<Record<string, RepoIndexVersionRecord>> {
+    if (!user || !authToken) return {};
+    if (!preloaded && repoIndexLoadedForRepoIdRef.current === repo.id) {
+      return repoIndexEntriesRef.current;
+    }
+    if (
+      !preloaded &&
+      repoIndexLoadPromiseRef.current &&
+      repoIndexLoadPromiseRef.current.repoId === repo.id
+    ) {
+      return await repoIndexLoadPromiseRef.current.promise;
+    }
+
+    const runLoad = async (): Promise<Record<string, RepoIndexVersionRecord>> => {
+      try {
+        const ociIndexPkgName = getRepoIndexPackageName(repo.name);
+        let idxPkg = preloaded?.pkg ?? null;
+        let idxVersions = preloaded?.versions ?? [];
+
+        if (!preloaded) {
+          const live = await fetchLivePackageState({
+            githubToken: authToken,
+            currentUserLogin: user.login,
+            owner: repo.owner.login,
+            ownerType: repo.owner.type,
+            packageName: ociIndexPkgName,
+          });
+          idxPkg = live.packageItem;
+          idxVersions = live.versions;
+        }
+
+        const sortedIdxVersions = sortPackageVersionsNewestFirst(idxVersions);
+        setRepoIndexPkg(idxPkg);
+        setRepoIndexVersions(sortedIdxVersions);
+
+        if (!idxPkg || sortedIdxVersions.length === 0) {
+          setRepoIndexEntries({});
+          repoIndexLoadedForRepoIdRef.current = repo.id;
+          return {};
+        }
+
+        const fetched = await fetchLatestRepoIndex({
+          username: user.login,
+          githubToken: authToken,
+          owner: idxPkg.owner.login,
+          packageName: idxPkg.name,
+          versions: sortedIdxVersions,
+        });
+
+        if (fetched.latestVersion && fetched.indexDetails) {
+          const idxVKey = makeVersionStateKey(idxPkg.name, fetched.latestVersion.name);
+          setInspectedByKey((prev) => ({
+            ...prev,
+            [idxVKey]: fetched.indexDetails!,
+          }));
+        }
+
+        const rawMap = fetched.payload?.versions || {};
+        applyIndexEntriesToInspectedMap(rawMap, preloaded?.liveVKeys);
+        setRepoIndexEntries(rawMap);
+        repoIndexLoadedForRepoIdRef.current = repo.id;
+        return rawMap;
+      } catch (err: unknown) {
+        setRepoIndexNotice({
+          type: 'warning',
+          text: `Failed to load repository index: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        });
+        return repoIndexEntriesRef.current;
+      } finally {
+        if (repoIndexLoadPromiseRef.current?.repoId === repo.id) {
+          repoIndexLoadPromiseRef.current = null;
+        }
+      }
+    };
+
+    const promise = runLoad();
+    repoIndexLoadPromiseRef.current = { repoId: repo.id, promise };
+    return await promise;
+  }
+
+  function enqueueRepoIndexMutation(opts: {
+    repo: GitHubRepo;
+    addOrUpdate?: Array<{
+      pkgName: string;
+      manifestDigest: string;
+      details: OciPackageDetails;
+    }>;
+    removeKeys?: string[];
+    removePkgNames?: string[];
+  }): Promise<void> {
+    const task = repoIndexWriteQueueRef.current.then(async () => {
+      if (!user || !authToken) return;
+      setRepoIndexUpdating(true);
+      setRepoIndexNotice(null);
+      try {
+        const baseEntries = {
+          ...(await ensureRepoIndexLoaded(opts.repo)),
+        };
+
+        const rmPkgSet = new Set(
+          (opts.removePkgNames || []).map((n) => n.toLowerCase())
+        );
+        if (rmPkgSet.size > 0) {
+          for (const [k, rec] of Object.entries(baseEntries)) {
+            if (rmPkgSet.has(rec.packageName.toLowerCase())) {
+              delete baseEntries[k];
+            }
+          }
+        }
+
+        for (const rk of opts.removeKeys || []) {
+          delete baseEntries[rk];
+        }
+
+        for (const item of opts.addOrUpdate || []) {
+          if (isRepoIndexPackageName(item.pkgName) || !item.manifestDigest) continue;
+          const vKey = makeVersionStateKey(item.pkgName, item.manifestDigest);
+          baseEntries[vKey] = ociDetailsToIndexRecord(
+            item.pkgName,
+            item.manifestDigest,
+            item.details
+          );
+        }
+
+        const payload: RepoIndexPayload = {
+          schemaVersion: 1,
+          repoFullName: opts.repo.full_name,
+          updatedAt: new Date().toISOString(),
+          versions: baseEntries,
+        };
+
+        const canDelete =
+          oauthScopes === null || oauthScopes.includes('delete:packages');
+
+        const pushed = await publishRepoIndexSnapshot({
+          username: user.login,
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          repo: opts.repo,
+          payload,
+          clockFormat: settings.clockFormat,
+          dateFormat: settings.dateFormat,
+          canDeletePackages: canDelete,
+        });
+
+        setRepoIndexEntries(baseEntries);
+        repoIndexLoadedForRepoIdRef.current = opts.repo.id;
+        if (pushed.indexPackage) {
+          setRepoIndexPkg(pushed.indexPackage);
+          setRepoIndexVersions(pushed.versions);
+          if (pushed.indexDetails.manifestDigest) {
+            const idxKey = makeVersionStateKey(
+              pushed.indexPackage.name,
+              pushed.indexDetails.manifestDigest
+            );
+            setInspectedByKey((prev) => ({
+              ...prev,
+              [idxKey]: pushed.indexDetails,
+            }));
+          }
+        }
+      } catch (err: unknown) {
+        setRepoIndexNotice({
+          type: 'warning',
+          text: `Failed to update repository index: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        });
+      } finally {
+        setRepoIndexUpdating(false);
+      }
+    });
+
+    repoIndexWriteQueueRef.current = task.catch(() => {});
+    return task;
+  }
+
   /**
-   * Background-indexes manifest metadata / <=50MB external tar headers for any versions
-   * not yet present in the digest cache. Shared between Repo Packages and UploadVersionModal.
+   * Fetches manifest summaries (requiring Load Files on unindexed layers) for versions not already
+   * populated from GHCR Manager Index.
    */
-  function indexVersionList(
+  async function indexVersionList(
     pkgName: string,
     ownerLogin: string,
-    versions: GitHubPackageVersion[]
+    versions: GitHubPackageVersion[],
+    knownIndexEntries?: Record<string, RepoIndexVersionRecord>
   ) {
     if (!user || !authToken || versions.length === 0) return;
-    const toFetch = versions.filter(
-      (v) => !inspectedByKeyRef.current[makeVersionStateKey(pkgName, v.name)]
-    );
+
+    let indexMap = knownIndexEntries;
+    if (
+      !indexMap &&
+      selectedRepo &&
+      repoIndexLoadedForRepoIdRef.current !== selectedRepo.id &&
+      !isRepoIndexPackageName(pkgName)
+    ) {
+      indexMap = await ensureRepoIndexLoaded(selectedRepo);
+    }
+
+    const toFetch = versions.filter((v) => {
+      const vKey = makeVersionStateKey(pkgName, v.name);
+      const existing = inspectedByKeyRef.current[vKey];
+      if (existing) return false;
+      if (indexMap && indexMap[vKey]) return false;
+      return true;
+    });
     if (toFetch.length === 0) return;
 
     setIndexingKeys((prev) => {
@@ -788,7 +1051,7 @@ export default function App() {
         packageName: pkgName,
         tag: info.primaryTag || info.shortDigest,
         reference: info.inspectRef,
-        forceLoadLargeExternal: false,
+        forceLoadLayer: false,
       })
         .then((details) => {
           setInspectedByKey((prev) => ({
@@ -820,15 +1083,55 @@ export default function App() {
     setPackagesLoading(true);
     setPackagesError(null);
     try {
-      const { repoPackages: linked, otherOwnerPackages: others } =
+      const { repoPackages: rawLinked, otherOwnerPackages: rawOthers } =
         await listPackagesForRepo(authToken, user.login, selectedRepo);
       if (refreshSeqRef.current !== seq) return;
+
+      const expectedIdxPkgName = getRepoIndexPackageName(
+        selectedRepo.name
+      ).toLowerCase();
+      let matchedIndexPkg =
+        rawLinked.find((p) => p.name.toLowerCase() === expectedIdxPkgName) ||
+        rawOthers.find((p) => p.name.toLowerCase() === expectedIdxPkgName) ||
+        null;
+      let directIdxVersions: GitHubPackageVersion[] | null = null;
+
+      if (!matchedIndexPkg) {
+        const directIdx = await fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: selectedRepo.owner.login,
+          ownerType: selectedRepo.owner.type,
+          packageName: expectedIdxPkgName,
+        }).catch(() => null);
+        if (refreshSeqRef.current !== seq) return;
+        if (directIdx?.exists && directIdx.packageItem) {
+          matchedIndexPkg = directIdx.packageItem;
+          directIdxVersions = directIdx.versions;
+        }
+      }
+
+      const linked = rawLinked.filter((p) => !isRepoIndexPackageName(p.name));
+      const others = rawOthers.filter((p) => !isRepoIndexPackageName(p.name));
       setRepoPackages(linked);
       setOtherPackages(others);
 
-      const allToLoad = [...linked, ...others];
+      let indexVersions: GitHubPackageVersion[] = directIdxVersions || [];
+      const fetchedVersionsByPkg: Record<string, GitHubPackageVersion[]> = {};
+      const liveLinkedVKeys = new Set<string>();
+      const succeededLinkedPkgNames = new Set<string>();
+
+      const fetchList: GitHubPackageItem[] = [
+        ...(matchedIndexPkg && directIdxVersions === null ? [matchedIndexPkg] : []),
+        ...linked,
+        ...others,
+      ];
+      const linkedNameSet = new Set(linked.map((p) => p.name.toLowerCase()));
+
       await Promise.all(
-        allToLoad.map(async (pkg) => {
+        fetchList.map(async (pkg) => {
+          const isIdx =
+            matchedIndexPkg && pkg.name.toLowerCase() === matchedIndexPkg.name.toLowerCase();
           try {
             const versions = await listPackageVersions({
               githubToken: authToken,
@@ -838,16 +1141,107 @@ export default function App() {
               packageName: pkg.name,
             });
             if (refreshSeqRef.current !== seq) return;
-            setPackageVersionsMap((prev) => ({
-              ...prev,
-              [pkg.name.toLowerCase()]: versions,
-            }));
-            indexVersionList(pkg.name, pkg.owner.login, versions);
+            if (isIdx) {
+              indexVersions = versions;
+            } else {
+              const lowerName = pkg.name.toLowerCase();
+              fetchedVersionsByPkg[lowerName] = versions;
+              if (linkedNameSet.has(lowerName)) {
+                succeededLinkedPkgNames.add(lowerName);
+                for (const v of versions) {
+                  liveLinkedVKeys.add(makeVersionStateKey(pkg.name, v.name));
+                }
+              }
+              setPackageVersionsMap((prev) => ({
+                ...prev,
+                [lowerName]: versions,
+              }));
+            }
           } catch {
-            // ignore individual package version list failure during bulk refresh
+            // Leave out of succeededLinkedPkgNames so transient errors don't prune index entries
           }
         })
       );
+
+      if (refreshSeqRef.current !== seq) return;
+
+      // Verify any package in the loaded index that didn't appear in /user/packages yet
+      const currentIndexMap = await ensureRepoIndexLoaded(selectedRepo, {
+        pkg: matchedIndexPkg,
+        versions: indexVersions,
+      });
+
+      if (refreshSeqRef.current !== seq) return;
+
+      const missingFromListPkgNames = Array.from(
+        new Set(
+          Object.values(currentIndexMap)
+            .map((rec) => rec.packageName.toLowerCase())
+            .filter(
+              (pkgLower) =>
+                !linkedNameSet.has(pkgLower) &&
+                !deletedPkgTombstones[pkgLower] &&
+                !isRepoIndexPackageName(pkgLower)
+            )
+        )
+      );
+
+      if (missingFromListPkgNames.length > 0) {
+        const directChecked = await Promise.all(
+          missingFromListPkgNames.map(async (pkgLower) => {
+            const live = await fetchLivePackageState({
+              githubToken: authToken,
+              currentUserLogin: user.login,
+              owner: selectedRepo.owner.login,
+              ownerType: selectedRepo.owner.type,
+              packageName: pkgLower,
+            }).catch(() => null);
+            return { pkgLower, live };
+          })
+        );
+        if (refreshSeqRef.current !== seq) return;
+
+        for (const { pkgLower, live } of directChecked) {
+          if (!live) continue;
+          succeededLinkedPkgNames.add(pkgLower);
+          if (live.exists && live.packageItem) {
+            if (live.versions.length > 0) {
+              linked.push(live.packageItem);
+              linkedNameSet.add(pkgLower);
+              fetchedVersionsByPkg[pkgLower] = live.versions;
+              for (const v of live.versions) {
+                liveLinkedVKeys.add(makeVersionStateKey(pkgLower, v.name));
+              }
+              setPackageVersionsMap((prev) => ({
+                ...prev,
+                [pkgLower]: live.versions,
+              }));
+            }
+          }
+        }
+        setRepoPackages([...linked]);
+      }
+
+      const staleKeys = Object.entries(currentIndexMap)
+        .filter(([k, rec]) => {
+          const pkgLower = rec.packageName.toLowerCase();
+          return succeededLinkedPkgNames.has(pkgLower) && !liveLinkedVKeys.has(k);
+        })
+        .map(([k]) => k);
+
+      if (staleKeys.length > 0 && matchedIndexPkg) {
+        void enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          removeKeys: staleKeys,
+        });
+      }
+
+      for (const pkg of [...linked, ...others]) {
+        const versions = fetchedVersionsByPkg[pkg.name.toLowerCase()];
+        if (versions && versions.length > 0) {
+          void indexVersionList(pkg.name, pkg.owner.login, versions, currentIndexMap);
+        }
+      }
     } catch (err: unknown) {
       if (refreshSeqRef.current === seq) {
         setPackagesError(err instanceof Error ? err.message : String(err));
@@ -1340,6 +1734,7 @@ export default function App() {
 
       // Delete checked old versions ONLY after the new image push succeeded
       let deleteErrors: string[] = [];
+      const deletedVersionKeys: string[] = [];
       if (opts.replaceVersions.length > 0) {
         const pkgOwnerLogin =
           modalLivePkg?.owner.login || selectedRepo.owner.login;
@@ -1360,6 +1755,27 @@ export default function App() {
           packageName: details.packageName,
           newManifestDigest: details.manifestDigest,
           targets: opts.replaceVersions,
+          onDeleted: (ver) =>
+            deletedVersionKeys.push(makeVersionStateKey(details.packageName, ver.name)),
+        });
+      }
+
+      if (details.manifestDigest) {
+        setUploadProgress({
+          stage: 'publishing-manifest',
+          message: 'Updating repository file index...',
+          percent: 98,
+        });
+        await enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          addOrUpdate: [
+            {
+              pkgName: details.packageName,
+              manifestDigest: details.manifestDigest,
+              details,
+            },
+          ],
+          removeKeys: deletedVersionKeys,
         });
       }
 
@@ -1840,6 +2256,12 @@ export default function App() {
     let wasCancelled = false;
     const skippedCount = plans.length - activePlans.length;
     const batchErrors: string[] = [];
+    const indexAddOrUpdate: Array<{
+      pkgName: string;
+      manifestDigest: string;
+      details: OciPackageDetails;
+    }> = [];
+    const indexRemoveKeys: string[] = [];
 
     for (let i = 0; i < activePlans.length; i++) {
       if (abortCtrl.signal.aborted) {
@@ -1953,6 +2375,11 @@ export default function App() {
             ...prev,
             [vKey]: details,
           }));
+          indexAddOrUpdate.push({
+            pkgName: details.packageName,
+            manifestDigest: details.manifestDigest,
+            details,
+          });
         }
 
         let deleteErrors: string[] = [];
@@ -1974,6 +2401,10 @@ export default function App() {
             packageName: details.packageName,
             newManifestDigest: details.manifestDigest,
             targets: plan.replaceVersions,
+            onDeleted: (ver) =>
+              indexRemoveKeys.push(
+                makeVersionStateKey(details.packageName, ver.name)
+              ),
           });
           totalReplacedCount +=
             plan.replaceVersions.length - deleteErrors.length;
@@ -2016,6 +2447,20 @@ export default function App() {
       }
     }
 
+    if (indexAddOrUpdate.length > 0 || indexRemoveKeys.length > 0) {
+      setSyncOverallProgress({
+        current: activePlans.length,
+        total: activePlans.length,
+        message: 'Updating repository file index...',
+        percent: 99,
+      });
+      await enqueueRepoIndexMutation({
+        repo: selectedRepo,
+        addOrUpdate: indexAddOrUpdate,
+        removeKeys: indexRemoveKeys,
+      });
+    }
+
     if (syncAbortRef.current === abortCtrl) {
       syncAbortRef.current = null;
     }
@@ -2024,7 +2469,11 @@ export default function App() {
     await refreshPackages();
 
     if (wasCancelled) {
-      setSyncModalError('Sync cancelled.');
+      setSyncModalError(
+        syncedCount > 0
+          ? `Sync cancelled (${syncedCount} completed item(s) uploaded and indexed).`
+          : 'Sync cancelled.'
+      );
     } else if (batchErrors.length > 0) {
       setSyncModalError(batchErrors.join(' | '));
     } else {
@@ -2087,7 +2536,7 @@ export default function App() {
         packageName: pkgName,
         tag: info.primaryTag || info.shortDigest,
         reference: info.inspectRef,
-        forceLoadLargeExternal: true,
+        forceLoadLayer: true,
         onProgress: (pct) => setInspectProgress(pct),
         signal: ac.signal,
       });
@@ -2096,6 +2545,22 @@ export default function App() {
         [vKey]: details,
       }));
       setExpandedVersionKeys((prev) => new Set(prev).add(vKey));
+
+      const isOtherPkg = otherPackages.some(
+        (p) => p.name.toLowerCase() === pkgName.toLowerCase()
+      );
+      if (!isRepoIndexPackageName(pkgName) && !isOtherPkg) {
+        void enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          addOrUpdate: [
+            {
+              pkgName,
+              manifestDigest: details.manifestDigest || version.name,
+              details,
+            },
+          ],
+        });
+      }
     } catch (err: unknown) {
       if (isAbortError(err)) {
         return;
@@ -2166,6 +2631,10 @@ export default function App() {
       return next;
     });
 
+    const wasUnindexed = Boolean(
+      details.needsManualLoad || details.files.length === 0
+    );
+
     try {
       const res = await downloadAndExtractPackageToDiskDesktop({
         username: user.login,
@@ -2186,6 +2655,27 @@ export default function App() {
         ...prev,
         [vKey]: res.details,
       }));
+
+      const isOtherPkg = otherPackages.some(
+        (p) => p.name.toLowerCase() === pkg.name.toLowerCase()
+      );
+      if (
+        res.saved &&
+        wasUnindexed &&
+        !isRepoIndexPackageName(pkg.name) &&
+        !isOtherPkg
+      ) {
+        void enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          addOrUpdate: [
+            {
+              pkgName: pkg.name,
+              manifestDigest: res.details.manifestDigest || version.name,
+              details: res.details,
+            },
+          ],
+        });
+      }
 
       if (res.saved) {
         setVersionNotices((prev) => ({
@@ -2323,6 +2813,10 @@ export default function App() {
     setDownloadProgress(null);
 
     try {
+      const prevDetails = inspectedByKeyRef.current[vKey];
+      const wasUnindexed = Boolean(
+        !prevDetails || prevDetails.needsManualLoad || prevDetails.files.length === 0
+      );
       const { details, extractedFiles } = await downloadAndExtractPackage({
         username: user.login,
         githubToken: authToken,
@@ -2337,6 +2831,22 @@ export default function App() {
         ...prev,
         [vKey]: details,
       }));
+
+      const isOtherPkg = otherPackages.some(
+        (p) => p.name.toLowerCase() === pkg.name.toLowerCase()
+      );
+      if (wasUnindexed && !isRepoIndexPackageName(pkg.name) && !isOtherPkg) {
+        void enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          addOrUpdate: [
+            {
+              pkgName: pkg.name,
+              manifestDigest: details.manifestDigest || version.name,
+              details,
+            },
+          ],
+        });
+      }
 
       if (extractedFiles.length === 0) {
         throw new Error('No files or folders were found inside the image layer.');
@@ -2529,6 +3039,10 @@ export default function App() {
       return next;
     });
 
+    const isOtherPkg = otherPackages.some(
+      (p) => p.name.toLowerCase() === pkgKey
+    );
+
     try {
       if (siblingVersions.length <= 1) {
         await deleteGitHubPackage({
@@ -2542,6 +3056,12 @@ export default function App() {
           pkg,
           `Removed "${pkg.name}" (last remaining version deleted) from GitHub Packages.`
         );
+        if (!isOtherPkg && !isRepoIndexPackageName(pkg.name)) {
+          await enqueueRepoIndexMutation({
+            repo: selectedRepo,
+            removePkgNames: [pkg.name],
+          });
+        }
       } else {
         await deletePackageVersion({
           githubToken: authToken,
@@ -2558,6 +3078,12 @@ export default function App() {
             text: `Removed version "${pkg.name}${info.pullSuffix}" from GitHub Packages.`,
           },
         }));
+        if (!isOtherPkg && !isRepoIndexPackageName(pkg.name)) {
+          await enqueueRepoIndexMutation({
+            repo: selectedRepo,
+            removeKeys: [vKey],
+          });
+        }
       }
       await refreshPackages();
     } catch (err: unknown) {
@@ -2576,6 +3102,9 @@ export default function App() {
   async function handleDeletePackageConfirmed(pkg: GitHubPackageItem) {
     if (!selectedRepo || !user || !authToken) return;
     const pkgKey = pkg.name.toLowerCase();
+    const isOtherPkg = otherPackages.some(
+      (p) => p.name.toLowerCase() === pkgKey
+    );
     setDeletingPkgName(pkg.name);
     setConfirmDeletePkg(null);
     try {
@@ -2590,6 +3119,12 @@ export default function App() {
         pkg,
         `Removed package "${pkg.name}" from GitHub Packages.`
       );
+      if (!isOtherPkg && !isRepoIndexPackageName(pkg.name)) {
+        await enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          removePkgNames: [pkg.name],
+        });
+      }
       await refreshPackages();
     } catch (err: unknown) {
       setPkgNotices((prev) => ({
@@ -4286,6 +4821,275 @@ export default function App() {
                           : []),
                       ];
 
+                      const renderRepoPackageCard = ({
+                        pkg,
+                        allVersions,
+                        displayedVersions,
+                        q,
+                        allowDelete,
+                        isIndexCard = false,
+                        displayTitleOverride,
+                      }: {
+                        pkg: GitHubPackageItem;
+                        allVersions: GitHubPackageVersion[];
+                        displayedVersions: GitHubPackageVersion[];
+                        q: string;
+                        allowDelete: boolean;
+                        isIndexCard?: boolean;
+                        displayTitleOverride?: string;
+                      }) => {
+                        const pkgKey = pkg.name.toLowerCase();
+                        const settingsUrl = `${pkg.html_url}/settings`;
+                        const outerCardClass = isIndexCard
+                          ? 'p-4 rounded-md theme-index-card space-y-3'
+                          : 'p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3';
+                        const versionCardClass = isIndexCard
+                          ? 'p-3 rounded-md theme-index-version-row space-y-2.5'
+                          : 'p-3 rounded-md bg-[#161b22] border border-[#30363d] space-y-2.5';
+
+                        return (
+                          <div key={pkg.id} className={outerCardClass}>
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <Package className="w-4 h-4 icon-packages" />
+                                {displayTitleOverride ? (
+                                  <>
+                                    <span className="text-sm font-bold text-gray-300">
+                                      {displayTitleOverride}
+                                    </span>
+                                    <span className="text-[11px] font-mono text-gray-400">
+                                      ({pkg.name})
+                                    </span>
+                                  </>
+                                ) : (
+                                  <span className="text-sm font-bold text-white font-mono">
+                                    {pkg.name}
+                                  </span>
+                                )}
+                                <span
+                                  className={`text-[10px] px-2 py-0.5 rounded border ${
+                                    pkg.visibility === 'private'
+                                      ? 'status-badge-warning'
+                                      : 'status-badge-valid'
+                                  }`}
+                                >
+                                  {pkg.visibility === 'private' && (
+                                    <Lock className="w-2.5 h-2.5 inline mr-1" />
+                                  )}
+                                  {pkg.visibility}
+                                </span>
+                                <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
+                                  {allVersions.length} version
+                                  {allVersions.length === 1 ? '' : 's'}
+                                </span>
+                                <a
+                                  href={settingsUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
+                                  className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
+                                >
+                                  Visibility Settings
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              </div>
+
+                              {allowDelete && (
+                                <button
+                                  type="button"
+                                  disabled={deletingPkgName === pkg.name}
+                                  onClick={() => {
+                                    setConfirmDeleteVersion(null);
+                                    setConfirmDeletePkg(pkg);
+                                  }}
+                                  className="btn-modal-action px-2.5 py-1 rounded-md text-xs hover:text-red-400 transition cursor-pointer flex items-center gap-1.5"
+                                  title="Remove entire package and all its versions from GitHub"
+                                >
+                                  {deletingPkgName === pkg.name ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  )}
+                                  Remove Package
+                                </button>
+                              )}
+                            </div>
+
+                            {renderInlineNotice(pkgNotices[pkgKey], () =>
+                              dismissPkgNotice(pkgKey)
+                            )}
+
+                            {displayedVersions.length === 0 ? (
+                              <div className="p-3 rounded-md bg-[#161b22] border border-[#30363d] text-xs text-gray-500">
+                                No tagged or untagged versions returned for this package.
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                {displayedVersions.map((version) => {
+                                  const vKey = makeVersionStateKey(pkg.name, version.name);
+                                  const info = getVersionReferenceInfo(version);
+                                  const details = inspectedByKey[vKey];
+                                  const hasMatchingInnerFile = Boolean(
+                                    q &&
+                                      details?.files?.some((f) =>
+                                        f.path.toLowerCase().includes(q)
+                                      )
+                                  );
+                                  const isDetailsExpanded =
+                                    expandedVersionKeys.has(vKey) || hasMatchingInnerFile;
+                                  const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.pullSuffix}`;
+                                  const uploadedAt = version.created_at
+                                    ? new Date(version.created_at).toLocaleString(
+                                        undefined,
+                                        { hour12: settings.clockFormat === '12h' }
+                                      )
+                                    : '';
+
+                                  return (
+                                    <div key={version.id} className={versionCardClass}>
+                                      <div className="flex flex-wrap items-start justify-between gap-3">
+                                        <div className="space-y-1 min-w-0">
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            <code className="text-xs font-bold text-white font-mono break-all">
+                                              {info.isUntagged
+                                                ? `${pkg.name} (untagged · ${info.shortDigest})`
+                                                : `${pkg.name}:${info.tags.join(', ')}`}
+                                            </code>
+                                            {uploadedAt && (
+                                              <span className="text-[11px] text-gray-500">
+                                                {uploadedAt}
+                                              </span>
+                                            )}
+                                          </div>
+
+                                          <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
+                                            <span className="break-all">{pullCmd}</span>
+                                            <button
+                                              type="button"
+                                              onClick={() => copyToClipboard(pullCmd)}
+                                              className="text-gray-400 hover:text-white cursor-pointer shrink-0"
+                                              title="Copy docker pull command"
+                                            >
+                                              {copiedText === pullCmd ? (
+                                                <Check className="w-3.5 h-3.5 rename-check-icon" />
+                                              ) : (
+                                                <Copy className="w-3.5 h-3.5" />
+                                              )}
+                                            </button>
+                                          </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-2 flex-wrap shrink-0">
+                                          <VersionInspectButton
+                                            details={details}
+                                            isIndexing={indexingKeys.has(vKey)}
+                                            isScanning={inspectingKey === vKey}
+                                            scanProgress={inspectProgress}
+                                            isExpanded={isDetailsExpanded}
+                                            disableLoad={inspectingKey !== null}
+                                            onToggleExpand={() =>
+                                              handleToggleVersionExpand(vKey)
+                                            }
+                                            onLoadFiles={() =>
+                                              handleLoadVersionFiles(
+                                                pkg.name,
+                                                pkg.owner.login,
+                                                version
+                                              )
+                                            }
+                                            onCancelScan={handleCancelInspect}
+                                          />
+
+                                          <button
+                                            type="button"
+                                            disabled={downloadingKey !== null}
+                                            onClick={() =>
+                                              handleDownloadVersion(pkg, version)
+                                            }
+                                            className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
+                                          >
+                                            {downloadingKey === vKey ? (
+                                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                            ) : (
+                                              <Download className="w-3.5 h-3.5" />
+                                            )}
+                                            Download & Extract
+                                          </button>
+
+                                          {downloadingKey === vKey && (
+                                            <button
+                                              type="button"
+                                              onClick={handleCancelDownload}
+                                              className="btn-modal-action px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                                              title="Cancel active download"
+                                            >
+                                              <X className="w-3.5 h-3.5" />
+                                              Cancel
+                                            </button>
+                                          )}
+
+                                          {allowDelete && (
+                                            <button
+                                              type="button"
+                                              disabled={deletingVersionKey === vKey}
+                                              onClick={() => {
+                                                setConfirmDeletePkg(null);
+                                                setConfirmDeleteVersion({
+                                                  pkg,
+                                                  version,
+                                                });
+                                              }}
+                                              className="btn-modal-action p-1.5 rounded-md hover:text-red-400 transition cursor-pointer"
+                                              title="Remove this version from GitHub"
+                                            >
+                                              {deletingVersionKey === vKey ? (
+                                                <Loader2 className="w-4 h-4 animate-spin" />
+                                              ) : (
+                                                <Trash2 className="w-4 h-4" />
+                                              )}
+                                            </button>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      {downloadingKey === vKey && downloadProgress && (
+                                        <div className="space-y-1.5">
+                                          <div className="flex justify-between text-xs text-gray-300">
+                                            <span>{downloadProgress.message}</span>
+                                            <span>{downloadProgress.percent}%</span>
+                                          </div>
+                                          <div className="w-full h-2 bg-[#0d1117] rounded-full overflow-hidden border border-[#30363d]">
+                                            <div
+                                              className="h-full tab-indicator transition-all duration-300"
+                                              style={{
+                                                width: `${downloadProgress.percent}%`,
+                                              }}
+                                            />
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {renderInlineNotice(
+                                        versionNotices[vKey],
+                                        () => dismissVersionNotice(vKey)
+                                      )}
+
+                                      {details && isDetailsExpanded && (
+                                        <VersionFileDetailsPanel
+                                          details={details}
+                                          highlightQuery={q}
+                                          containerBgClass="bg-[#0d1117]"
+                                        />
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      };
+
                       return (
                         <>
                           {/* Search Bar (Searches Package Names, Original Names, and Files Inside Images) */}
@@ -4428,249 +5232,55 @@ export default function App() {
                                             )
                                         );
                                       });
-                                  const settingsUrl = `${pkg.html_url}/settings`;
+                                  return renderRepoPackageCard({
+                                    pkg,
+                                    allVersions,
+                                    displayedVersions,
+                                    q,
+                                    allowDelete: true,
+                                    isIndexCard: false,
+                                  });
+                                })}
+                            </div>
+                          )}
 
-                                  return (
-                                    <div
-                                      key={pkg.id}
-                                      className="p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3"
-                                    >
-                                      <div className="flex flex-wrap items-center justify-between gap-3">
-                                        <div className="flex items-center gap-2 flex-wrap">
-                                          <Package className="w-4 h-4 icon-packages" />
-                                          <span className="text-sm font-bold text-white font-mono">
-                                            {pkg.name}
-                                          </span>
-                                          <span
-                                            className={`text-[10px] px-2 py-0.5 rounded border ${
-                                              pkg.visibility === 'private'
-                                                ? 'status-badge-warning'
-                                                : 'status-badge-valid'
-                                            }`}
-                                          >
-                                            {pkg.visibility === 'private' && (
-                                              <Lock className="w-2.5 h-2.5 inline mr-1" />
-                                            )}
-                                            {pkg.visibility}
-                                          </span>
-                                          <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
-                                            {allVersions.length} version
-                                            {allVersions.length === 1 ? '' : 's'}
-                                          </span>
-                                          <a
-                                            href={settingsUrl}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            title="Open package settings on GitHub (e.g. to change Private/Public visibility)"
-                                            className="text-[11px] text-gray-400 hover:text-white inline-flex items-center gap-1 underline"
-                                          >
-                                            Visibility Settings
-                                            <ExternalLink className="w-3 h-3" />
-                                          </a>
-                                        </div>
-
-                                        <button
-                                          type="button"
-                                          disabled={deletingPkgName === pkg.name}
-                                          onClick={() => {
-                                            setConfirmDeleteVersion(null);
-                                            setConfirmDeletePkg(pkg);
-                                          }}
-                                          className="btn-modal-action px-2.5 py-1 rounded-md text-xs hover:text-red-400 transition cursor-pointer flex items-center gap-1.5"
-                                          title="Remove entire package and all its versions from GitHub"
-                                        >
-                                          {deletingPkgName === pkg.name ? (
-                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                          ) : (
-                                            <Trash2 className="w-3.5 h-3.5" />
-                                          )}
-                                          Remove Package
-                                        </button>
-                                      </div>
-
-                                      {renderInlineNotice(pkgNotices[pkgKey], () =>
-                                        dismissPkgNotice(pkgKey)
-                                      )}
-
-                                      {displayedVersions.length === 0 ? (
-                                  <div className="p-3 rounded-md bg-[#161b22] border border-[#30363d] text-xs text-gray-500">
-                                    No tagged or untagged versions returned for this package.
-                                  </div>
-                                ) : (
-                                  <div className="space-y-2">
-                                    {displayedVersions.map((version) => {
-                                      const vKey = makeVersionStateKey(
-                                        pkg.name,
-                                        version.name
-                                      );
-                                      const info = getVersionReferenceInfo(version);
-                                      const details = inspectedByKey[vKey];
-                                      const hasMatchingInnerFile = Boolean(
-                                        q &&
-                                          details?.files?.some((f) =>
-                                            f.path.toLowerCase().includes(q)
-                                          )
-                                      );
-                                      const isDetailsExpanded =
-                                        expandedVersionKeys.has(vKey) ||
-                                        hasMatchingInnerFile;
-                                      const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.pullSuffix}`;
-                                      const uploadedAt = version.created_at
-                                        ? new Date(version.created_at).toLocaleString(
-                                            undefined,
-                                            { hour12: settings.clockFormat === '12h' }
-                                          )
-                                        : '';
-
-                                      return (
-                                        <div
-                                          key={version.id}
-                                          className="p-3 rounded-md bg-[#161b22] border border-[#30363d] space-y-2.5"
-                                        >
-                                          <div className="flex flex-wrap items-start justify-between gap-3">
-                                            <div className="space-y-1 min-w-0">
-                                              <div className="flex items-center gap-2 flex-wrap">
-                                                <code className="text-xs font-bold text-white font-mono break-all">
-                                                  {info.isUntagged
-                                                    ? `${pkg.name} (untagged · ${info.shortDigest})`
-                                                    : `${pkg.name}:${info.tags.join(', ')}`}
-                                                </code>
-                                                {uploadedAt && (
-                                                  <span className="text-[11px] text-gray-500">
-                                                    {uploadedAt}
-                                                  </span>
-                                                )}
-                                              </div>
-
-                                              <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
-                                                <span className="break-all">
-                                                  {pullCmd}
-                                                </span>
-                                                <button
-                                                  type="button"
-                                                  onClick={() => copyToClipboard(pullCmd)}
-                                                  className="text-gray-400 hover:text-white cursor-pointer shrink-0"
-                                                  title="Copy docker pull command"
-                                                >
-                                                  {copiedText === pullCmd ? (
-                                                    <Check className="w-3.5 h-3.5 rename-check-icon" />
-                                                  ) : (
-                                                    <Copy className="w-3.5 h-3.5" />
-                                                  )}
-                                                </button>
-                                              </div>
-                                            </div>
-
-                                            <div className="flex items-center gap-2 flex-wrap shrink-0">
-                                              <VersionInspectButton
-                                                details={details}
-                                                isIndexing={indexingKeys.has(vKey)}
-                                                isScanning={inspectingKey === vKey}
-                                                scanProgress={inspectProgress}
-                                                isExpanded={isDetailsExpanded}
-                                                disableLoad={inspectingKey !== null}
-                                                onToggleExpand={() =>
-                                                  handleToggleVersionExpand(vKey)
-                                                }
-                                                onLoadFiles={() =>
-                                                  handleLoadVersionFiles(
-                                                    pkg.name,
-                                                    pkg.owner.login,
-                                                    version
-                                                  )
-                                                }
-                                                onCancelScan={handleCancelInspect}
-                                              />
-
-                                              <button
-                                                type="button"
-                                                disabled={downloadingKey !== null}
-                                                onClick={() =>
-                                                  handleDownloadVersion(pkg, version)
-                                                }
-                                                className="px-3 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
-                                              >
-                                                {downloadingKey === vKey ? (
-                                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                                ) : (
-                                                  <Download className="w-3.5 h-3.5" />
-                                                )}
-                                                Download & Extract
-                                              </button>
-
-                                              {downloadingKey === vKey && (
-                                                <button
-                                                  type="button"
-                                                  onClick={handleCancelDownload}
-                                                  className="btn-modal-action px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1 cursor-pointer"
-                                                  title="Cancel active download"
-                                                >
-                                                  <X className="w-3.5 h-3.5" />
-                                                  Cancel
-                                                </button>
-                                              )}
-
-                                              <button
-                                                type="button"
-                                                disabled={deletingVersionKey === vKey}
-                                                onClick={() => {
-                                                  setConfirmDeletePkg(null);
-                                                  setConfirmDeleteVersion({
-                                                    pkg,
-                                                    version,
-                                                  });
-                                                }}
-                                                className="btn-modal-action p-1.5 rounded-md hover:text-red-400 transition cursor-pointer"
-                                                title="Remove this version from GitHub"
-                                              >
-                                                {deletingVersionKey === vKey ? (
-                                                  <Loader2 className="w-4 h-4 animate-spin" />
-                                                ) : (
-                                                  <Trash2 className="w-4 h-4" />
-                                                )}
-                                              </button>
-                                            </div>
-                                          </div>
-
-                                          {downloadingKey === vKey && downloadProgress && (
-                                            <div className="space-y-1.5">
-                                              <div className="flex justify-between text-xs text-gray-300">
-                                                <span>{downloadProgress.message}</span>
-                                                <span>{downloadProgress.percent}%</span>
-                                              </div>
-                                              <div className="w-full h-2 bg-[#0d1117] rounded-full overflow-hidden border border-[#30363d]">
-                                                <div
-                                                  className="h-full tab-indicator transition-all duration-300"
-                                                  style={{
-                                                    width: `${downloadProgress.percent}%`,
-                                                  }}
-                                                />
-                                              </div>
-                                            </div>
-                                          )}
-
-                                          {renderInlineNotice(
-                                            versionNotices[vKey],
-                                            () => dismissVersionNotice(vKey)
-                                          )}
-
-                                          {details && isDetailsExpanded && (
-                                            <VersionFileDetailsPanel
-                                              details={details}
-                                              highlightQuery={q}
-                                              containerBgClass="bg-[#0d1117]"
-                                            />
-                                          )}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                )}
+                          {!packagesLoading && (repoIndexPkg || repoIndexNotice || repoIndexUpdating) && (
+                            <div className="border-t border-[#30363d] pt-5 mt-5 space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-400">
+                                <span className="font-semibold flex items-center gap-1.5">
+                                  <Layers className="w-3.5 h-3.5" />
+                                  Repository File Index
+                                </span>
+                                <span className="text-[11px]">
+                                  {repoIndexUpdating
+                                    ? 'Updating index...'
+                                    : `Keeps latest ${REPO_INDEX_KEEP_VERSIONS} timestamped checkpoints (delete disabled in app)`}
+                                </span>
                               </div>
-                            );
-                          })}
-                      </div>
-                    )}
+
+                              {repoIndexNotice &&
+                                renderInlineNotice(repoIndexNotice, () =>
+                                  setRepoIndexNotice(null)
+                                )}
+
+                              {repoIndexPkg &&
+                                (() => {
+                                  const sortedIndexVersions =
+                                    sortPackageVersionsNewestFirst(repoIndexVersions);
+                                  return renderRepoPackageCard({
+                                    pkg: repoIndexPkg,
+                                    allVersions: sortedIndexVersions,
+                                    displayedVersions: sortedIndexVersions,
+                                    q: '',
+                                    allowDelete: false,
+                                    isIndexCard: true,
+                                    displayTitleOverride: getRepoIndexDisplayTitle(
+                                      selectedRepo.name
+                                    ),
+                                  });
+                                })()}
+                            </div>
+                          )}
                         </>
                       );
                     })()}
