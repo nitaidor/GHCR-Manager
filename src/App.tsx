@@ -487,6 +487,7 @@ export default function App() {
   const repoIndexWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [repoIndexUpdating, setRepoIndexUpdating] = useState<boolean>(false);
   const [repoIndexNotice, setRepoIndexNotice] = useState<InlineNotice | null>(null);
+  const [isRepoIndexExpanded, setIsRepoIndexExpanded] = useState<boolean>(false);
 
   const [deletedPkgTombstones, setDeletedPkgTombstones] = useState<
     Record<
@@ -663,6 +664,7 @@ export default function App() {
     setRepoIndexVersions([]);
     setRepoIndexEntries({});
     setRepoIndexNotice(null);
+    setIsRepoIndexExpanded(false);
     repoIndexLoadedForRepoIdRef.current = null;
     repoIndexLoadPromiseRef.current = null;
   }
@@ -780,6 +782,7 @@ export default function App() {
       setRepoIndexVersions([]);
       setRepoIndexEntries({});
       setRepoIndexNotice(null);
+      setIsRepoIndexExpanded(false);
       repoIndexLoadedForRepoIdRef.current = null;
       repoIndexLoadPromiseRef.current = null;
       localStorage.setItem(STORAGE_REPO_KEY, String(selectedRepo.id));
@@ -790,6 +793,7 @@ export default function App() {
   useEffect(() => {
     if (activeTab === 'packages' && selectedRepo && authToken && user) {
       setExpandedVersionKeys(new Set());
+      setIsRepoIndexExpanded(false);
       refreshPackages({ clearTransientNotices: true });
     }
   }, [activeTab]);
@@ -4827,16 +4831,22 @@ export default function App() {
                         displayedVersions,
                         q,
                         allowDelete,
+                        allowInspect = true,
+                        showVersionCount = true,
                         isIndexCard = false,
                         displayTitleOverride,
+                        headerMetaNote,
                       }: {
                         pkg: GitHubPackageItem;
                         allVersions: GitHubPackageVersion[];
                         displayedVersions: GitHubPackageVersion[];
                         q: string;
                         allowDelete: boolean;
+                        allowInspect?: boolean;
+                        showVersionCount?: boolean;
                         isIndexCard?: boolean;
                         displayTitleOverride?: string;
+                        headerMetaNote?: string;
                       }) => {
                         const pkgKey = pkg.name.toLowerCase();
                         const settingsUrl = `${pkg.html_url}/settings`;
@@ -4878,10 +4888,12 @@ export default function App() {
                                   )}
                                   {pkg.visibility}
                                 </span>
-                                <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
-                                  {allVersions.length} version
-                                  {allVersions.length === 1 ? '' : 's'}
-                                </span>
+                                {showVersionCount && (
+                                  <span className="text-[10px] px-2 py-0.5 rounded border border-[#30363d] bg-[#161b22] text-gray-300 font-medium">
+                                    {allVersions.length} version
+                                    {allVersions.length === 1 ? '' : 's'}
+                                  </span>
+                                )}
                                 <a
                                   href={settingsUrl}
                                   target="_blank"
@@ -4892,6 +4904,11 @@ export default function App() {
                                   Visibility Settings
                                   <ExternalLink className="w-3 h-3" />
                                 </a>
+                                {headerMetaNote && (
+                                  <span className="text-[11px] text-gray-400">
+                                    {headerMetaNote}
+                                  </span>
+                                )}
                               </div>
 
                               {allowDelete && (
@@ -4980,25 +4997,27 @@ export default function App() {
                                         </div>
 
                                         <div className="flex items-center gap-2 flex-wrap shrink-0">
-                                          <VersionInspectButton
-                                            details={details}
-                                            isIndexing={indexingKeys.has(vKey)}
-                                            isScanning={inspectingKey === vKey}
-                                            scanProgress={inspectProgress}
-                                            isExpanded={isDetailsExpanded}
-                                            disableLoad={inspectingKey !== null}
-                                            onToggleExpand={() =>
-                                              handleToggleVersionExpand(vKey)
-                                            }
-                                            onLoadFiles={() =>
-                                              handleLoadVersionFiles(
-                                                pkg.name,
-                                                pkg.owner.login,
-                                                version
-                                              )
-                                            }
-                                            onCancelScan={handleCancelInspect}
-                                          />
+                                          {allowInspect && (
+                                            <VersionInspectButton
+                                              details={details}
+                                              isIndexing={indexingKeys.has(vKey)}
+                                              isScanning={inspectingKey === vKey}
+                                              scanProgress={inspectProgress}
+                                              isExpanded={isDetailsExpanded}
+                                              disableLoad={inspectingKey !== null}
+                                              onToggleExpand={() =>
+                                                handleToggleVersionExpand(vKey)
+                                              }
+                                              onLoadFiles={() =>
+                                                handleLoadVersionFiles(
+                                                  pkg.name,
+                                                  pkg.owner.login,
+                                                  version
+                                                )
+                                              }
+                                              onCancelScan={handleCancelInspect}
+                                            />
+                                          )}
 
                                           <button
                                             type="button"
@@ -5074,7 +5093,7 @@ export default function App() {
                                         () => dismissVersionNotice(vKey)
                                       )}
 
-                                      {details && isDetailsExpanded && (
+                                      {allowInspect && details && isDetailsExpanded && (
                                         <VersionFileDetailsPanel
                                           details={details}
                                           highlightQuery={q}
@@ -5246,24 +5265,38 @@ export default function App() {
 
                           {!packagesLoading && (repoIndexPkg || repoIndexNotice || repoIndexUpdating) && (
                             <div className="border-t border-[#30363d] pt-5 mt-5 space-y-3">
-                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-400">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setIsRepoIndexExpanded((prev) => !prev)
+                                }
+                                aria-expanded={isRepoIndexExpanded}
+                                className="w-full flex flex-wrap items-center justify-between gap-2 py-1 px-1.5 -mx-1.5 rounded-md text-xs text-gray-400 hover:text-white hover:bg-[#21262d] transition cursor-pointer"
+                              >
                                 <span className="font-semibold flex items-center gap-1.5">
-                                  <Layers className="w-3.5 h-3.5" />
+                                  {isRepoIndexExpanded ? (
+                                    <ChevronDown className="w-3.5 h-3.5 shrink-0" />
+                                  ) : (
+                                    <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+                                  )}
+                                  <Layers className="w-3.5 h-3.5 shrink-0" />
                                   Repository File Index
                                 </span>
-                                <span className="text-[11px]">
-                                  {repoIndexUpdating
-                                    ? 'Updating index...'
-                                    : `Keeps latest ${REPO_INDEX_KEEP_VERSIONS} timestamped checkpoints (delete disabled in app)`}
-                                </span>
-                              </div>
+                                {repoIndexUpdating && (
+                                  <span className="text-[11px] flex items-center gap-1.5">
+                                    <Loader2 className="w-3 h-3 animate-spin theme-spinner" />
+                                    Updating index...
+                                  </span>
+                                )}
+                              </button>
 
                               {repoIndexNotice &&
                                 renderInlineNotice(repoIndexNotice, () =>
                                   setRepoIndexNotice(null)
                                 )}
 
-                              {repoIndexPkg &&
+                              {isRepoIndexExpanded &&
+                                repoIndexPkg &&
                                 (() => {
                                   const sortedIndexVersions =
                                     sortPackageVersionsNewestFirst(repoIndexVersions);
@@ -5273,10 +5306,13 @@ export default function App() {
                                     displayedVersions: sortedIndexVersions,
                                     q: '',
                                     allowDelete: false,
+                                    allowInspect: false,
+                                    showVersionCount: false,
                                     isIndexCard: true,
                                     displayTitleOverride: getRepoIndexDisplayTitle(
                                       selectedRepo.name
                                     ),
+                                    headerMetaNote: `Keeps latest ${REPO_INDEX_KEEP_VERSIONS} timestamped checkpoints`,
                                   });
                                 })()}
                             </div>
