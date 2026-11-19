@@ -13,7 +13,7 @@ Pushing compiled binaries, build outputs, configs, or project folders to GitHub 
 * **Multi-Device Shared Index & Safe Locking:** Syncs package file lists across devices inside a shared compressed OCI repository index image (`GHCR Manager Index`, keeping the newest 5 checkpoints) held in RAM with no persistent local path cache, and uses atomic per-package and index Git-ref locks to prevent concurrent overwrites across PCs.
 * **Zero-Docker Architecture:** Generates POSIX USTAR/PAX `.tar.gz` layers, SHA-256 digests, and OCI manifests without Docker, using disk-streaming and chunked OCI uploads/extractions on Desktop for multi-GB packages (up to GHCR's 10 GB layer limit).
 * **Saved Credentials Manager:** Supports GitHub Personal Access Tokens and OAuth Device Flow, automatically saving credentials under your username with masked suffixes (`ghp_••••xxxx` / `Ov23••••xxxx`), inline renaming, and one-click sign-in.
-* **Target Repository, Timestamp Tags & 5 Themes:** Switch target repositories inside **Application Settings** (displayed in the header `<username> (<reponame>)` badge), customize `12h`/`24h` and date-format live timestamp tags, and choose from Dark, Light, Green on Black, Red on Black, or Monochrome themes.
+* **Target Repository, Timestamp Tags & 5 Themes:** Switch target repositories, customize hour and date format live timestamp tags, and choose from Dark, Light, Green on Black, Red on Black, or Monochrome themes.
 
 ## Live Demo
 Run GHCR Manager directly in your browser: [nitaidor.github.io/GHCR-Manager](https://nitaidor.github.io/GHCR-Manager/)
