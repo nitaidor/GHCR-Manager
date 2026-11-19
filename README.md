@@ -9,10 +9,11 @@ Pushing compiled binaries, build outputs, configs, or project folders to GitHub 
 
 * **File, Folder & Artifact Builder:** Package a single file/folder or bundle multiple items into one OCI image, inspect nested folder trees, check existing versions live on GitHub, and tag with live timestamps or replace older versions.
 * **Desktop Root Folder Auto-Sync:** Choose a root directory on Windows, Linux, or macOS, select specific files or sub-folders, preview nested contents, and review tags, conflicts, and replacements before pushing, turning direct files into separate packages and immediate sub-folders into bundled packages.
-* **Package Explorer & Extractor:** Browse packages across all tagged and untagged versions, inspect nested file trees, search package names/tags/files, extract contents to disk (Desktop) or file / `.zip` (Mobile & local web dev), and remove individual versions or whole packages.
+* **Package Explorer & Extractor:** Browse packages across all tagged and untagged versions, inspect nested file trees (loading unindexed image headers on demand), search package names/tags/files, extract contents into `<package>` folders on Desktop (with rename/replace prompts if a folder exists) or file / `.zip` (Mobile & local web dev), and remove individual versions or whole packages.
+* **Multi-Device Shared Index & Safe Locking:** Syncs package file lists across devices inside a shared compressed OCI repository index image (`GHCR Manager Index`, keeping the newest 5 checkpoints) held in RAM with no persistent local path cache, and uses atomic per-package and index Git-ref locks to prevent concurrent overwrites across PCs.
 * **Zero-Docker Architecture:** Generates POSIX USTAR/PAX `.tar.gz` layers, SHA-256 digests, and OCI manifests without Docker, using disk-streaming and chunked OCI uploads/extractions on Desktop for multi-GB packages (up to GHCR's 10 GB layer limit).
 * **Saved Credentials Manager:** Supports GitHub Personal Access Tokens and OAuth Device Flow, automatically saving credentials under your username with masked suffixes (`ghp_••••xxxx` / `Ov23••••xxxx`), inline renaming, and one-click sign-in.
-* **Configurable Timestamp Tags & 5 Themes:** Live timestamp tags with `12h`/`24h` and date-format settings, plus Dark, Light, Green on Black, Red on Black, and Monochrome themes.
+* **Target Repository, Timestamp Tags & 5 Themes:** Switch target repositories inside **Application Settings** (displayed in the header `<username> (<reponame>)` badge), customize `12h`/`24h` and date-format live timestamp tags, and choose from Dark, Light, Green on Black, Red on Black, or Monochrome themes.
 
 ## Live Demo
 Run GHCR Manager directly in your browser: [nitaidor.github.io/GHCR-Manager](https://nitaidor.github.io/GHCR-Manager/)

@@ -61,7 +61,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                     Personal Access Token (PAT)
                   </h4>
                   <p className="text-sm text-gray-300">
-                    Sign in immediately using a classic GitHub Personal Access Token (<code>ghp_...</code>) with read/write repository access (<code>repo</code>) and package scopes (<code>write:packages</code>, <code>read:packages</code>, and <code>delete:packages</code>). Repositories must have at least 1 commit to be selected.
+                    Sign in immediately using a classic GitHub Personal Access Token (<code>ghp_...</code>) with read/write repository access (<code>repo</code>) and package scopes (<code>write:packages</code>, <code>read:packages</code>, and <code>delete:packages</code>), or a fine-grained PAT with <code>Contents: Read and write</code> and <code>Packages: Read and write</code>. Repositories must have at least 1 commit to be selected.
                   </p>
                 </div>
                 <div className="border-t border-[#30363d] pt-4">
@@ -99,7 +99,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               <Upload className="w-5 h-5 icon-upload" /> 2. Upload Files Tab (Naming, Tags &amp; Version Replace)
             </h2>
             <p className="text-sm text-gray-400 mb-4">
-              Available on Windows, Linux, macOS, Android, and iOS (multi-GB packages require the Desktop app). Select a target repository, choose or drag-and-drop files or folders (expandable to preview nested contents), review the package name, and click <strong>Create Image</strong>:
+              Available on Windows, Linux, macOS, Android, and iOS (multi-GB packages require the Desktop app). Confirm your target repository in <strong>App Settings</strong> (shown in the top badge as <code>&lt;username&gt; (&lt;reponame&gt;)</code>), choose or drag-and-drop files or folders (expandable to preview nested contents), review the package name, and click <strong>Create Image</strong>:
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -125,6 +125,9 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               </li>
               <li>
                 <strong>Live Timestamp Tag:</strong> The version tag defaults to a live-ticking timestamp (using your <strong>App Settings</strong> format) until manually edited. Choosing a tag already used by an unselected version is blocked unless you replace that version or pick another tag. Selected items clear automatically after upload.
+              </li>
+              <li>
+                <strong>Cancel &amp; Multi-PC Coordination:</strong> Click <strong>Cancel</strong> at any time while an upload is running. If another PC is actively uploading or deleting the same package, your upload waits until it finishes and refreshes the version list if changes occurred.
               </li>
             </ul>
           </section>
@@ -156,7 +159,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               </div>
             </div>
             <p className="text-xs text-gray-400 mt-4 bg-[#0d1117] p-3.5 rounded border border-[#30363d]">
-              In the review popup, set a shared <strong>Batch Tag</strong> (or override tags per item), inspect any existing GitHub versions, and choose <strong>New image</strong>, <strong>Replace</strong> (requires <code>delete:packages</code>), or <strong>Skip</strong> for each item before syncing.
+              In the review popup, set a shared <strong>Batch Tag</strong> (or override tags per item), inspect any existing GitHub versions, and choose <strong>New image</strong>, <strong>Replace</strong> (requires <code>delete:packages</code>), or <strong>Skip</strong> for each item before syncing. Active syncs can be cancelled mid-batch while keeping completed items uploaded and indexed.
             </p>
           </section>
 
@@ -170,10 +173,10 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                 <strong>Automatic Repository Linking:</strong> Uploaded images include <code>org.opencontainers.image.source</code> labels and annotations so GitHub automatically links them to the selected repository.
               </li>
               <li>
-                <strong>Shared Repo Index, Folder Trees &amp; Search:</strong> Switching to <strong>Repo Packages</strong> or clicking <strong>Refresh</strong> loads your repository&apos;s compressed <code>GHCR Manager Index</code> image into RAM (keeping the newest 5 checkpoints) so file lists and inner-folder search work immediately without storing path caches on your device. Any unindexed image loads on demand when you click <strong>Load Files</strong> (streaming only archive headers) and is added to the index afterward.
+                <strong>Shared Repo Index, Folder Trees &amp; Search:</strong> Switching to <strong>Repo Packages</strong> or clicking <strong>Refresh</strong> loads your repository&apos;s compressed <code>GHCR Manager Index</code> image into RAM (keeping the newest 5 checkpoints) so file lists and inner-folder search work immediately without storing path caches on your device. Any unindexed image loads on demand when you click <strong>Load Files</strong> (streaming only archive headers) and syncs into the shared index across devices automatically.
               </li>
               <li>
-                <strong>Download &amp; Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts files directly to a destination folder on Desktop (supporting multi-GB images), or downloads the file / <code>.zip</code> bundle on Web and Mobile.
+                <strong>Download &amp; Extract:</strong> Pulls any selected version&apos;s <code>.tar.gz</code> OCI layer from <code>ghcr.io</code> and extracts files into a named <code>&lt;package&gt;</code> folder on Desktop (supporting multi-GB images, mid-transfer <strong>Cancel</strong>, and a <strong>Save as &quot;&lt;name&gt; (1)&quot; / Replace Existing / Cancel</strong> prompt if the folder already exists), or downloads the file / <code>.zip</code> bundle on Web and Mobile.
               </li>
               <li>
                 <strong>Confirmed Deletion:</strong> Removing a single version or an entire package opens a confirmation popup before permanently deleting it on GitHub (requires <code>delete:packages</code>).
@@ -186,22 +189,32 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
             <h2 className="text-xl font-semibold mb-4 flex items-center gap-2 header-logo">
               <Settings className="w-5 h-5 header-logo" /> 5. Application Settings
             </h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-6">
               <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
                 <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-                  Appearance &amp; 5 Themes
+                  Target Repository
                 </h4>
                 <p className="text-sm text-gray-300">
-                  Switch between Dark and Light mode and pick from five color schemes: <strong>Default Dark</strong>, <strong>Green on Black</strong>, <strong>Red on Black</strong>, <strong>Default Light</strong>, and <strong>Black on White (Monochrome)</strong>.
+                  Switch your active repository when signed in, filter repositories by name, refresh your repository list, or open <strong>View Packages on GitHub</strong>. The active repository is shown in the header badge, and only repositories with read/write access and at least 1 commit can be selected.
                 </p>
               </div>
-              <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
-                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-                  Default Timestamp Tags
-                </h4>
-                <p className="text-sm text-gray-300">
-                  Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This affects only new uploads; existing tags on GitHub remain unchanged.
-                </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
+                  <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                    Appearance &amp; 5 Themes
+                  </h4>
+                  <p className="text-sm text-gray-300">
+                    Switch between Dark and Light mode and pick from five color schemes: <strong>Default Dark</strong>, <strong>Green on Black</strong>, <strong>Red on Black</strong>, <strong>Default Light</strong>, and <strong>Black on White (Monochrome)</strong>.
+                  </p>
+                </div>
+                <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
+                  <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                    Default Timestamp Tags
+                  </h4>
+                  <p className="text-sm text-gray-300">
+                    Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This affects only new uploads; existing tags on GitHub remain unchanged.
+                  </p>
+                </div>
               </div>
             </div>
           </section>
