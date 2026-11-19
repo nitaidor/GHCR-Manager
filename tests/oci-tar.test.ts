@@ -7,13 +7,22 @@ import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import {
   formatTimestampTag,
+  formatUniqueRepoIndexTag,
+  getPackageLockKey,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
   isRepoIndexPackageName,
+  toGitRefSafeLockSegment,
   toOciImageName,
   validateFilesSelectionName,
   validateOciTag,
 } from '../src/lib/naming.ts';
+import {
+  acquireRepoIndexLock,
+  acquireRepoLock,
+  acquireRepoPackageLocks,
+  type HttpRequestFn,
+} from '../src/lib/repo-lock.ts';
 import {
   buildOciLayerFromFiles,
   createZipFromExtractedFiles,
@@ -370,6 +379,273 @@ async function runTests() {
     ];
     const scaleSummary = summarizeArchiveEntries(scaleEntries);
     assert.deepEqual(scaleSummary, { regularFileCount: 5000, emptyFolderCount: 1 });
+
+    console.log('10. Testing collision-free index tags, bijective Git ref keys & atomic Repo Lock CAS...');
+    const sameSecDate = new Date(2026, 10, 19, 22, 30, 5, 412);
+    const baseSecTag = formatTimestampTag(sameSecDate, '24h', 'YYYY-MM-DD');
+    assert.equal(baseSecTag, '2026-11-19_22.30.05');
+    assert.equal(
+      formatUniqueRepoIndexTag(sameSecDate, '24h', 'YYYY-MM-DD', []),
+      '2026-11-19_22.30.05'
+    );
+    const secondSameSecTag = formatUniqueRepoIndexTag(sameSecDate, '24h', 'YYYY-MM-DD', [
+      baseSecTag,
+    ]);
+    assert.equal(secondSameSecTag, '2026-11-19_22.30.05.412');
+    assert.equal(validateOciTag(secondSameSecTag).valid, true);
+    const thirdSameSecTag = formatUniqueRepoIndexTag(sameSecDate, '24h', 'YYYY-MM-DD', [
+      baseSecTag,
+      secondSameSecTag,
+    ]);
+    assert.equal(thirdSameSecTag, '2026-11-19_22.30.05.412-2');
+
+    // Bijective Git ref key encoding: no collisions and no `.lock` / `..` / `/`
+    assert.notEqual(getPackageLockKey('foo.bar'), getPackageLockKey('foo_2e_bar'));
+    assert.equal(getPackageLockKey('foo.lock').endsWith('.lock'), false);
+    assert.equal(getPackageLockKey('a..b').includes('..'), false);
+    assert.match(toGitRefSafeLockSegment('Hello.World_2026'), /^[a-z0-9_-]+$/);
+
+    // Stateful in-memory GitHub Git Refs server simulating CAS fast-forward & server clock
+    let mockServerNowMs = 1_795_000_000_000;
+    let objSeq = 0;
+    const commits = new Map<
+      string,
+      { sha: string; message: string; treeSha: string; parents: string[]; committerDate: string }
+    >();
+    const refs = new Map<string, string>();
+
+    const isAncestorCommit = (ancestorSha: string, descendantSha: string): boolean => {
+      let cur: string | undefined = descendantSha;
+      const visited = new Set<string>();
+      while (cur && !visited.has(cur)) {
+        if (cur === ancestorSha) return true;
+        visited.add(cur);
+        cur = commits.get(cur)?.parents[0];
+      }
+      return false;
+    };
+
+    const jsonRes = (status: number, data: unknown): { status: number; headers: Record<string, string>; body: Uint8Array } => ({
+      status,
+      headers: {
+        'content-type': 'application/json',
+        date: new Date(mockServerNowMs).toUTCString(),
+      },
+      body: new TextEncoder().encode(JSON.stringify(data)),
+    });
+
+    const mockGitHubHttp: HttpRequestFn = async (req) => {
+      const url = new URL(req.url);
+      const method = req.method || 'GET';
+      const pathName = url.pathname;
+      const parsedBody = req.body
+        ? JSON.parse(typeof req.body === 'string' ? req.body : new TextDecoder().decode(req.body))
+        : null;
+
+      if (pathName === '/repos/alice/empty-repo/git/trees' || pathName.startsWith('/repos/alice/empty-repo/git/ref')) {
+        return jsonRes(409, { message: 'Git Repository is empty.' });
+      }
+      if (method === 'POST' && pathName === '/repos/alice/demo/git/trees') {
+        return jsonRes(201, { sha: `tree-${++objSeq}` });
+      }
+      if (method === 'POST' && pathName === '/repos/alice/demo/git/commits') {
+        const sha = `commit-${++objSeq}`;
+        commits.set(sha, {
+          sha,
+          message: parsedBody.message,
+          treeSha: parsedBody.tree,
+          parents: parsedBody.parents || [],
+          committerDate: new Date(mockServerNowMs).toISOString(),
+        });
+        return jsonRes(201, { sha });
+      }
+      if (method === 'GET' && pathName.startsWith('/repos/alice/demo/git/commits/')) {
+        const sha = decodeURIComponent(pathName.split('/').pop() || '');
+        const c = commits.get(sha);
+        if (!c) return jsonRes(404, { message: 'Not Found' });
+        return jsonRes(200, {
+          sha: c.sha,
+          message: c.message,
+          tree: { sha: c.treeSha },
+          committer: { date: c.committerDate },
+        });
+      }
+      if (method === 'GET' && pathName.startsWith('/repos/alice/demo/git/ref/')) {
+        const refName = `refs/${pathName.slice('/repos/alice/demo/git/ref/'.length)}`;
+        const sha = refs.get(refName);
+        if (!sha) return jsonRes(404, { message: 'Not Found' });
+        return jsonRes(200, { ref: refName, object: { sha, type: 'commit' } });
+      }
+      if (method === 'POST' && pathName === '/repos/alice/demo/git/refs') {
+        if (refs.has(parsedBody.ref)) {
+          return jsonRes(422, { message: 'Reference already exists' });
+        }
+        refs.set(parsedBody.ref, parsedBody.sha);
+        return jsonRes(201, { ref: parsedBody.ref, object: { sha: parsedBody.sha } });
+      }
+      if (method === 'PATCH' && pathName.startsWith('/repos/alice/demo/git/refs/')) {
+        const refName = `refs/${pathName.slice('/repos/alice/demo/git/refs/'.length)}`;
+        const currentSha = refs.get(refName);
+        if (!currentSha) return jsonRes(404, { message: 'Not Found' });
+        const nextSha = parsedBody.sha as string;
+        if (!parsedBody.force && !isAncestorCommit(currentSha, nextSha)) {
+          return jsonRes(422, { message: 'Update is not a fast forward' });
+        }
+        refs.set(refName, nextSha);
+        return jsonRes(200, { ref: refName, object: { sha: nextSha } });
+      }
+      return jsonRes(404, { message: 'Unhandled mock route' });
+    };
+
+    const demoRepo = {
+      id: 42,
+      name: 'demo',
+      full_name: 'alice/demo',
+      owner: { login: 'alice' },
+    };
+
+    // (a) Simultaneous race between PC1 and PC2 on same package
+    let activeHolders = 0;
+    let maxConcurrentHolders = 0;
+    let pc2WaitCalls = 0;
+    const p1 = acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: getPackageLockKey('shared-pkg'),
+      packageName: 'shared-pkg',
+      operation: 'upload',
+      sessionId: 'pc-1',
+      pollIntervalMs: 30,
+      heartbeatIntervalMs: 5_000,
+      leaseTtlMs: 10_000,
+      httpRequest: mockGitHubHttp,
+    }).then(async (lock) => {
+      activeHolders += 1;
+      maxConcurrentHolders = Math.max(maxConcurrentHolders, activeHolders);
+      await new Promise((r) => setTimeout(r, 200));
+      activeHolders -= 1;
+      await lock.release();
+      return lock;
+    });
+
+    const p2 = acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: getPackageLockKey('shared-pkg'),
+      packageName: 'shared-pkg',
+      operation: 'upload',
+      sessionId: 'pc-2',
+      pollIntervalMs: 30,
+      heartbeatIntervalMs: 5_000,
+      leaseTtlMs: 10_000,
+      onWaiting: () => {
+        pc2WaitCalls += 1;
+      },
+      httpRequest: mockGitHubHttp,
+    }).then(async (lock) => {
+      activeHolders += 1;
+      maxConcurrentHolders = Math.max(maxConcurrentHolders, activeHolders);
+      await new Promise((r) => setTimeout(r, 120));
+      activeHolders -= 1;
+      await lock.release();
+      return lock;
+    });
+
+    const [lock1Res, lock2Res] = await Promise.all([p1, p2]);
+    assert.equal(maxConcurrentHolders, 1);
+    assert.equal(lock1Res.hadToWait || lock2Res.hadToWait, true);
+    assert.ok(pc2WaitCalls >= 1 || lock1Res.hadToWait);
+
+    // (b) Crashed lease expiry + server-clock immunity + late stale release rejection
+    const pc1CrashLock = await acquireRepoIndexLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      pollIntervalMs: 25,
+      heartbeatIntervalMs: 60_000,
+      leaseTtlMs: 5_000,
+      httpRequest: mockGitHubHttp,
+    });
+    // Advance GitHub server clock past the 5s lease TTL
+    mockServerNowMs += 6_500;
+    let leaseLostFired = false;
+    const pc2Takeover = await acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: 'index',
+      operation: 'index',
+      sessionId: 'pc-2-takeover',
+      pollIntervalMs: 25,
+      heartbeatIntervalMs: 60_000,
+      leaseTtlMs: 5_000,
+      onLeaseLost: () => {
+        leaseLostFired = true;
+      },
+      httpRequest: mockGitHubHttp,
+    });
+    assert.equal(leaseLostFired, false);
+    // Old crashed PC wakes up late and tries to release; CAS 422 must reject it
+    const activeTakeoverSha = refs.get('refs/ghcr-manager/locks/index');
+    await pc1CrashLock.release();
+    assert.equal(refs.get('refs/ghcr-manager/locks/index'), activeTakeoverSha);
+    await pc2Takeover.release();
+
+    // (c) Multi-package canonical lock ordering ([zeta, alpha] vs [alpha, zeta]) without deadlock
+    const [bundleA, bundleB] = await Promise.all([
+      acquireRepoPackageLocks({
+        repo: demoRepo,
+        githubToken: 'tok',
+        ownerLogin: 'alice',
+        packageNames: ['zeta-pkg', 'alpha-pkg'],
+        operation: 'sync',
+        sessionId: 'sync-a',
+        pollIntervalMs: 25,
+        httpRequest: mockGitHubHttp,
+      }).then(async (b) => {
+        assert.equal(b.locks[0].packageName, 'alpha-pkg');
+        assert.equal(b.locks[1].packageName, 'zeta-pkg');
+        await new Promise((r) => setTimeout(r, 40));
+        await b.releaseAll();
+        return b;
+      }),
+      acquireRepoPackageLocks({
+        repo: demoRepo,
+        githubToken: 'tok',
+        ownerLogin: 'alice',
+        packageNames: ['alpha-pkg', 'zeta-pkg'],
+        operation: 'sync',
+        sessionId: 'sync-b',
+        pollIntervalMs: 25,
+        httpRequest: mockGitHubHttp,
+      }).then(async (b) => {
+        await b.releaseAll();
+        return b;
+      }),
+    ]);
+    assert.equal(bundleA.locks.length, 2);
+    assert.equal(bundleB.locks.length, 2);
+
+    // (d) Empty 0-commit repo fails fast with explicit message
+    await assert.rejects(
+      () =>
+        acquireRepoLock({
+          repo: {
+            id: 99,
+            name: 'empty-repo',
+            full_name: 'alice/empty-repo',
+            owner: { login: 'alice' },
+          },
+          githubToken: 'tok',
+          ownerLogin: 'alice',
+          lockKey: getPackageLockKey('test'),
+          operation: 'upload',
+          httpRequest: mockGitHubHttp,
+        }),
+      /empty \(0-commit\) repositories/i
+    );
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }

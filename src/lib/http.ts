@@ -197,11 +197,30 @@ export async function crossPlatformHttpRequest(opts: {
       : opts.body;
 
   if (window.electronAPI?.httpRequest) {
-    return await window.electronAPI.httpRequest({
+    const reqPromise = window.electronAPI.httpRequest({
       url: opts.url,
       method: opts.method || 'GET',
       headers: opts.headers,
       body: bodyBytes,
+    });
+    if (!opts.signal) {
+      return await reqPromise;
+    }
+    return await new Promise<HttpResponseData>((resolve, reject) => {
+      const onAbort = () => {
+        reject(new DOMException('Operation aborted', 'AbortError'));
+      };
+      opts.signal!.addEventListener('abort', onAbort, { once: true });
+      reqPromise.then(
+        (res) => {
+          opts.signal!.removeEventListener('abort', onAbort);
+          resolve(res);
+        },
+        (err) => {
+          opts.signal!.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      );
     });
   }
 
@@ -217,6 +236,7 @@ export async function crossPlatformHttpRequest(opts: {
 
       const proxyRes = await fetch('/__oci_proxy', {
         method: opts.method || 'GET',
+        cache: 'no-store',
         headers: {
           'x-target-url': opts.url,
           'x-forward-headers': JSON.stringify(opts.headers || {}),
@@ -255,6 +275,7 @@ export async function crossPlatformHttpRequest(opts: {
 
   const res = await fetch(opts.url, {
     method: opts.method || 'GET',
+    cache: 'no-store',
     headers: opts.headers,
     body:
       opts.method && opts.method !== 'GET' && opts.method !== 'HEAD' && directCopy

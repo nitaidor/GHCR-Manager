@@ -8,7 +8,7 @@ import {
   Info,
   LogOut,
 } from 'lucide-react';
-import type { GitHubUser } from '../lib/github-oci';
+import type { GitHubRepo, GitHubUser } from '../lib/github-oci';
 import type { ClockFormat, DateFormat } from '../lib/naming';
 
 export interface AppSettings {
@@ -22,6 +22,8 @@ interface HeaderProps {
   isDarkMode: boolean;
   settings: AppSettings;
   user: GitHubUser | null;
+  selectedRepo: GitHubRepo | null;
+  reposLoading?: boolean;
   authLoading: boolean;
   showMenu: boolean;
   setShowMenu: (val: boolean) => void;
@@ -35,6 +37,8 @@ export const Header: React.FC<HeaderProps> = ({
   isDarkMode,
   settings,
   user,
+  selectedRepo,
+  reposLoading,
   authLoading,
   showMenu,
   setShowMenu,
@@ -74,9 +78,16 @@ export const Header: React.FC<HeaderProps> = ({
         </span>
       );
     }
+    const badgeLabel = selectedRepo
+      ? `${user.login} (${selectedRepo.name})`
+      : reposLoading
+      ? `${user.login} (loading...)`
+      : `${user.login} (no repo)`;
+
     return (
-      <span className="px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-wider rounded border flex items-center gap-1.5 status-badge-valid shadow-sm leading-none w-fit mb-[2px]">
-        <CheckCircle2 className="w-3 h-3" /> {user.login} (ghcr.io)
+      <span className="px-2.5 py-0.5 text-[11px] font-bold tracking-wider rounded border flex items-center gap-1.5 status-badge-valid shadow-sm leading-none w-fit mb-[2px] max-w-full">
+        <CheckCircle2 className="w-3 h-3 shrink-0" />
+        <span className="truncate">{badgeLabel}</span>
       </span>
     );
   };

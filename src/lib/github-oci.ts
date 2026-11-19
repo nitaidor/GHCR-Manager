@@ -1,4 +1,9 @@
-import { crossPlatformHttpRequest, decodeJson, decodeText } from './http';
+import {
+  crossPlatformHttpRequest,
+  decodeJson,
+  decodeText,
+  mapWithConcurrency,
+} from './http';
 import {
   buildOciLayerFromFiles,
   extractFileMetaListStreaming,
@@ -9,7 +14,7 @@ import {
   type TarInputFile,
 } from './tar';
 import {
-  formatTimestampTag,
+  formatUniqueRepoIndexTag,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
   REPO_INDEX_KEEP_VERSIONS,
@@ -36,6 +41,16 @@ export interface GitHubRepo {
   html_url: string;
   description: string | null;
   updated_at: string;
+  pushed_at?: string | null;
+  size?: number;
+  hasCommits?: boolean;
+  permissions?: {
+    admin?: boolean;
+    maintain?: boolean;
+    push?: boolean;
+    triage?: boolean;
+    pull?: boolean;
+  };
   owner: {
     login: string;
     avatar_url: string;
@@ -313,8 +328,36 @@ export async function pollGitHubDeviceFlowToken(
   throw new Error(data.error_description || data.error || 'Device flow authorization failed');
 }
 
+async function checkRepoHasCommits(
+  token: string,
+  repo: GitHubRepo
+): Promise<boolean> {
+  // Fast path: non-zero repo size with a push timestamp indicates at least one commit
+  if ((repo.size ?? 0) > 0 && Boolean(repo.pushed_at)) {
+    return true;
+  }
+
+  try {
+    const res = await crossPlatformHttpRequest({
+      url: `https://api.github.com/repos/${encodeURIComponent(
+        repo.owner.login
+      )}/${encodeURIComponent(repo.name)}/commits?per_page=1`,
+      method: 'GET',
+      headers: githubApiHeaders(token),
+    });
+    if (res.status === 409) return false;
+    if (res.status === 200) {
+      const commits = decodeJson<unknown[]>(res.body);
+      return Array.isArray(commits) && commits.length > 0;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 /**
- * Lists repositories accessible to the authenticated user.
+ * Lists repositories accessible to the authenticated user and flags 0-commit repos.
  */
 export async function listUserRepositories(token: string): Promise<GitHubRepo[]> {
   const res = await crossPlatformHttpRequest({
@@ -327,7 +370,11 @@ export async function listUserRepositories(token: string): Promise<GitHubRepo[]>
     throw new Error(`Failed to fetch repositories (HTTP ${res.status})`);
   }
 
-  return decodeJson<GitHubRepo[]>(res.body);
+  const repos = decodeJson<GitHubRepo[]>(res.body);
+  await mapWithConcurrency(repos, 6, async (repo) => {
+    repo.hasCommits = await checkRepoHasCommits(token, repo);
+  });
+  return repos;
 }
 
 /**
@@ -878,6 +925,20 @@ export function sortPackageVersionsNewestFirst(
   });
 }
 
+/**
+ * Produces a deterministic signature covering a package's version IDs, digests,
+ * and tags so any version creation, deletion, or tag change is reliably detected.
+ */
+export function getVersionStateSignature(versions: GitHubPackageVersion[]): string {
+  return [...versions]
+    .sort((a, b) => a.id - b.id)
+    .map((v) => {
+      const tags = [...(v.metadata?.container?.tags || [])].sort().join(',');
+      return `${v.id}:${v.name}:${tags}`;
+    })
+    .join('|');
+}
+
 export function ociDetailsToIndexRecord(
   pkgName: string,
   manifestDigest: string,
@@ -1213,6 +1274,7 @@ export async function publishRepoIndexSnapshot(opts: {
   clockFormat: ClockFormat;
   dateFormat: DateFormat;
   canDeletePackages: boolean;
+  existingTags?: Iterable<string>;
 }): Promise<{
   indexPackage: GitHubPackageItem | null;
   versions: GitHubPackageVersion[];
@@ -1220,7 +1282,12 @@ export async function publishRepoIndexSnapshot(opts: {
 }> {
   const ociIndexPkgName = getRepoIndexPackageName(opts.repo.name);
   const jsonBytes = encoder.encode(JSON.stringify(opts.payload));
-  const tag = formatTimestampTag(new Date(), opts.clockFormat, opts.dateFormat);
+  const tag = formatUniqueRepoIndexTag(
+    new Date(),
+    opts.clockFormat,
+    opts.dateFormat,
+    opts.existingTags
+  );
 
   const details = await buildAndPushOciImage({
     username: opts.username,

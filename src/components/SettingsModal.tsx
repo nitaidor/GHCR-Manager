@@ -1,5 +1,16 @@
-import React, { useEffect, useState } from 'react';
-import { Settings, X, Clock, Calendar } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Settings,
+  X,
+  Clock,
+  Calendar,
+  Package,
+  Search,
+  RefreshCw,
+  ExternalLink,
+  Check,
+} from 'lucide-react';
+import type { GitHubRepo } from '../lib/github-oci';
 import type { AppSettings } from './Header';
 import {
   formatTimestampTag,
@@ -14,6 +25,12 @@ interface SettingsModalProps {
   setSettings: React.Dispatch<React.SetStateAction<AppSettings>>;
   isDarkMode: boolean;
   setIsDarkMode: (val: boolean) => void;
+  isSignedIn: boolean;
+  repos: GitHubRepo[];
+  selectedRepo: GitHubRepo | null;
+  onSelectRepo: (repo: GitHubRepo) => void;
+  reposLoading: boolean;
+  onRefreshRepos: () => void;
 }
 
 const DATE_FORMAT_OPTIONS: Array<{ value: DateFormat; label: string; sample: string }> = [
@@ -35,8 +52,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   setSettings,
   isDarkMode,
   setIsDarkMode,
+  isSignedIn,
+  repos,
+  selectedRepo,
+  onSelectRepo,
+  reposLoading,
+  onRefreshRepos,
 }) => {
   const [previewNow, setPreviewNow] = useState<Date>(() => new Date());
+  const [repoSearch, setRepoSearch] = useState<string>('');
+
+  const filteredRepos = useMemo(() => {
+    const q = repoSearch.trim().toLowerCase();
+    if (!q) return repos;
+    return repos.filter(
+      (r) =>
+        r.full_name.toLowerCase().includes(q) ||
+        (r.description && r.description.toLowerCase().includes(q))
+    );
+  }, [repos, repoSearch]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -48,6 +82,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   useEffect(() => {
     if (!isOpen) return;
+    setRepoSearch('');
     setPreviewNow(new Date());
     const timer = setInterval(() => setPreviewNow(new Date()), 1000);
     return () => clearInterval(timer);
@@ -79,6 +114,132 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         <div className="p-5 overflow-y-auto space-y-6 flex-1">
+          {/* Target Repository Section (when signed in) */}
+          {isSignedIn && (
+            <section>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-3 border-b border-[#30363d] pb-2">
+                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+                  <Package className="w-4 h-4 icon-packages" />
+                  Target Repository ({repos.length})
+                </h3>
+                <div className="flex items-center gap-2">
+                  {selectedRepo && (
+                    <a
+                      href={`${selectedRepo.html_url}/packages`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn-modal-action px-2.5 py-1 rounded text-xs font-semibold inline-flex items-center gap-1.5"
+                    >
+                      View Repo Packages on GitHub
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    disabled={reposLoading}
+                    onClick={onRefreshRepos}
+                    title="Refresh repositories"
+                    className="btn-modal-action px-2.5 py-1 rounded text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw
+                      className={`w-3 h-3 ${reposLoading ? 'animate-spin' : ''}`}
+                    />
+                    Refresh
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-[#0d1117] border border-[#30363d] rounded-md overflow-hidden">
+                <div className="p-2.5 border-b border-[#30363d] bg-[#161b22]">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-gray-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={repoSearch}
+                      onChange={(e) => setRepoSearch(e.target.value)}
+                      placeholder="Filter repositories..."
+                      className="w-full pl-8 pr-3 py-1.5 rounded bg-[#0d1117] border border-[#30363d] text-xs text-white focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="max-h-56 overflow-y-auto divide-y divide-[#30363d]">
+                  {reposLoading && repos.length === 0 ? (
+                    <div className="p-4 text-center text-xs text-gray-500">
+                      Loading repositories...
+                    </div>
+                  ) : filteredRepos.length === 0 ? (
+                    <div className="p-4 text-center text-xs text-gray-500">
+                      No matching repositories.
+                    </div>
+                  ) : (
+                    filteredRepos.map((repo) => {
+                      const isSelected = selectedRepo?.id === repo.id;
+                      const hasNoCommits = repo.hasCommits === false;
+                      const needsRepoWrite = repo.permissions?.push === false;
+                      const isDisabledRepo = hasNoCommits || needsRepoWrite;
+                      const disabledTooltip = hasNoCommits
+                        ? 'Requires at least 1 commit in this repository before it can be selected.'
+                        : needsRepoWrite
+                        ? 'Requires read/write access to this repository.'
+                        : undefined;
+
+                      return (
+                        <button
+                          key={repo.id}
+                          type="button"
+                          aria-disabled={isDisabledRepo}
+                          tabIndex={isDisabledRepo ? -1 : 0}
+                          title={disabledTooltip}
+                          onClick={() => {
+                            if (isDisabledRepo) return;
+                            onSelectRepo(repo);
+                          }}
+                          className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition ${
+                            isDisabledRepo
+                              ? 'repo-option-disabled'
+                              : isSelected
+                              ? 'active-variant font-bold cursor-pointer'
+                              : 'hover:bg-[#21262d] text-gray-300 cursor-pointer'
+                          }`}
+                        >
+                          <div className="min-w-0 flex items-center gap-2">
+                            {isSelected && !isDisabledRepo && (
+                              <Check className="w-3.5 h-3.5 shrink-0" />
+                            )}
+                            <div className="min-w-0">
+                              <div className="truncate">{repo.full_name}</div>
+                              {repo.description && (
+                                <div className="text-[11px] text-gray-500 truncate">
+                                  {repo.description}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {hasNoCommits && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
+                                0 commits
+                              </span>
+                            )}
+                            {!hasNoCommits && needsRepoWrite && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
+                                Read-only
+                              </span>
+                            )}
+                            <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
+                              {repo.private ? 'Private' : 'Public'}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            </section>
+          )}
+
           {/* Appearance Section (5 Themes + Clock & Date Format) */}
           <section>
             <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-3 border-b border-[#30363d] pb-2">

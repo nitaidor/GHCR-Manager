@@ -52,6 +52,7 @@ export interface SyncBatchItemPlan {
   ociName: string;
   action: SyncConflictAction;
   tag: string;
+  isTagAutoTimestamp: boolean;
   replaceVersions: GitHubPackageVersion[];
   packageOwnerLogin: string;
   packageOwnerType: 'User' | 'Organization';
@@ -161,6 +162,36 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
     setExpandedItemIndices(new Set());
     setExpandedVersionKeys(new Set());
   }, [isOpen, resetSignature]);
+
+  // Prune stale replaceIds if liveStatesByIndex updates after waiting on a lock
+  useEffect(() => {
+    if (!isOpen) return;
+    setDecisions((prev) => {
+      let changed = false;
+      const next: Record<number, ItemDecision> = { ...prev };
+      for (const [k, dec] of Object.entries(prev)) {
+        const idx = Number(k);
+        if (dec.replaceIds.size === 0) continue;
+        const validIds = new Set(
+          (liveStatesByIndex[idx]?.versions || []).map((v) => v.id)
+        );
+        const filtered = new Set<number>();
+        for (const id of dec.replaceIds) {
+          if (validIds.has(id)) filtered.add(id);
+        }
+        if (filtered.size !== dec.replaceIds.size) {
+          changed = true;
+          next[idx] = {
+            ...dec,
+            action:
+              dec.action === 'replace' && filtered.size === 0 ? 'new' : dec.action,
+            replaceIds: filtered,
+          };
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [isOpen, liveStatesByIndex]);
 
   // Escape closes when not actively syncing
   useEffect(() => {
@@ -398,6 +429,7 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
         ociName: entry.ociName,
         action: dec.action,
         tag: val.resolvedTag,
+        isTagAutoTimestamp: !isBatchTagEdited && dec.customTag === undefined,
         replaceVersions: replaceTargets,
         packageOwnerLogin: liveState?.packageItem?.owner.login || repo.owner.login,
         packageOwnerType: liveState?.packageItem?.owner.type || repo.owner.type,

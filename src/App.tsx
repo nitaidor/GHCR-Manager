@@ -59,6 +59,7 @@ import {
   fetchLivePackageState,
   formatBytes,
   getVersionReferenceInfo,
+  getVersionStateSignature,
   indexRecordToOciDetails,
   inspectPackageManifest,
   listPackageVersions,
@@ -91,6 +92,8 @@ import {
 } from './lib/http';
 import { isAbortError } from './lib/http';
 import {
+  formatTimestampTag,
+  getPackageLockKey,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
   isRepoIndexPackageName,
@@ -100,11 +103,23 @@ import {
   type DateFormat,
 } from './lib/naming';
 import {
+  acquireRepoIndexLock,
+  acquireRepoLock,
+  acquireRepoPackageLocks,
+  type ActiveRepoLock,
+  type ActiveRepoLockBundle,
+  type RepoLockWaitInfo,
+} from './lib/repo-lock';
+import {
   createZipFromExtractedFiles,
   normalizeMemoryLimitError,
   summarizeArchiveEntries,
   type TarInputFile,
 } from './lib/tar';
+
+function isRepoSelectable(repo: GitHubRepo): boolean {
+  return repo.hasCommits !== false && repo.permissions?.push !== false;
+}
 
 function formatFolderSummaryBadge(
   entries: ReadonlyArray<DesktopRootFolderFileEntry>,
@@ -336,24 +351,7 @@ export default function App() {
   // Repositories state
   const [repos, setRepos] = useState<GitHubRepo[]>([]);
   const [reposLoading, setReposLoading] = useState<boolean>(false);
-  const [repoSearch, setRepoSearch] = useState<string>('');
-  const [showRepoDropdown, setShowRepoDropdown] = useState<boolean>(false);
   const [selectedRepo, setSelectedRepo] = useState<GitHubRepo | null>(null);
-  const repoDropdownRef = useRef<HTMLDivElement | null>(null);
-
-  // Close repo dropdown on outside click
-  useEffect(() => {
-    const handleOutside = (e: MouseEvent) => {
-      if (
-        repoDropdownRef.current &&
-        !repoDropdownRef.current.contains(e.target as Node)
-      ) {
-        setShowRepoDropdown(false);
-      }
-    };
-    document.addEventListener('mousedown', handleOutside);
-    return () => document.removeEventListener('mousedown', handleOutside);
-  }, []);
 
   // Navigation tab
   const [activeTab, setActiveTab] = useState<ActiveTab>('upload-files');
@@ -474,13 +472,20 @@ export default function App() {
   type InlineNotice = { type: 'success' | 'warning' | 'error'; text: string };
   const [repoIndexPkg, setRepoIndexPkg] = useState<GitHubPackageItem | null>(null);
   const [repoIndexVersions, setRepoIndexVersions] = useState<GitHubPackageVersion[]>([]);
+  const repoIndexVersionsRef = useRef<GitHubPackageVersion[]>([]);
+  repoIndexVersionsRef.current = repoIndexVersions;
   const [repoIndexEntries, setRepoIndexEntries] = useState<
     Record<string, RepoIndexVersionRecord>
   >({});
   const repoIndexEntriesRef = useRef<Record<string, RepoIndexVersionRecord>>({});
   repoIndexEntriesRef.current = repoIndexEntries;
   const repoIndexLoadedForRepoIdRef = useRef<number | null>(null);
+  const repoIndexLatestDigestRef = useRef<string | null>(null);
   const repoIndexLoadPromiseRef = useRef<{
+    repoId: number;
+    promise: Promise<Record<string, RepoIndexVersionRecord>>;
+  } | null>(null);
+  const repoIndexRemoteCheckRef = useRef<{
     repoId: number;
     promise: Promise<Record<string, RepoIndexVersionRecord>>;
   } | null>(null);
@@ -560,6 +565,20 @@ export default function App() {
     setAuthError(null);
     try {
       const { user: ghUser, oauthScopes: reportedScopes } = await fetchGitHubAuthInfo(clean);
+      if (reportedScopes !== null) {
+        const missingScopes: string[] = [];
+        if (!reportedScopes.includes('repo')) {
+          missingScopes.push('repo (repository read/write)');
+        }
+        if (!reportedScopes.includes('write:packages')) {
+          missingScopes.push('write:packages / read:packages (package read/write)');
+        }
+        if (missingScopes.length > 0) {
+          throw new Error(
+            `GitHub token is missing required scope(s): ${missingScopes.join(', ')}. Ensure both repository read/write ('repo') and packages read/write ('write:packages', 'read:packages') scopes are enabled.`
+          );
+        }
+      }
       setUser(ghUser);
       setOauthScopes(reportedScopes);
       setAuthToken(clean);
@@ -620,7 +639,9 @@ export default function App() {
 
       const savedRepoId = Number(localStorage.getItem(STORAGE_REPO_KEY));
       const matched =
-        userRepos.find((r) => r.id === savedRepoId) || userRepos[0] || null;
+        userRepos.find((r) => r.id === savedRepoId && isRepoSelectable(r)) ||
+        userRepos.find(isRepoSelectable) ||
+        null;
       setSelectedRepo(matched);
     } catch (err: unknown) {
       setAuthError(err instanceof Error ? err.message : String(err));
@@ -662,11 +683,14 @@ export default function App() {
     setVersionNotices({});
     setRepoIndexPkg(null);
     setRepoIndexVersions([]);
+    repoIndexVersionsRef.current = [];
     setRepoIndexEntries({});
     setRepoIndexNotice(null);
     setIsRepoIndexExpanded(false);
     repoIndexLoadedForRepoIdRef.current = null;
+    repoIndexLatestDigestRef.current = null;
     repoIndexLoadPromiseRef.current = null;
+    repoIndexRemoteCheckRef.current = null;
   }
 
   // Saved PAT handlers
@@ -780,11 +804,14 @@ export default function App() {
       setExtractConflict(null);
       setRepoIndexPkg(null);
       setRepoIndexVersions([]);
+      repoIndexVersionsRef.current = [];
       setRepoIndexEntries({});
       setRepoIndexNotice(null);
       setIsRepoIndexExpanded(false);
       repoIndexLoadedForRepoIdRef.current = null;
+      repoIndexLatestDigestRef.current = null;
       repoIndexLoadPromiseRef.current = null;
+      repoIndexRemoteCheckRef.current = null;
       localStorage.setItem(STORAGE_REPO_KEY, String(selectedRepo.id));
       refreshPackages({ clearTransientNotices: true });
     }
@@ -861,9 +888,11 @@ export default function App() {
         const sortedIdxVersions = sortPackageVersionsNewestFirst(idxVersions);
         setRepoIndexPkg(idxPkg);
         setRepoIndexVersions(sortedIdxVersions);
+        repoIndexVersionsRef.current = sortedIdxVersions;
 
         if (!idxPkg || sortedIdxVersions.length === 0) {
           setRepoIndexEntries({});
+          repoIndexLatestDigestRef.current = null;
           repoIndexLoadedForRepoIdRef.current = repo.id;
           return {};
         }
@@ -887,6 +916,8 @@ export default function App() {
         const rawMap = fetched.payload?.versions || {};
         applyIndexEntriesToInspectedMap(rawMap, preloaded?.liveVKeys);
         setRepoIndexEntries(rawMap);
+        repoIndexLatestDigestRef.current =
+          fetched.latestVersion?.name || sortedIdxVersions[0]?.name || null;
         repoIndexLoadedForRepoIdRef.current = repo.id;
         return rawMap;
       } catch (err: unknown) {
@@ -909,6 +940,73 @@ export default function App() {
     return await promise;
   }
 
+  function formatLockWaitLabel(info: RepoLockWaitInfo, fallbackPkg?: string): string {
+    const pkgLabel = info.packageName || fallbackPkg;
+    const waitSec = Math.max(1, Math.ceil(info.remainingMs / 1000));
+    if (pkgLabel) {
+      return `Waiting for ${info.holderOwner} (${info.operation} "${pkgLabel}") to release lock (~${waitSec}s lease)...`;
+    }
+    return `Waiting for ${info.holderOwner} (${info.operation}) to release repository index lock (~${waitSec}s lease)...`;
+  }
+
+  /**
+   * Checks the latest GHCR Manager Index checkpoint digest on GitHub and downloads
+   * index.json only if another PC pushed a newer checkpoint (or it isn't loaded yet).
+   */
+  async function syncRemoteRepoIndexIfChanged(
+    repo: GitHubRepo
+  ): Promise<Record<string, RepoIndexVersionRecord>> {
+    if (!user || !authToken) return repoIndexEntriesRef.current;
+
+    if (
+      repoIndexRemoteCheckRef.current &&
+      repoIndexRemoteCheckRef.current.repoId === repo.id
+    ) {
+      return await repoIndexRemoteCheckRef.current.promise;
+    }
+
+    const runCheck = async (): Promise<Record<string, RepoIndexVersionRecord>> => {
+      try {
+        const ociIndexPkgName = getRepoIndexPackageName(repo.name);
+        const live = await fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: repo.owner.login,
+          ownerType: repo.owner.type,
+          packageName: ociIndexPkgName,
+        });
+
+        const sortedIdxVersions = sortPackageVersionsNewestFirst(live.versions);
+        const remoteLatestDigest = sortedIdxVersions[0]?.name || null;
+
+        if (
+          repoIndexLoadedForRepoIdRef.current === repo.id &&
+          remoteLatestDigest === repoIndexLatestDigestRef.current
+        ) {
+          setRepoIndexPkg(live.packageItem);
+          setRepoIndexVersions(sortedIdxVersions);
+          repoIndexVersionsRef.current = sortedIdxVersions;
+          return repoIndexEntriesRef.current;
+        }
+
+        return await ensureRepoIndexLoaded(repo, {
+          pkg: live.packageItem,
+          versions: sortedIdxVersions,
+        });
+      } catch {
+        return await ensureRepoIndexLoaded(repo);
+      } finally {
+        if (repoIndexRemoteCheckRef.current?.repoId === repo.id) {
+          repoIndexRemoteCheckRef.current = null;
+        }
+      }
+    };
+
+    const promise = runCheck();
+    repoIndexRemoteCheckRef.current = { repoId: repo.id, promise };
+    return await promise;
+  }
+
   function enqueueRepoIndexMutation(opts: {
     repo: GitHubRepo;
     addOrUpdate?: Array<{
@@ -923,9 +1021,25 @@ export default function App() {
       if (!user || !authToken) return;
       setRepoIndexUpdating(true);
       setRepoIndexNotice(null);
+      let indexLock: ActiveRepoLock | null = null;
       try {
+        indexLock = await acquireRepoIndexLock({
+          repo: opts.repo,
+          githubToken: authToken,
+          ownerLogin: user.login,
+          onWaiting: (info) => {
+            setRepoIndexNotice({
+              type: 'warning',
+              text: formatLockWaitLabel(info),
+            });
+          },
+        });
+        if (indexLock.hadToWait) {
+          setRepoIndexNotice(null);
+        }
+
         const baseEntries = {
-          ...(await ensureRepoIndexLoaded(opts.repo)),
+          ...(await syncRemoteRepoIndexIfChanged(opts.repo)),
         };
 
         const rmPkgSet = new Set(
@@ -963,6 +1077,13 @@ export default function App() {
         const canDelete =
           oauthScopes === null || oauthScopes.includes('delete:packages');
 
+        const existingIndexTags = new Set<string>();
+        for (const ver of repoIndexVersionsRef.current) {
+          for (const tag of ver.metadata?.container?.tags || []) {
+            if (tag) existingIndexTags.add(tag);
+          }
+        }
+
         const pushed = await publishRepoIndexSnapshot({
           username: user.login,
           githubToken: authToken,
@@ -972,9 +1093,13 @@ export default function App() {
           clockFormat: settings.clockFormat,
           dateFormat: settings.dateFormat,
           canDeletePackages: canDelete,
+          existingTags: existingIndexTags,
         });
 
         setRepoIndexEntries(baseEntries);
+        repoIndexLatestDigestRef.current =
+          pushed.indexDetails.manifestDigest || pushed.versions[0]?.name || null;
+        repoIndexVersionsRef.current = pushed.versions;
         repoIndexLoadedForRepoIdRef.current = opts.repo.id;
         if (pushed.indexPackage) {
           setRepoIndexPkg(pushed.indexPackage);
@@ -998,6 +1123,7 @@ export default function App() {
           }`,
         });
       } finally {
+        await indexLock?.release();
         setRepoIndexUpdating(false);
       }
     });
@@ -1256,16 +1382,6 @@ export default function App() {
       }
     }
   }
-
-  const filteredRepos = useMemo(() => {
-    const q = repoSearch.trim().toLowerCase();
-    if (!q) return repos;
-    return repos.filter(
-      (r) =>
-        r.full_name.toLowerCase().includes(q) ||
-        (r.description && r.description.toLowerCase().includes(q))
-    );
-  }, [repos, repoSearch]);
 
   // --- TAB 1: File & Folder selection & naming logic ---
   function handleAbortUploadScan() {
@@ -1532,21 +1648,25 @@ export default function App() {
     setModalExistingVersions([]);
 
     try {
-      const liveState = await fetchLivePackageState({
-        githubToken: authToken,
-        currentUserLogin: user.login,
-        owner: selectedRepo.owner.login,
-        ownerType: selectedRepo.owner.type,
-        packageName: pkgName,
-      });
+      const [liveState, latestIndexMap] = await Promise.all([
+        fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: selectedRepo.owner.login,
+          ownerType: selectedRepo.owner.type,
+          packageName: pkgName,
+        }),
+        syncRemoteRepoIndexIfChanged(selectedRepo),
+      ]);
       if (modalLookupSeqRef.current !== seq) return;
       if (liveState.exists) {
         setModalLivePkg(liveState.packageItem);
         setModalExistingVersions(liveState.versions);
-        indexVersionList(
+        void indexVersionList(
           pkgName,
           liveState.packageItem?.owner.login || selectedRepo.owner.login,
-          liveState.versions
+          liveState.versions,
+          latestIndexMap
         );
       }
     } catch (err: unknown) {
@@ -1579,6 +1699,7 @@ export default function App() {
   async function handleExecuteVersionedUpload(opts: {
     tag: string;
     replaceVersions: GitHubPackageVersion[];
+    isTagManuallyEdited: boolean;
   }) {
     if (!selectedRepo || !user || !authToken) return;
     if (!fileNamingValidation.valid) {
@@ -1586,12 +1707,107 @@ export default function App() {
       return;
     }
 
+    const targetPkgName = fileNamingValidation.ociPackageName;
+    const sigBeforeLock = getVersionStateSignature(modalExistingVersions);
+
     const abortCtrl = new AbortController();
     uploadAbortRef.current = abortCtrl;
+    let leaseLost = false;
+    let pkgLock: ActiveRepoLock | null = null;
     setUploadError(null);
     setUploadSuccess(null);
 
     try {
+      setUploadProgress({
+        stage: 'authenticating',
+        message: `Acquiring upload lock for "${targetPkgName}"...`,
+        percent: 2,
+      });
+
+      pkgLock = await acquireRepoLock({
+        repo: selectedRepo,
+        githubToken: authToken,
+        ownerLogin: user.login,
+        lockKey: getPackageLockKey(targetPkgName),
+        packageName: targetPkgName,
+        operation: 'upload',
+        signal: abortCtrl.signal,
+        onWaiting: (info) =>
+          setUploadProgress({
+            stage: 'authenticating',
+            message: formatLockWaitLabel(info, targetPkgName),
+            percent: 2,
+          }),
+        onLeaseLost: () => {
+          leaseLost = true;
+          abortCtrl.abort();
+        },
+      });
+
+      if (abortCtrl.signal.aborted) {
+        throw new DOMException('Upload cancelled', 'AbortError');
+      }
+
+      setUploadProgress({
+        stage: 'authenticating',
+        message: 'Checking GitHub & repository index for latest updates...',
+        percent: 4,
+      });
+
+      const [liveState, latestIndexMap] = await Promise.all([
+        fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: selectedRepo.owner.login,
+          ownerType: selectedRepo.owner.type,
+          packageName: targetPkgName,
+        }),
+        syncRemoteRepoIndexIfChanged(selectedRepo),
+      ]);
+
+      if (abortCtrl.signal.aborted) {
+        throw new DOMException('Upload cancelled', 'AbortError');
+      }
+
+      setModalLivePkg(liveState.packageItem);
+      setModalExistingVersions(liveState.versions);
+      if (liveState.exists && liveState.versions.length > 0) {
+        void indexVersionList(
+          targetPkgName,
+          liveState.packageItem?.owner.login || selectedRepo.owner.login,
+          liveState.versions,
+          latestIndexMap
+        );
+      }
+
+      const sigAfterLock = getVersionStateSignature(liveState.versions);
+      if (sigAfterLock !== sigBeforeLock) {
+        await pkgLock.release();
+        pkgLock = null;
+        setUploadError(
+          `Another PC updated "${targetPkgName}" while you were waiting. The version list above has been refreshed - please review New vs Replace and your tag, then click Upload again.`
+        );
+        return;
+      }
+
+      const effectiveTag = opts.isTagManuallyEdited
+        ? opts.tag
+        : formatTimestampTag(new Date(), settings.clockFormat, settings.dateFormat);
+
+      const replaceIdSet = new Set(opts.replaceVersions.map((v) => v.id));
+      const hasUncheckedTagCollision = liveState.versions.some((v) => {
+        if (replaceIdSet.has(v.id)) return false;
+        return (v.metadata?.container?.tags || []).includes(effectiveTag);
+      });
+      if (hasUncheckedTagCollision) {
+        await pkgLock.release();
+        pkgLock = null;
+        setUploadError(
+          `Tag "${effectiveTag}" already exists on an existing version of "${targetPkgName}". Please enter a new tag or check Replace before uploading.`
+        );
+        return;
+      }
+
       const isSingleFolderOnly =
         pickedItems.length === 1 && pickedItems[0].kind === 'folder';
 
@@ -1703,7 +1919,7 @@ export default function App() {
         githubToken: authToken,
         repo: selectedRepo,
         rawImageName: fileNamingValidation.effectiveRawName,
-        tag: opts.tag,
+        tag: effectiveTag,
         mode:
           pickedItems.length === 1 && pickedItems[0].kind === 'file'
             ? 'single-file'
@@ -1796,12 +2012,17 @@ export default function App() {
       setShowUploadVersionModal(false);
       await refreshPackages();
     } catch (err: unknown) {
-      if (isAbortError(err)) {
+      if (leaseLost) {
+        setUploadError(
+          'Upload aborted because this device lost its upload lock after being inactive or disconnected. Please try again.'
+        );
+      } else if (isAbortError(err)) {
         setUploadError('Upload cancelled.');
       } else {
         setUploadError(err instanceof Error ? err.message : String(err));
       }
     } finally {
+      await pkgLock?.release();
       if (uploadAbortRef.current === abortCtrl) {
         uploadAbortRef.current = null;
       }
@@ -2162,6 +2383,7 @@ export default function App() {
     setSyncLookupTotalCount(uniquePkgNames.length);
 
     try {
+      const remoteIndexPromise = syncRemoteRepoIndexIfChanged(selectedRepo);
       const statesByPkgName: Record<string, LivePackageState> = {};
       await mapWithConcurrency(uniquePkgNames, 4, async (pkgName) => {
         if (syncLookupSeqRef.current !== seq) return;
@@ -2176,10 +2398,13 @@ export default function App() {
         statesByPkgName[pkgName] = liveState;
         setSyncLookupDoneCount((prev) => prev + 1);
         if (liveState.exists && liveState.versions.length > 0) {
-          indexVersionList(
+          const latestIndexMap = await remoteIndexPromise;
+          if (syncLookupSeqRef.current !== seq) return;
+          void indexVersionList(
             pkgName,
             liveState.packageItem?.owner.login || selectedRepo.owner.login,
-            liveState.versions
+            liveState.versions,
+            latestIndexMap
           );
         }
       });
@@ -2242,10 +2467,17 @@ export default function App() {
 
     const abortCtrl = new AbortController();
     syncAbortRef.current = abortCtrl;
+    let leaseLost = false;
+    let lockBundle: ActiveRepoLockBundle | null = null;
     setIsSyncingFolder(true);
     setSyncError(null);
     setSyncModalError(null);
     setSyncBatchSummary(null);
+
+    const beforeStatesByIdx: Record<number, LivePackageState | undefined> = {
+      ...syncLiveStatesByIndex,
+    };
+    const activePkgNames = Array.from(new Set(activePlans.map((p) => p.ociName)));
 
     const initialStatuses: Record<number, SyncItemStatus> = {};
     for (const p of plans) {
@@ -2267,226 +2499,362 @@ export default function App() {
     }> = [];
     const indexRemoveKeys: string[] = [];
 
-    for (let i = 0; i < activePlans.length; i++) {
-      if (abortCtrl.signal.aborted) {
-        wasCancelled = true;
-        break;
-      }
-      const plan = activePlans[i];
-      const basePercent = Math.floor((i / activePlans.length) * 100);
-
+    try {
       setSyncOverallProgress({
-        current: i + 1,
+        current: 0,
         total: activePlans.length,
-        message: `Reading files for ${plan.ociName}:${plan.tag}...`,
-        percent: basePercent,
+        message: 'Acquiring upload lock(s) for selected packages...',
+        percent: 0,
       });
 
-      setSyncStatuses((prev) => ({
-        ...prev,
-        [plan.idx]: {
-          state: 'uploading',
-          message: 'Reading files...',
-          percent: 5,
+      lockBundle = await acquireRepoPackageLocks({
+        repo: selectedRepo,
+        githubToken: authToken,
+        ownerLogin: user.login,
+        packageNames: activePkgNames,
+        operation: 'sync',
+        signal: abortCtrl.signal,
+        onWaiting: (info) =>
+          setSyncOverallProgress({
+            current: 0,
+            total: activePlans.length,
+            message: formatLockWaitLabel(info),
+            percent: 0,
+          }),
+        onLeaseLost: () => {
+          leaseLost = true;
+          abortCtrl.abort();
         },
+      });
+
+      if (abortCtrl.signal.aborted) {
+        throw new DOMException('Sync cancelled', 'AbortError');
+      }
+
+      setSyncOverallProgress({
+        current: 0,
+        total: activePlans.length,
+        message: 'Checking GitHub & repository index for latest updates...',
+        percent: 2,
+      });
+
+      const remoteIndexPromise = syncRemoteRepoIndexIfChanged(selectedRepo);
+      const freshByPkgName: Record<string, LivePackageState> = {};
+      await mapWithConcurrency(activePkgNames, 4, async (pkgName) => {
+        if (abortCtrl.signal.aborted) return;
+        freshByPkgName[pkgName] = await fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: selectedRepo.owner.login,
+          ownerType: selectedRepo.owner.type,
+          packageName: pkgName,
+        });
+      });
+
+      const latestIndexMap = await remoteIndexPromise;
+      if (abortCtrl.signal.aborted) {
+        throw new DOMException('Sync cancelled', 'AbortError');
+      }
+
+      const refreshedByIdx: Record<number, LivePackageState> = {};
+      for (const entry of syncReviewSelectedItems) {
+        if (freshByPkgName[entry.ociName]) {
+          refreshedByIdx[entry.idx] = freshByPkgName[entry.ociName];
+        }
+      }
+
+      const changedPkgNames: string[] = [];
+      for (const pkgName of activePkgNames) {
+        const freshState = freshByPkgName[pkgName];
+        if (!freshState) continue;
+        if (freshState.exists && freshState.versions.length > 0) {
+          void indexVersionList(
+            pkgName,
+            freshState.packageItem?.owner.login || selectedRepo.owner.login,
+            freshState.versions,
+            latestIndexMap
+          );
+        }
+        const samplePlan = activePlans.find((p) => p.ociName === pkgName);
+        const beforeVersions = samplePlan
+          ? beforeStatesByIdx[samplePlan.idx]?.versions || []
+          : [];
+        if (
+          getVersionStateSignature(freshState.versions) !==
+          getVersionStateSignature(beforeVersions)
+        ) {
+          changedPkgNames.push(pkgName);
+        }
+      }
+
+      if (changedPkgNames.length > 0) {
+        setSyncLiveStatesByIndex((prev) => ({ ...prev, ...refreshedByIdx }));
+        await lockBundle.releaseAll();
+        lockBundle = null;
+        setSyncModalError(
+          `Another PC updated ${changedPkgNames
+            .map((n) => `"${n}"`)
+            .join(', ')} while you were waiting. The version list above has been refreshed - please review New vs Replace and tags, then click Sync again.`
+        );
+        return;
+      }
+
+      // Refresh unedited auto-timestamp tags to current time right before starting batch
+      const batchNowTag = formatTimestampTag(
+        new Date(),
+        settings.clockFormat,
+        settings.dateFormat
+      );
+      const resolvedPlans = activePlans.map((plan) => ({
+        ...plan,
+        tag: plan.isTagAutoTimestamp ? batchNowTag : plan.tag,
+        packageOwnerLogin:
+          freshByPkgName[plan.ociName]?.packageItem?.owner.login ||
+          plan.packageOwnerLogin,
+        packageOwnerType:
+          freshByPkgName[plan.ociName]?.packageItem?.owner.type ||
+          plan.packageOwnerType,
       }));
 
-      try {
-        const isBareEmptyRootSubfolder =
-          plan.item.kind === 'root-subfolder' && plan.item.files.length === 0;
-        const canStreamDesktop =
-          Boolean(window.electronAPI?.buildOciLayerFile) &&
-          Boolean(window.electronAPI?.uploadBlobFromFile) &&
-          (isBareEmptyRootSubfolder
-            ? Boolean(plan.item.fullPath)
-            : plan.item.files.length > 0 &&
-              plan.item.files.every(
-                (f) => Boolean(f.fullPath) || Boolean(f.isDirectory)
-              ));
-
-        let tarFiles: TarInputFile[] | undefined;
-        let desktopFiles: DesktopStreamingInputFile[] | undefined;
-
-        if (canStreamDesktop) {
-          desktopFiles = isBareEmptyRootSubfolder
-            ? [
-                {
-                  fullPath: plan.item.fullPath || '',
-                  relativePath: '.',
-                  size: 0,
-                  mtime: plan.item.mtime,
-                  isDirectory: true,
-                },
-              ]
-            : plan.item.files.map((f) => ({
-                fullPath: f.fullPath || '',
-                relativePath: f.relativePath,
-                size: f.isDirectory ? 0 : f.size,
-                mtime: f.mtime,
-                ...(f.isDirectory ? { isDirectory: true } : {}),
-              }));
-        } else {
-          try {
-            tarFiles = await readRootSyncItemFiles(plan.item);
-          } catch (err) {
-            throw normalizeMemoryLimitError(err, 'upload');
-          }
+      for (let i = 0; i < resolvedPlans.length; i++) {
+        if (abortCtrl.signal.aborted) {
+          wasCancelled = true;
+          break;
         }
+        const plan = resolvedPlans[i];
+        const basePercent = Math.floor((i / resolvedPlans.length) * 100);
 
-        const details = await buildAndPushOciImage({
-          username: user.login,
-          githubToken: authToken,
-          repo: selectedRepo,
-          rawImageName: plan.item.name,
-          tag: plan.tag,
-          mode: plan.item.kind,
-          files: tarFiles,
-          desktopFiles,
-          signal: abortCtrl.signal,
-          onProgress: (p) => {
-            const overallPct = Math.min(
-              99,
-              Math.floor(((i + p.percent / 100) / activePlans.length) * 100)
-            );
+        setSyncOverallProgress({
+          current: i + 1,
+          total: resolvedPlans.length,
+          message: `Reading files for ${plan.ociName}:${plan.tag}...`,
+          percent: basePercent,
+        });
+
+        setSyncStatuses((prev) => ({
+          ...prev,
+          [plan.idx]: {
+            state: 'uploading',
+            message: 'Reading files...',
+            percent: 5,
+          },
+        }));
+
+        try {
+          const isBareEmptyRootSubfolder =
+            plan.item.kind === 'root-subfolder' && plan.item.files.length === 0;
+          const canStreamDesktop =
+            Boolean(window.electronAPI?.buildOciLayerFile) &&
+            Boolean(window.electronAPI?.uploadBlobFromFile) &&
+            (isBareEmptyRootSubfolder
+              ? Boolean(plan.item.fullPath)
+              : plan.item.files.length > 0 &&
+                plan.item.files.every(
+                  (f) => Boolean(f.fullPath) || Boolean(f.isDirectory)
+                ));
+
+          let tarFiles: TarInputFile[] | undefined;
+          let desktopFiles: DesktopStreamingInputFile[] | undefined;
+
+          if (canStreamDesktop) {
+            desktopFiles = isBareEmptyRootSubfolder
+              ? [
+                  {
+                    fullPath: plan.item.fullPath || '',
+                    relativePath: '.',
+                    size: 0,
+                    mtime: plan.item.mtime,
+                    isDirectory: true,
+                  },
+                ]
+              : plan.item.files.map((f) => ({
+                  fullPath: f.fullPath || '',
+                  relativePath: f.relativePath,
+                  size: f.isDirectory ? 0 : f.size,
+                  mtime: f.mtime,
+                  ...(f.isDirectory ? { isDirectory: true } : {}),
+                }));
+          } else {
+            try {
+              tarFiles = await readRootSyncItemFiles(plan.item);
+            } catch (err) {
+              throw normalizeMemoryLimitError(err, 'upload');
+            }
+          }
+
+          const details = await buildAndPushOciImage({
+            username: user.login,
+            githubToken: authToken,
+            repo: selectedRepo,
+            rawImageName: plan.item.name,
+            tag: plan.tag,
+            mode: plan.item.kind,
+            files: tarFiles,
+            desktopFiles,
+            signal: abortCtrl.signal,
+            onProgress: (p) => {
+              const overallPct = Math.min(
+                99,
+                Math.floor(((i + p.percent / 100) / resolvedPlans.length) * 100)
+              );
+              setSyncOverallProgress({
+                current: i + 1,
+                total: resolvedPlans.length,
+                message: `${plan.ociName}:${plan.tag} - ${p.message}`,
+                percent: overallPct,
+              });
+              setSyncStatuses((prev) => ({
+                ...prev,
+                [plan.idx]: {
+                  state: 'uploading',
+                  message: p.message,
+                  percent: p.percent,
+                },
+              }));
+            },
+          });
+
+          const syncedPkgKey = details.packageName.toLowerCase();
+          setDeletedPkgTombstones((prev) => {
+            if (!prev[syncedPkgKey]) return prev;
+            const next = { ...prev };
+            delete next[syncedPkgKey];
+            return next;
+          });
+
+          if (details.manifestDigest) {
+            const vKey = makeVersionStateKey(details.packageName, details.manifestDigest);
+            setInspectedByKey((prev) => ({
+              ...prev,
+              [vKey]: details,
+            }));
+            indexAddOrUpdate.push({
+              pkgName: details.packageName,
+              manifestDigest: details.manifestDigest,
+              details,
+            });
+          }
+
+          let deleteErrors: string[] = [];
+          if (plan.replaceVersions.length > 0) {
             setSyncOverallProgress({
               current: i + 1,
-              total: activePlans.length,
-              message: `${plan.ociName}:${plan.tag} - ${p.message}`,
-              percent: overallPct,
+              total: resolvedPlans.length,
+              message: `Removing ${plan.replaceVersions.length} old version(s) of ${plan.ociName}...`,
+              percent: Math.min(
+                99,
+                Math.floor(((i + 0.96) / resolvedPlans.length) * 100)
+              ),
             });
+            deleteErrors = await deleteReplacedVersions({
+              githubToken: authToken,
+              currentUserLogin: user.login,
+              owner: plan.packageOwnerLogin,
+              ownerType: plan.packageOwnerType,
+              packageName: details.packageName,
+              newManifestDigest: details.manifestDigest,
+              targets: plan.replaceVersions,
+              onDeleted: (ver) =>
+                indexRemoveKeys.push(
+                  makeVersionStateKey(details.packageName, ver.name)
+                ),
+            });
+            totalReplacedCount +=
+              plan.replaceVersions.length - deleteErrors.length;
+          }
+
+          syncedCount += 1;
+
+          if (deleteErrors.length > 0) {
+            const msg = `Uploaded ${details.packageName}:${details.tag}, but failed to remove old version(s): ${deleteErrors.join('; ')}`;
+            batchErrors.push(msg);
+            setSyncStatuses((prev) => ({
+              ...prev,
+              [plan.idx]: { state: 'error', message: msg },
+            }));
+          } else {
             setSyncStatuses((prev) => ({
               ...prev,
               [plan.idx]: {
-                state: 'uploading',
-                message: p.message,
-                percent: p.percent,
+                state: 'done',
+                message: `Uploaded ${details.packageName}:${details.tag}`,
+                percent: 100,
               },
             }));
-          },
-        });
-
-        const syncedPkgKey = details.packageName.toLowerCase();
-        setDeletedPkgTombstones((prev) => {
-          if (!prev[syncedPkgKey]) return prev;
-          const next = { ...prev };
-          delete next[syncedPkgKey];
-          return next;
-        });
-
-        if (details.manifestDigest) {
-          const vKey = makeVersionStateKey(details.packageName, details.manifestDigest);
-          setInspectedByKey((prev) => ({
-            ...prev,
-            [vKey]: details,
-          }));
-          indexAddOrUpdate.push({
-            pkgName: details.packageName,
-            manifestDigest: details.manifestDigest,
-            details,
-          });
-        }
-
-        let deleteErrors: string[] = [];
-        if (plan.replaceVersions.length > 0) {
-          setSyncOverallProgress({
-            current: i + 1,
-            total: activePlans.length,
-            message: `Removing ${plan.replaceVersions.length} old version(s) of ${plan.ociName}...`,
-            percent: Math.min(
-              99,
-              Math.floor(((i + 0.96) / activePlans.length) * 100)
-            ),
-          });
-          deleteErrors = await deleteReplacedVersions({
-            githubToken: authToken,
-            currentUserLogin: user.login,
-            owner: plan.packageOwnerLogin,
-            ownerType: plan.packageOwnerType,
-            packageName: details.packageName,
-            newManifestDigest: details.manifestDigest,
-            targets: plan.replaceVersions,
-            onDeleted: (ver) =>
-              indexRemoveKeys.push(
-                makeVersionStateKey(details.packageName, ver.name)
-              ),
-          });
-          totalReplacedCount +=
-            plan.replaceVersions.length - deleteErrors.length;
-        }
-
-        syncedCount += 1;
-
-        if (deleteErrors.length > 0) {
-          const msg = `Uploaded ${details.packageName}:${details.tag}, but failed to remove old version(s): ${deleteErrors.join('; ')}`;
-          batchErrors.push(msg);
+          }
+        } catch (err: unknown) {
+          if (isAbortError(err)) {
+            wasCancelled = true;
+            setSyncStatuses((prev) => ({
+              ...prev,
+              [plan.idx]: { state: 'error', message: 'Cancelled' },
+            }));
+            break;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          batchErrors.push(`${plan.ociName}: ${msg}`);
           setSyncStatuses((prev) => ({
             ...prev,
             [plan.idx]: { state: 'error', message: msg },
           }));
-        } else {
-          setSyncStatuses((prev) => ({
-            ...prev,
-            [plan.idx]: {
-              state: 'done',
-              message: `Uploaded ${details.packageName}:${details.tag}`,
-              percent: 100,
-            },
-          }));
         }
-      } catch (err: unknown) {
-        if (isAbortError(err)) {
-          wasCancelled = true;
-          setSyncStatuses((prev) => ({
-            ...prev,
-            [plan.idx]: { state: 'error', message: 'Cancelled' },
-          }));
-          break;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        batchErrors.push(`${plan.ociName}: ${msg}`);
-        setSyncStatuses((prev) => ({
-          ...prev,
-          [plan.idx]: { state: 'error', message: msg },
-        }));
       }
-    }
 
-    if (indexAddOrUpdate.length > 0 || indexRemoveKeys.length > 0) {
-      setSyncOverallProgress({
-        current: activePlans.length,
-        total: activePlans.length,
-        message: 'Updating repository file index...',
-        percent: 99,
-      });
-      await enqueueRepoIndexMutation({
-        repo: selectedRepo,
-        addOrUpdate: indexAddOrUpdate,
-        removeKeys: indexRemoveKeys,
-      });
-    }
+      if (indexAddOrUpdate.length > 0 || indexRemoveKeys.length > 0) {
+        setSyncOverallProgress({
+          current: resolvedPlans.length,
+          total: resolvedPlans.length,
+          message: 'Updating repository file index...',
+          percent: 99,
+        });
+        await enqueueRepoIndexMutation({
+          repo: selectedRepo,
+          addOrUpdate: indexAddOrUpdate,
+          removeKeys: indexRemoveKeys,
+        });
+      }
 
-    if (syncAbortRef.current === abortCtrl) {
-      syncAbortRef.current = null;
-    }
-    setSyncOverallProgress(null);
-    setIsSyncingFolder(false);
-    await refreshPackages();
+      await refreshPackages();
 
-    if (wasCancelled) {
-      setSyncModalError(
-        syncedCount > 0
-          ? `Sync cancelled (${syncedCount} completed item(s) uploaded and indexed).`
-          : 'Sync cancelled.'
-      );
-    } else if (batchErrors.length > 0) {
-      setSyncModalError(batchErrors.join(' | '));
-    } else {
-      setShowSyncReviewModal(false);
-      setSyncBatchSummary({
-        syncedCount,
-        skippedCount,
-        replacedCount: totalReplacedCount,
-      });
+      if (leaseLost) {
+        setSyncModalError(
+          syncedCount > 0
+            ? `Sync stopped because this device lost its upload lock after being inactive or disconnected (${syncedCount} earlier item(s) uploaded and indexed).`
+            : 'Sync aborted because this device lost its upload lock after being inactive or disconnected. Please try again.'
+        );
+      } else if (wasCancelled) {
+        setSyncModalError(
+          syncedCount > 0
+            ? `Sync cancelled (${syncedCount} completed item(s) uploaded and indexed).`
+            : 'Sync cancelled.'
+        );
+      } else if (batchErrors.length > 0) {
+        setSyncModalError(batchErrors.join(' | '));
+      } else {
+        setShowSyncReviewModal(false);
+        setSyncBatchSummary({
+          syncedCount,
+          skippedCount,
+          replacedCount: totalReplacedCount,
+        });
+      }
+    } catch (err: unknown) {
+      if (leaseLost) {
+        setSyncModalError(
+          'Sync aborted because this device lost its upload lock after being inactive or disconnected. Please try again.'
+        );
+      } else if (isAbortError(err)) {
+        setSyncModalError('Sync cancelled.');
+      } else {
+        setSyncModalError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      await lockBundle?.releaseAll();
+      if (syncAbortRef.current === abortCtrl) {
+        syncAbortRef.current = null;
+      }
+      setSyncOverallProgress(null);
+      setIsSyncingFolder(false);
     }
   }
 
@@ -2533,6 +2901,28 @@ export default function App() {
     });
 
     try {
+      const isOtherPkg = otherPackages.some(
+        (p) => p.name.toLowerCase() === pkgName.toLowerCase()
+      );
+
+      if (!isRepoIndexPackageName(pkgName) && !isOtherPkg) {
+        const latestIndexMap = await syncRemoteRepoIndexIfChanged(selectedRepo);
+        if (ac.signal.aborted) return;
+        const remoteRecord = latestIndexMap[vKey];
+        if (remoteRecord) {
+          const restored = indexRecordToOciDetails(
+            remoteRecord,
+            info.primaryTag || info.shortDigest
+          );
+          setInspectedByKey((prev) => ({
+            ...prev,
+            [vKey]: restored,
+          }));
+          setExpandedVersionKeys((prev) => new Set(prev).add(vKey));
+          return;
+        }
+      }
+
       const details = await inspectPackageManifest({
         username: user.login,
         githubToken: authToken,
@@ -2550,9 +2940,6 @@ export default function App() {
       }));
       setExpandedVersionKeys((prev) => new Set(prev).add(vKey));
 
-      const isOtherPkg = otherPackages.some(
-        (p) => p.name.toLowerCase() === pkgName.toLowerCase()
-      );
       if (!isRepoIndexPackageName(pkgName) && !isOtherPkg) {
         void enqueueRepoIndexMutation({
           repo: selectedRepo,
@@ -3046,9 +3433,67 @@ export default function App() {
     const isOtherPkg = otherPackages.some(
       (p) => p.name.toLowerCase() === pkgKey
     );
+    const shouldLockPkg = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
+    let pkgLock: ActiveRepoLock | null = null;
 
     try {
-      if (siblingVersions.length <= 1) {
+      if (shouldLockPkg) {
+        pkgLock = await acquireRepoLock({
+          repo: selectedRepo,
+          githubToken: authToken,
+          ownerLogin: user.login,
+          lockKey: getPackageLockKey(pkg.name),
+          packageName: pkg.name,
+          operation: 'delete',
+          onWaiting: (info) =>
+            setVersionNotices((prev) => ({
+              ...prev,
+              [vKey]: {
+                type: 'warning',
+                text: formatLockWaitLabel(info, pkg.name),
+              },
+            })),
+        });
+      }
+
+      // Check live version list after acquiring lock so we don't delete the whole
+      // package if another PC uploaded another version while we waited.
+      let effectiveVersions = siblingVersions;
+      if (shouldLockPkg) {
+        if (pkgLock?.hadToWait) {
+          setVersionNotices((prev) => {
+            if (!prev[vKey]) return prev;
+            const next = { ...prev };
+            delete next[vKey];
+            return next;
+          });
+        }
+
+        const liveState = await fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: pkg.owner.login,
+          ownerType: pkg.owner.type,
+          packageName: pkg.name,
+        });
+        effectiveVersions = liveState.versions;
+
+        if (!liveState.exists || !effectiveVersions.some((v) => v.id === version.id)) {
+          setVersionNotices((prev) => {
+            const next = { ...prev };
+            delete next[vKey];
+            return next;
+          });
+          await enqueueRepoIndexMutation({
+            repo: selectedRepo,
+            ...(liveState.exists ? { removeKeys: [vKey] } : { removePkgNames: [pkg.name] }),
+          });
+          await refreshPackages();
+          return;
+        }
+      }
+
+      if (effectiveVersions.length <= 1) {
         await deleteGitHubPackage({
           githubToken: authToken,
           currentUserLogin: user.login,
@@ -3060,7 +3505,7 @@ export default function App() {
           pkg,
           `Removed "${pkg.name}" (last remaining version deleted) from GitHub Packages.`
         );
-        if (!isOtherPkg && !isRepoIndexPackageName(pkg.name)) {
+        if (shouldLockPkg) {
           await enqueueRepoIndexMutation({
             repo: selectedRepo,
             removePkgNames: [pkg.name],
@@ -3082,7 +3527,7 @@ export default function App() {
             text: `Removed version "${pkg.name}${info.pullSuffix}" from GitHub Packages.`,
           },
         }));
-        if (!isOtherPkg && !isRepoIndexPackageName(pkg.name)) {
+        if (shouldLockPkg) {
           await enqueueRepoIndexMutation({
             repo: selectedRepo,
             removeKeys: [vKey],
@@ -3099,6 +3544,7 @@ export default function App() {
         },
       }));
     } finally {
+      await pkgLock?.release();
       setDeletingVersionKey(null);
     }
   }
@@ -3109,9 +3555,75 @@ export default function App() {
     const isOtherPkg = otherPackages.some(
       (p) => p.name.toLowerCase() === pkgKey
     );
+    const shouldLockPkg = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
+    const beforeVersions = packageVersionsMap[pkgKey] || [];
     setDeletingPkgName(pkg.name);
     setConfirmDeletePkg(null);
+    let pkgLock: ActiveRepoLock | null = null;
     try {
+      if (shouldLockPkg) {
+        pkgLock = await acquireRepoLock({
+          repo: selectedRepo,
+          githubToken: authToken,
+          ownerLogin: user.login,
+          lockKey: getPackageLockKey(pkg.name),
+          packageName: pkg.name,
+          operation: 'delete',
+          onWaiting: (info) =>
+            setPkgNotices((prev) => ({
+              ...prev,
+              [pkgKey]: {
+                type: 'warning',
+                text: formatLockWaitLabel(info, pkg.name),
+              },
+            })),
+        });
+
+        if (pkgLock.hadToWait) {
+          setPkgNotices((prev) => {
+            if (!prev[pkgKey]) return prev;
+            const next = { ...prev };
+            delete next[pkgKey];
+            return next;
+          });
+        }
+
+        const liveState = await fetchLivePackageState({
+          githubToken: authToken,
+          currentUserLogin: user.login,
+          owner: pkg.owner.login,
+          ownerType: pkg.owner.type,
+          packageName: pkg.name,
+        });
+        if (!liveState.exists) {
+          recordDeletedPkgTombstone(
+            pkg,
+            `Removed package "${pkg.name}" from GitHub Packages.`
+          );
+          await enqueueRepoIndexMutation({
+            repo: selectedRepo,
+            removePkgNames: [pkg.name],
+          });
+          await refreshPackages();
+          return;
+        }
+        if (
+          pkgLock.hadToWait &&
+          getVersionStateSignature(liveState.versions) !==
+            getVersionStateSignature(beforeVersions)
+        ) {
+          setPkgNotices((prev) => ({
+            ...prev,
+            [pkgKey]: {
+              type: 'warning',
+              text: `Another PC updated "${pkg.name}" while you were waiting. The version list has been refreshed - click Remove Package again if you still want to delete all versions.`,
+            },
+          }));
+          await refreshPackages();
+          return;
+        }
+      }
+
       await deleteGitHubPackage({
         githubToken: authToken,
         currentUserLogin: user.login,
@@ -3123,7 +3635,7 @@ export default function App() {
         pkg,
         `Removed package "${pkg.name}" from GitHub Packages.`
       );
-      if (!isOtherPkg && !isRepoIndexPackageName(pkg.name)) {
+      if (shouldLockPkg) {
         await enqueueRepoIndexMutation({
           repo: selectedRepo,
           removePkgNames: [pkg.name],
@@ -3139,6 +3651,7 @@ export default function App() {
         },
       }));
     } finally {
+      await pkgLock?.release();
       setDeletingPkgName(null);
     }
   }
@@ -3158,6 +3671,8 @@ export default function App() {
         isDarkMode={isDarkMode}
         settings={settings}
         user={user}
+        selectedRepo={selectedRepo}
+        reposLoading={reposLoading}
         authLoading={authLoading}
         showMenu={showMenu}
         setShowMenu={setShowMenu}
@@ -3214,11 +3729,21 @@ export default function App() {
 
             {authTab === 'pat' ? (
               <div className="space-y-5">
-                <div className="p-3.5 rounded-md bg-[#0d1117] border border-[#30363d] text-xs text-gray-300 space-y-2">
+                <div className="p-3.5 rounded-md bg-[#0d1117] border border-[#30363d] text-xs text-gray-300 space-y-2.5">
                   <div className="font-semibold text-white flex items-center gap-1.5">
                     <ShieldCheck className="w-4 h-4 header-logo" />
-                    Required GitHub Scopes:
+                    Required GitHub Permissions (Read &amp; Write):
                   </div>
+                  <ul className="text-[11px] text-gray-400 space-y-1 list-disc list-inside">
+                    <li>
+                      <span className="text-gray-200 font-semibold">Repositories (read/write):</span>{' '}
+                      <code>repo</code> scope (required for repo access and cross-PC locking; selected repos need at least 1 commit).
+                    </li>
+                    <li>
+                      <span className="text-gray-200 font-semibold">Packages (read/write &amp; delete):</span>{' '}
+                      <code>read:packages</code>, <code>write:packages</code>, and <code>delete:packages</code>.
+                    </li>
+                  </ul>
                   <div className="flex flex-wrap gap-1.5">
                     {['repo', 'write:packages', 'read:packages', 'delete:packages'].map(
                       (scope) => (
@@ -3231,11 +3756,14 @@ export default function App() {
                       )
                     )}
                   </div>
+                  <div className="text-[11px] text-gray-400">
+                    Fine-grained PATs must grant <code>Contents: Read and write</code> and <code>Packages: Read and write</code>.
+                  </div>
                   <a
                     href={tokenGenUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 text-gray-300 hover:text-white font-semibold pt-1 underline"
+                    className="inline-flex items-center gap-1.5 text-gray-300 hover:text-white font-semibold pt-0.5 underline"
                   >
                     Open GitHub with scopes pre-selected
                     <ExternalLink className="w-3.5 h-3.5" />
@@ -3604,117 +4132,37 @@ export default function App() {
           />
 
           <main className="w-full max-w-4xl relative z-10 space-y-6">
-            {/* Compact Repository Selector Card */}
-            <div
-              className="bg-[#161b22] border border-[#30363d] rounded-xl p-4 sm:p-5 shadow-md"
-              ref={repoDropdownRef}
-            >
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="relative flex-1 sm:w-80">
-                    <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-400 mb-1">
-                      Target GitHub Repository ({repos.length})
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => setShowRepoDropdown(!showRepoDropdown)}
-                      className="w-full px-3.5 py-2 rounded-md bg-[#0d1117] border border-[#30363d] text-left text-xs font-semibold text-white flex items-center justify-between gap-2 cursor-pointer"
-                    >
-                      <span className="truncate">
-                        {selectedRepo
-                          ? selectedRepo.full_name
-                          : 'Select a repository...'}
-                      </span>
-                      <ChevronDown className="w-4 h-4 text-gray-400 shrink-0" />
-                    </button>
-
-                    {showRepoDropdown && (
-                      <div className="absolute left-0 top-full mt-1.5 w-full sm:w-96 bg-[#161b22] border border-[#30363d] rounded-md shadow-2xl z-40 overflow-hidden">
-                        <div className="p-2 border-b border-[#30363d] bg-[#0d1117]">
-                          <div className="relative">
-                            <Search className="w-3.5 h-3.5 text-gray-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                            <input
-                              type="text"
-                              value={repoSearch}
-                              onChange={(e) => setRepoSearch(e.target.value)}
-                              placeholder="Filter repositories..."
-                              autoFocus
-                              className="w-full pl-8 pr-3 py-1.5 rounded bg-[#161b22] border border-[#30363d] text-xs text-white focus:outline-none"
-                            />
-                          </div>
-                        </div>
-                        <div className="max-h-64 overflow-y-auto divide-y divide-[#30363d]">
-                          {filteredRepos.length === 0 ? (
-                            <div className="p-4 text-center text-xs text-gray-500">
-                              No matching repositories.
-                            </div>
-                          ) : (
-                            filteredRepos.map((repo) => {
-                              const isSelected = selectedRepo?.id === repo.id;
-                              return (
-                                <button
-                                  key={repo.id}
-                                  type="button"
-                                  onClick={() => {
-                                    setSelectedRepo(repo);
-                                    setShowRepoDropdown(false);
-                                  }}
-                                  className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 cursor-pointer transition ${
-                                    isSelected
-                                      ? 'active-variant font-bold'
-                                      : 'hover:bg-[#21262d] text-gray-300'
-                                  }`}
-                                >
-                                  <div className="min-w-0">
-                                    <div className="truncate">{repo.full_name}</div>
-                                    {repo.description && (
-                                      <div className="text-[11px] text-gray-500 truncate">
-                                        {repo.description}
-                                      </div>
-                                    )}
-                                  </div>
-                                  <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
-                                    {repo.private ? 'Private' : 'Public'}
-                                  </span>
-                                </button>
-                              );
-                            })
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
+            {!selectedRepo && !reposLoading && (
+              <div className="p-4 rounded-xl theme-warning-banner text-xs flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>
+                    {repos.length > 0
+                      ? 'No selectable repository found. Repositories with 0 commits (or without read/write access) cannot be selected because multi-PC locking requires at least 1 commit. Add an initial commit on GitHub and click Refresh.'
+                      : 'No repositories found for this GitHub account yet. Create a repository with at least 1 commit and click Refresh.'}
+                  </span>
                 </div>
-
-                {selectedRepo && (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <a
-                      href={`${selectedRepo.html_url}/packages`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5"
-                    >
-                      View Repo Packages on GitHub
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handleSignInWithToken(authToken, { source: 'restore' })
-                      }
-                      title="Refresh repositories"
-                      className="btn-modal-action p-2 rounded-md cursor-pointer"
-                    >
-                      <RefreshCw
-                        className={`w-3.5 h-3.5 ${
-                          reposLoading ? 'animate-spin' : ''
-                        }`}
-                      />
-                    </button>
-                  </div>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowSettingsModal(true)}
+                    className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold cursor-pointer"
+                  >
+                    Open App Settings
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleSignInWithToken(authToken, { source: 'restore' })
+                    }
+                    className="btn-modal-action px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Refresh
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
             {selectedRepo && (
               <>
@@ -5607,6 +6055,16 @@ export default function App() {
         setSettings={setSettings}
         isDarkMode={isDarkMode}
         setIsDarkMode={setIsDarkMode}
+        isSignedIn={Boolean(user)}
+        repos={repos}
+        selectedRepo={selectedRepo}
+        onSelectRepo={(repo) => setSelectedRepo(repo)}
+        reposLoading={reposLoading}
+        onRefreshRepos={() => {
+          if (authToken) {
+            void handleSignInWithToken(authToken, { source: 'restore' });
+          }
+        }}
       />
 
       <HelpModal

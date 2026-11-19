@@ -930,3 +930,41 @@ html.theme-terminal-green .dropzone-container-sync.is-drag-over,
   background-color: var(--theme-bg) !important;
   border: 1px solid var(--theme-border) !important;
 }
+
+/* Disabled / Empty (0-commit) Repository Selector Options (all 5 themes) */
+.repo-option-disabled {
+  background-color: transparent !important;
+  color: var(--theme-text-muted) !important;
+  opacity: 0.5 !important;
+  cursor: not-allowed !important;
+}
+.repo-option-disabled:hover {
+  background-color: transparent !important;
+}
+.repo-option-disabled * {
+  color: inherit !important;
+}
+html.theme-light:not(.theme-monochrome) .repo-option-disabled,
+.theme-light:not(.theme-monochrome) .repo-option-disabled {
+  background-color: #f9fafb !important;
+  color: #9ca3af !important;
+  opacity: 0.75 !important;
+}
+html.theme-monochrome .repo-option-disabled,
+.theme-monochrome .repo-option-disabled {
+  background-color: #f3f4f6 !important;
+  color: #6b7280 !important;
+  opacity: 0.75 !important;
+}
+.theme-terminal-green .repo-option-disabled,
+html.theme-terminal-green .repo-option-disabled {
+  background-color: #000000 !important;
+  color: rgba(74, 222, 128, 0.48) !important;
+  opacity: 1 !important;
+}
+.theme-terminal-red .repo-option-disabled,
+html.theme-terminal-red .repo-option-disabled {
+  background-color: #000000 !important;
+  color: rgba(248, 113, 113, 0.48) !important;
+  opacity: 1 !important;
+}

@@ -61,7 +61,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                     Personal Access Token (PAT)
                   </h4>
                   <p className="text-sm text-gray-300">
-                    Sign in immediately using a classic GitHub Personal Access Token (<code>ghp_...</code>) with the four required scopes: <code>repo</code>, <code>write:packages</code>, <code>read:packages</code>, and <code>delete:packages</code>.
+                    Sign in immediately using a classic GitHub Personal Access Token (<code>ghp_...</code>) with read/write repository access (<code>repo</code>) and package scopes (<code>write:packages</code>, <code>read:packages</code>, and <code>delete:packages</code>). Repositories must have at least 1 commit to be selected.
                   </p>
                 </div>
                 <div className="border-t border-[#30363d] pt-4">

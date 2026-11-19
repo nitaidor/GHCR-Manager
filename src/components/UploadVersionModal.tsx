@@ -68,6 +68,7 @@ export interface UploadVersionModalProps {
   onConfirmUpload: (opts: {
     tag: string;
     replaceVersions: GitHubPackageVersion[];
+    isTagManuallyEdited: boolean;
   }) => Promise<void>;
   onCancelUpload?: () => void;
 }
@@ -118,6 +119,21 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
     setSelectedReplaceIds(new Set());
     setExpandedKeys(new Set());
   }, [isOpen, packageName]);
+
+  // Prune stale checked IDs if existingVersions refreshes after waiting on a lock
+  useEffect(() => {
+    if (!isOpen) return;
+    const validIds = new Set(existingVersions.map((v) => v.id));
+    setSelectedReplaceIds((prev) => {
+      let changed = false;
+      const next = new Set<number>();
+      for (const id of prev) {
+        if (validIds.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [isOpen, existingVersions]);
 
   // Allow Escape to close when not actively uploading
   useEffect(() => {
@@ -202,6 +218,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
     onConfirmUpload({
       tag: tagValidation.tag,
       replaceVersions: replaceTargets,
+      isTagManuallyEdited,
     });
   };
 

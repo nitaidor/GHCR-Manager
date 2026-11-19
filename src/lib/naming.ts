@@ -211,6 +211,77 @@ export function validateFilesSelectionName(
 export const REPO_INDEX_PACKAGE_PREFIX = 'ghcr-manager-index_';
 export const REPO_INDEX_MODE = 'repo-index';
 export const REPO_INDEX_KEEP_VERSIONS = 5;
+export const REPO_INDEX_LOCK_KEY = 'index';
+
+/**
+ * Generates an OCI tag for `ghcr-manager-index_<repo>` using `formatTimestampTag`,
+ * appending milliseconds (or sequence number) only if `existingTags` already contains
+ * that exact same-second tag.
+ */
+export function formatUniqueRepoIndexTag(
+  date: Date,
+  clockFormat: ClockFormat = '24h',
+  dateFormat: DateFormat = 'YYYY-MM-DD',
+  existingTags?: Iterable<string>
+): string {
+  const base = formatTimestampTag(date, clockFormat, dateFormat);
+  const taken = new Set<string>();
+  if (existingTags) {
+    for (const tag of existingTags) {
+      if (tag) taken.add(tag.trim());
+    }
+  }
+  if (!taken.has(base)) {
+    return base;
+  }
+
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  const withMs = `${base}.${ms}`.slice(0, 128);
+  if (!taken.has(withMs)) {
+    return withMs;
+  }
+
+  for (let seq = 2; seq < 1000; seq++) {
+    const candidate = `${base}.${ms}-${seq}`.slice(0, 128);
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `${base}.${ms}-${Date.now()}`.slice(0, 128);
+}
+
+/**
+ * Bijectively encodes an arbitrary string into a single Git-ref-safe path segment
+ * containing only `[a-z0-9_-]` (no dots, slashes, `..`, or `.lock` suffix).
+ */
+export function toGitRefSafeLockSegment(rawName: string): string {
+  const normalized = rawName.trim().toLowerCase() || 'default';
+  const bytes = new TextEncoder().encode(normalized);
+  let encoded = '';
+  for (const byte of bytes) {
+    const isAlphaNumOrHyphen =
+      (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte === 45;
+    if (isAlphaNumOrHyphen) {
+      encoded += String.fromCharCode(byte);
+    } else {
+      encoded += `_${byte.toString(16).padStart(2, '0')}_`;
+    }
+  }
+  if (encoded.length <= 160) {
+    return encoded;
+  }
+  // Keep deterministic fixed-length FNV-1a suffix if unusually long
+  let hash = 0x811c9dc5;
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${encoded.slice(0, 140)}-${hash.toString(16).padStart(8, '0')}`;
+}
+
+export function getPackageLockKey(pkgName: string): string {
+  return `pkg-${toGitRefSafeLockSegment(pkgName)}`;
+}
 
 export function getRepoIndexPackageName(repoName: string): string {
   const slug = toOciImageName(repoName) || 'repo';
