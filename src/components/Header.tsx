@@ -82,7 +82,7 @@ export const Header: React.FC<HeaderProps> = ({
       ? `${user.login} (${selectedRepo.name})`
       : reposLoading
       ? `${user.login} (loading...)`
-      : `${user.login} (no repo)`;
+      : `${user.login} (no selected repo)`;
 
     return (
       <span className="px-2.5 py-0.5 text-[11px] font-bold tracking-wider rounded border flex items-center gap-1.5 status-badge-valid shadow-sm leading-none w-fit mb-[2px] max-w-full">
