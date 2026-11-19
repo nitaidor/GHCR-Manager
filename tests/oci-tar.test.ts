@@ -558,7 +558,8 @@ async function runTests() {
     assert.equal(lock1Res.hadToWait || lock2Res.hadToWait, true);
     assert.ok(pc2WaitCalls >= 1 || lock1Res.hadToWait);
 
-    // (b) Crashed lease expiry + server-clock immunity + late stale release rejection
+    // (b) Crashed/offline lease expiry + verifyHeld blocks late manifest push + late release rejection
+    let pc1LeaseLostFired = false;
     const pc1CrashLock = await acquireRepoIndexLock({
       repo: demoRepo,
       githubToken: 'tok',
@@ -566,11 +567,14 @@ async function runTests() {
       pollIntervalMs: 25,
       heartbeatIntervalMs: 60_000,
       leaseTtlMs: 5_000,
+      onLeaseLost: () => {
+        pc1LeaseLostFired = true;
+      },
       httpRequest: mockGitHubHttp,
     });
     // Advance GitHub server clock past the 5s lease TTL
     mockServerNowMs += 6_500;
-    let leaseLostFired = false;
+    let pc2LeaseLostFired = false;
     const pc2Takeover = await acquireRepoLock({
       repo: demoRepo,
       githubToken: 'tok',
@@ -582,11 +586,16 @@ async function runTests() {
       heartbeatIntervalMs: 60_000,
       leaseTtlMs: 5_000,
       onLeaseLost: () => {
-        leaseLostFired = true;
+        pc2LeaseLostFired = true;
       },
       httpRequest: mockGitHubHttp,
     });
-    assert.equal(leaseLostFired, false);
+    assert.equal(pc2LeaseLostFired, false);
+    await pc2Takeover.verifyHeld();
+    // Old disconnected PC reconnects right before publishing manifest: verifyHeld must reject
+    await assert.rejects(() => pc1CrashLock.verifyHeld(), /Lock lease lost/);
+    assert.equal(pc1LeaseLostFired, true);
+    assert.equal(pc1CrashLock.isLeaseLost(), true);
     // Old crashed PC wakes up late and tries to release; CAS 422 must reject it
     const activeTakeoverSha = refs.get('refs/ghcr-manager/locks/index');
     await pc1CrashLock.release();

@@ -1094,6 +1094,7 @@ export default function App() {
           dateFormat: settings.dateFormat,
           canDeletePackages: canDelete,
           existingTags: existingIndexTags,
+          beforePublishManifest: () => indexLock!.verifyHeld(),
         });
 
         setRepoIndexEntries(baseEntries);
@@ -1926,6 +1927,7 @@ export default function App() {
             : 'multi-file',
         files: tarInputs,
         desktopFiles,
+        beforePublishManifest: () => pkgLock!.verifyHeld(),
         signal: abortCtrl.signal,
         onProgress: (p) => setUploadProgress(p),
       });
@@ -1956,6 +1958,7 @@ export default function App() {
       let deleteErrors: string[] = [];
       const deletedVersionKeys: string[] = [];
       if (opts.replaceVersions.length > 0) {
+        await pkgLock.verifyHeld();
         const pkgOwnerLogin =
           modalLivePkg?.owner.login || selectedRepo.owner.login;
         const pkgOwnerType =
@@ -2691,6 +2694,7 @@ export default function App() {
             mode: plan.item.kind,
             files: tarFiles,
             desktopFiles,
+            beforePublishManifest: () => lockBundle!.verifyAllHeld(),
             signal: abortCtrl.signal,
             onProgress: (p) => {
               const overallPct = Math.min(
@@ -2737,6 +2741,7 @@ export default function App() {
 
           let deleteErrors: string[] = [];
           if (plan.replaceVersions.length > 0) {
+            await lockBundle.verifyAllHeld();
             setSyncOverallProgress({
               current: i + 1,
               total: resolvedPlans.length,

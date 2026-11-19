@@ -48,6 +48,7 @@ export interface ActiveRepoLock {
   packageName?: string;
   hadToWait: boolean;
   isLeaseLost: () => boolean;
+  verifyHeld: () => Promise<void>;
   release: () => Promise<void>;
 }
 
@@ -55,6 +56,7 @@ export interface ActiveRepoLockBundle {
   locks: ActiveRepoLock[];
   hadToWait: boolean;
   isAnyLeaseLost: () => boolean;
+  verifyAllHeld: () => Promise<void>;
   releaseAll: () => Promise<void>;
 }
 
@@ -531,6 +533,7 @@ function createActiveRepoLockHandle(opts: {
   let currentSha = opts.initialCommitSha;
   let released = false;
   let leaseLost = false;
+  let lastConfirmedAt = Date.now();
   let releasePromise: Promise<void> | null = null;
   let opChain: Promise<void> = Promise.resolve();
 
@@ -543,53 +546,84 @@ function createActiveRepoLockHandle(opts: {
     return next;
   };
 
+  const markLeaseLost = () => {
+    if (leaseLost) return;
+    leaseLost = true;
+    clearInterval(hbTimer);
+    opts.onLeaseLost?.();
+  };
+
+  const renewOnce = async (strictNetwork: boolean): Promise<boolean> => {
+    if (released || leaseLost) return false;
+    if (Date.now() - lastConfirmedAt >= opts.leaseTtlMs) {
+      markLeaseLost();
+      return false;
+    }
+    try {
+      const hbPayload: RepoLockLeasePayload = {
+        schemaVersion: 1,
+        status: 'locked',
+        lockKey: opts.lockKey,
+        ...(opts.packageName ? { packageName: opts.packageName } : {}),
+        ownerLogin: opts.ownerLogin,
+        sessionId: opts.sessionId,
+        operation: opts.operation,
+        leaseTtlMs: opts.leaseTtlMs,
+        acquiredAt: opts.acquiredAt,
+        heartbeatAt: Date.now(),
+      };
+      const hbSha = await createLockCommit({
+        httpRequest: opts.httpRequest,
+        githubToken: opts.githubToken,
+        owner: opts.owner,
+        repoName: opts.repoName,
+        repoFullName: opts.repoFullName,
+        treeSha: opts.treeSha,
+        parents: [currentSha],
+        payload: hbPayload,
+      });
+      const result = await tryFastForwardLockRef({
+        httpRequest: opts.httpRequest,
+        githubToken: opts.githubToken,
+        owner: opts.owner,
+        repoName: opts.repoName,
+        repoFullName: opts.repoFullName,
+        refSubPath: opts.refSubPath,
+        commitSha: hbSha,
+      });
+      if (!result.ok) {
+        markLeaseLost();
+        return false;
+      }
+      currentSha = hbSha;
+      lastConfirmedAt = Date.now();
+      return true;
+    } catch (err) {
+      if (Date.now() - lastConfirmedAt >= opts.leaseTtlMs) {
+        markLeaseLost();
+        return false;
+      }
+      if (strictNetwork) {
+        throw err;
+      }
+      return !leaseLost;
+    }
+  };
+
   const runHeartbeat = () => {
     if (released || leaseLost) return;
-    void enqueueOp(async () => {
-      if (released || leaseLost) return;
-      try {
-        const hbPayload: RepoLockLeasePayload = {
-          schemaVersion: 1,
-          status: 'locked',
-          lockKey: opts.lockKey,
-          ...(opts.packageName ? { packageName: opts.packageName } : {}),
-          ownerLogin: opts.ownerLogin,
-          sessionId: opts.sessionId,
-          operation: opts.operation,
-          leaseTtlMs: opts.leaseTtlMs,
-          acquiredAt: opts.acquiredAt,
-          heartbeatAt: Date.now(),
-        };
-        const hbSha = await createLockCommit({
-          httpRequest: opts.httpRequest,
-          githubToken: opts.githubToken,
-          owner: opts.owner,
-          repoName: opts.repoName,
-          repoFullName: opts.repoFullName,
-          treeSha: opts.treeSha,
-          parents: [currentSha],
-          payload: hbPayload,
-        });
-        const result = await tryFastForwardLockRef({
-          httpRequest: opts.httpRequest,
-          githubToken: opts.githubToken,
-          owner: opts.owner,
-          repoName: opts.repoName,
-          repoFullName: opts.repoFullName,
-          refSubPath: opts.refSubPath,
-          commitSha: hbSha,
-        });
-        if (!result.ok) {
-          leaseLost = true;
-          clearInterval(hbTimer);
-          opts.onLeaseLost?.();
-          return;
-        }
-        currentSha = hbSha;
-      } catch {
-        // Transient network error on heartbeat; next beat retries before TTL expires
-      }
-    });
+    if (Date.now() - lastConfirmedAt >= opts.leaseTtlMs) {
+      markLeaseLost();
+      return;
+    }
+    void enqueueOp(() => renewOnce(false));
+  };
+
+  const verifyHeld = async (): Promise<void> => {
+    const ok = await enqueueOp(() => renewOnce(true));
+    if (!ok) {
+      throw new DOMException('Lock lease lost', 'AbortError');
+    }
   };
 
   const hbTimer = setInterval(runHeartbeat, opts.heartbeatIntervalMs);
@@ -652,6 +686,7 @@ function createActiveRepoLockHandle(opts: {
     packageName: opts.packageName,
     hadToWait: opts.hadToWait,
     isLeaseLost: () => leaseLost,
+    verifyHeld,
     release,
   };
 }
@@ -878,6 +913,7 @@ export function acquireRepoIndexLock(opts: {
   ownerLogin: string;
   signal?: AbortSignal;
   onWaiting?: (info: RepoLockWaitInfo) => void;
+  onLeaseLost?: () => void;
   leaseTtlMs?: number;
   heartbeatIntervalMs?: number;
   pollIntervalMs?: number;
@@ -956,6 +992,11 @@ export async function acquireRepoPackageLocks(opts: {
     locks: acquired,
     hadToWait,
     isAnyLeaseLost: () => acquired.some((l) => l.isLeaseLost()),
+    verifyAllHeld: async () => {
+      for (const lock of acquired) {
+        await lock.verifyHeld();
+      }
+    },
     releaseAll: async () => {
       await Promise.allSettled(
         [...acquired].reverse().map((l) => l.release())

@@ -503,6 +503,7 @@ export async function buildAndPushOciImage(opts: {
   mode: 'single-file' | 'multi-file' | 'root-file' | 'root-subfolder' | 'repo-index';
   files?: TarInputFile[];
   desktopFiles?: DesktopStreamingInputFile[];
+  beforePublishManifest?: () => Promise<void>;
   onProgress?: (update: PushProgressUpdate) => void;
   signal?: AbortSignal;
 }): Promise<OciPackageDetails> {
@@ -770,7 +771,10 @@ export async function buildAndPushOciImage(opts: {
       }
     }
 
-    // 7. Publish Manifest
+    // 7. Publish Manifest (verify any active lock lease right before tagging)
+    if (opts.beforePublishManifest) {
+      await opts.beforePublishManifest();
+    }
     if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
     onProgress?.({
       stage: 'publishing-manifest',
@@ -1275,6 +1279,7 @@ export async function publishRepoIndexSnapshot(opts: {
   dateFormat: DateFormat;
   canDeletePackages: boolean;
   existingTags?: Iterable<string>;
+  beforePublishManifest?: () => Promise<void>;
 }): Promise<{
   indexPackage: GitHubPackageItem | null;
   versions: GitHubPackageVersion[];
@@ -1297,6 +1302,7 @@ export async function publishRepoIndexSnapshot(opts: {
     ociPackageNameOverride: ociIndexPkgName,
     tag,
     mode: REPO_INDEX_MODE,
+    beforePublishManifest: opts.beforePublishManifest,
     files: [
       {
         relativePath: 'index.json',
