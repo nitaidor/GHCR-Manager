@@ -628,6 +628,262 @@ async function streamOciLayerInChunks({
 }
 
 /**
+ * Streams local files directly from disk through TAR + gzip into a single continuous
+ * stream (buffered up to `monolithicThresholdBytes` first so <= 4 MiB layers can commit
+ * via one monolithic PUT). Writes zero temporary archive files to disk.
+ */
+async function streamOciLayerContinuous({
+  files,
+  monolithicThresholdBytes = DEFAULT_STREAM_CHUNK_BYTES,
+  onStartStream,
+  onMonolithic,
+  onCommitStreamed,
+  onProgress,
+  signal,
+  gzipLevel,
+}) {
+  if (
+    typeof onStartStream !== 'function' ||
+    typeof onMonolithic !== 'function' ||
+    typeof onCommitStreamed !== 'function'
+  ) {
+    throw new Error(
+      'streamOciLayerContinuous requires onStartStream, onMonolithic, and onCommitStreamed callbacks.'
+    );
+  }
+  const { statList, totalFileBytes } = await prepareTarSourceEntries(files, signal);
+  const resolvedGzipLevel =
+    typeof gzipLevel === 'number'
+      ? gzipLevel
+      : totalFileBytes >= ADAPTIVE_GZIP_FAST_THRESHOLD_BYTES
+        ? 1
+        : 6;
+
+  const uncompressedHash = crypto.createHash('sha256');
+  const compressedHash = crypto.createHash('sha256');
+  const gzip = zlib.createGzip({ level: resolvedGzipLevel });
+  const initialBuf = Buffer.allocUnsafe(monolithicThresholdBytes);
+  let initialFill = 0;
+  let activeStream = null;
+  let compressedSize = 0;
+  let uploadedCompressedBytes = 0;
+  let committedDigest = null;
+  let processedBytes = 0;
+  let lastPct = -1;
+  let lastReportedUploaded = -1;
+  let activeReadStream = null;
+  let pipeFailed = false;
+  let pipeError = null;
+
+  function reportProgress(force = false, dataSent = false) {
+    if (!onProgress) return;
+    const pct =
+      totalFileBytes > 0
+        ? Math.min(100, Math.round((processedBytes / totalFileBytes) * 100))
+        : 100;
+    const uploadedDelta = uploadedCompressedBytes - lastReportedUploaded;
+    if (
+      force ||
+      pct !== lastPct ||
+      (dataSent && (lastReportedUploaded < 0 || uploadedDelta >= 1024 * 1024))
+    ) {
+      lastPct = pct;
+      if (uploadedCompressedBytes > lastReportedUploaded) {
+        lastReportedUploaded = uploadedCompressedBytes;
+      }
+      onProgress({
+        processedBytes,
+        totalBytes: totalFileBytes,
+        uploadedBytes: uploadedCompressedBytes,
+        percent: pct,
+      });
+    }
+  }
+
+  let sink;
+  const abortPipelineWithError = (streamErr) => {
+    if (!pipeError && streamErr) pipeError = streamErr;
+    pipeFailed = true;
+    try {
+      activeReadStream?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      gzip.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      sink?.destroy(streamErr);
+    } catch {
+      // ignore
+    }
+  };
+
+  sink = new Writable({
+    highWaterMark: 256 * 1024,
+    write(gzChunk, _enc, cb) {
+      (async () => {
+        if (signal?.aborted) {
+          throw createAbortError('Upload cancelled');
+        }
+        if (pipeFailed) {
+          throw pipeError || new Error('Archive stream failed');
+        }
+        const buf = Buffer.isBuffer(gzChunk) ? gzChunk : Buffer.from(gzChunk);
+        compressedSize += buf.length;
+        compressedHash.update(buf);
+
+        if (!activeStream) {
+          if (initialFill + buf.length <= monolithicThresholdBytes) {
+            buf.copy(initialBuf, initialFill);
+            initialFill += buf.length;
+            reportProgress(false, false);
+            return;
+          }
+          activeStream = await onStartStream({
+            abortPipeline: abortPipelineWithError,
+          });
+          if (initialFill > 0) {
+            await activeStream.write(initialBuf.subarray(0, initialFill));
+            uploadedCompressedBytes += initialFill;
+            initialFill = 0;
+          }
+        }
+
+        await activeStream.write(buf);
+        uploadedCompressedBytes += buf.length;
+        reportProgress(false, true);
+      })().then(
+        () => cb(),
+        (err) => cb(err)
+      );
+    },
+    final(cb) {
+      (async () => {
+        if (signal?.aborted) {
+          throw createAbortError('Upload cancelled');
+        }
+        if (pipeFailed) {
+          throw pipeError || new Error('Archive stream failed');
+        }
+        committedDigest = `sha256:${compressedHash.digest('hex')}`;
+        if (!activeStream) {
+          const body = initialFill > 0 ? initialBuf.subarray(0, initialFill) : Buffer.alloc(0);
+          await onMonolithic({ body, compressedDigest: committedDigest });
+          uploadedCompressedBytes = body.length;
+          initialFill = 0;
+          reportProgress(true, true);
+          return;
+        }
+        await activeStream.finish();
+        await onCommitStreamed({ compressedDigest: committedDigest });
+        reportProgress(true, true);
+      })().then(
+        () => cb(),
+        (err) => cb(err)
+      );
+    },
+  });
+
+  const pipeDone = pipeline(gzip, sink);
+  pipeDone.catch((e) => {
+    pipeFailed = true;
+    if (!pipeError) pipeError = e;
+  });
+
+  const onAbort = () => {
+    const cancelErr = createAbortError('Upload cancelled');
+    pipeFailed = true;
+    try {
+      activeStream?.destroy?.(cancelErr);
+    } catch {
+      // ignore
+    }
+    try {
+      activeReadStream?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      gzip.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      sink.destroy();
+    } catch {
+      // ignore
+    }
+  };
+  if (signal) {
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  try {
+    reportProgress(true, false);
+    await pumpTarArchiveIntoGzip({
+      statList,
+      gzip,
+      uncompressedHash,
+      signal,
+      onActiveReadStream: (s) => {
+        activeReadStream = s;
+      },
+      getPipeFailure: () => (pipeFailed ? pipeError || new Error('Archive stream failed') : null),
+      onBytesRead: (delta) => {
+        processedBytes += delta;
+        reportProgress(false, false);
+      },
+    });
+    await pipeDone;
+    reportProgress(true, false);
+
+    return {
+      uncompressedDigest: `sha256:${uncompressedHash.digest('hex')}`,
+      compressedDigest: committedDigest || `sha256:${compressedHash.digest('hex')}`,
+      compressedSize,
+      totalFileBytes,
+      fileCount: statList.filter((f) => !f.isDirectory).length,
+      fileMetaList: buildTarFileMetaList(statList),
+    };
+  } catch (err) {
+    try {
+      activeStream?.destroy?.(err);
+    } catch {
+      // ignore
+    }
+    try {
+      activeReadStream?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      gzip.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      sink.destroy();
+    } catch {
+      // ignore
+    }
+    await pipeDone.catch((e) => {
+      if (!pipeError) pipeError = e;
+    });
+    if (signal?.aborted) {
+      throw createAbortError('Upload cancelled');
+    }
+    throw pipeError || err;
+  } finally {
+    if (signal) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
+/**
  * Shared streaming USTAR/PAX TAR state machine for both fast header indexing
  * and streaming zero-RAM extraction directly to disk.
  */
@@ -916,6 +1172,7 @@ module.exports = {
   resolveExtractDestinationInfo,
   resolveSafeExtractPath,
   sanitizeFolderName,
+  streamOciLayerContinuous,
   streamOciLayerInChunks,
   writeStreamChunk,
 };

@@ -52,6 +52,7 @@ const {
 const {
   BLOB_UPLOAD_CHUNK_BYTES,
   streamAndUploadOciLayer,
+  streamAndUploadOciLayerChunked,
 } = require('../electron/oci-upload.cjs');
 
 async function runTests() {
@@ -1315,7 +1316,7 @@ async function runTests() {
       const tempBefore = (await fs.readdir(os.tmpdir())).filter((n) =>
         n.startsWith('ghcr-manager-layer-')
       );
-      const resA = await streamAndUploadOciLayer({
+      const resA = await streamAndUploadOciLayerChunked({
         files: [
           {
             fullPath: random95Path,
@@ -1349,7 +1350,7 @@ async function runTests() {
     await fs.writeFile(smallPath, smallBytes);
     const mockB = await createMockRegistry({});
     try {
-      const resB = await streamAndUploadOciLayer({
+      const resB = await streamAndUploadOciLayerChunked({
         files: [{ fullPath: smallPath, relativePath: 'small.bin', size: smallBytes.length }],
         uploadInitUrl: `${mockB.baseUrl}/v2/alice/pkg/blobs/uploads/`,
         registryToken: 'tok-initial',
@@ -1373,7 +1374,7 @@ async function runTests() {
       expectedLimitLabel: '1.00MiB',
     });
     try {
-      const resC = await streamAndUploadOciLayer({
+      const resC = await streamAndUploadOciLayerChunked({
         files: [
           {
             fullPath: random45Path,
@@ -1398,7 +1399,7 @@ async function runTests() {
     const mockD = await createMockRegistry({ failChunk2With401Once: true });
     let refreshCount = 0;
     try {
-      const resD = await streamAndUploadOciLayer({
+      const resD = await streamAndUploadOciLayerChunked({
         files: [
           {
             fullPath: random45Path,
@@ -1429,7 +1430,7 @@ async function runTests() {
     });
     try {
       await assert.rejects(
-        streamAndUploadOciLayer({
+        streamAndUploadOciLayerChunked({
           files: [
             {
               fullPath: random95Path,
@@ -1446,6 +1447,454 @@ async function runTests() {
       assert.equal(mockE.state.deletedCount, 1);
     } finally {
       await mockE.close();
+    }
+
+    console.log('17. Testing continuous streaming PATCH upload (retry once, proxy/401/double-drop 4 MiB fallback, abort)...');
+    const createStreamingMockRegistry = (opts: {
+      rejectStreamingStatus?: number;
+      dropSocketOnAttempt?: Set<number>;
+      failStreaming401AfterBytes?: number;
+      onContinuousBytes?: () => void;
+    }) => {
+      const state = {
+        expectedToken: 'tok-initial',
+        streamingAttempts: 0,
+        chunkedPatchCalls: 0,
+        monolithicPutCalls: 0,
+        failedStreaming401: false,
+        deletedCount: 0,
+        lastCommittedSessionId: '',
+        sessions: new Map<
+          string,
+          {
+            chunks: Buffer[];
+            offset: number;
+            streamingBytes: number;
+            patchSizes: number[];
+            committedDigest: string | null;
+            deleted: boolean;
+          }
+        >(),
+      };
+
+      const srv = http.createServer((req, res) => {
+        const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
+
+        if (req.method === 'POST' && urlObj.pathname === '/v2/alice/pkg/blobs/uploads/') {
+          if (req.headers.authorization !== `Bearer ${state.expectedToken}`) {
+            res.statusCode = 401;
+            res.end('unauthorized');
+            return;
+          }
+          const sid = `stream-sess-${state.sessions.size + 1}`;
+          state.sessions.set(sid, {
+            chunks: [],
+            offset: 0,
+            streamingBytes: 0,
+            patchSizes: [],
+            committedDigest: null,
+            deleted: false,
+          });
+          res.statusCode = 202;
+          res.setHeader('Location', `/v2/alice/pkg/blobs/uploads/${sid}`);
+          res.end();
+          return;
+        }
+
+        const sessMatch = urlObj.pathname.match(/^\/v2\/alice\/pkg\/blobs\/uploads\/(stream-sess-\d+)$/);
+        if (!sessMatch) {
+          res.statusCode = 404;
+          res.end('not found');
+          return;
+        }
+        const sess = state.sessions.get(sessMatch[1]);
+        if (!sess || sess.deleted) {
+          res.statusCode = 404;
+          res.end('session not found');
+          return;
+        }
+
+        if (req.method === 'DELETE') {
+          sess.deleted = true;
+          state.deletedCount += 1;
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+
+        if (req.headers.authorization !== `Bearer ${state.expectedToken}`) {
+          res.statusCode = 401;
+          res.end('unauthorized');
+          return;
+        }
+
+        if (req.method === 'GET') {
+          res.statusCode = 204;
+          res.setHeader('Range', sess.offset > 0 ? `0-${sess.offset - 1}` : '0-0');
+          res.end();
+          return;
+        }
+
+        if (req.method === 'PATCH') {
+          const contentRange = req.headers['content-range'];
+          if (!contentRange) {
+            state.streamingAttempts += 1;
+            if (opts.rejectStreamingStatus) {
+              res.statusCode = opts.rejectStreamingStatus;
+              res.end('streaming not supported');
+              return;
+            }
+            const attemptIdx = state.streamingAttempts;
+            const localChunks: Buffer[] = [];
+            let received = 0;
+            let endedEarly = false;
+
+            req.on('data', (chunk: Buffer) => {
+              if (endedEarly) return;
+              const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              received += buf.length;
+              localChunks.push(buf);
+
+              if (
+                opts.failStreaming401AfterBytes &&
+                received >= opts.failStreaming401AfterBytes &&
+                !state.failedStreaming401
+              ) {
+                endedEarly = true;
+                state.failedStreaming401 = true;
+                state.expectedToken = 'tok-refreshed';
+                res.statusCode = 401;
+                res.end('token expired mid-stream');
+                return;
+              }
+
+              if (
+                opts.dropSocketOnAttempt &&
+                opts.dropSocketOnAttempt.has(attemptIdx) &&
+                received >= 1024 * 1024
+              ) {
+                endedEarly = true;
+                req.socket.destroy();
+                return;
+              }
+
+              if (opts.onContinuousBytes && received >= 1024 * 1024) {
+                endedEarly = true;
+                opts.onContinuousBytes();
+              }
+            });
+
+            req.on('end', () => {
+              if (endedEarly) return;
+              sess.chunks.push(...localChunks);
+              sess.offset += received;
+              sess.streamingBytes += received;
+              res.statusCode = 202;
+              res.setHeader('Location', `/v2/alice/pkg/blobs/uploads/${sessMatch[1]}`);
+              res.setHeader('Range', `0-${sess.offset - 1}`);
+              res.end();
+            });
+            return;
+          }
+
+          // Ranged 4 MiB chunked fallback PATCH
+          state.chunkedPatchCalls += 1;
+          const patchChunks: Buffer[] = [];
+          req.on('data', (c: Buffer) => patchChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          req.on('end', () => {
+            const body = Buffer.concat(patchChunks);
+            if (body.length > BLOB_UPLOAD_CHUNK_BYTES) {
+              res.statusCode = 416;
+              res.end(
+                JSON.stringify({
+                  errors: [
+                    {
+                      code: 'REQUESTED_RANGE_NOT_SATISFIABLE',
+                      message: 'the request body is too large and exceeds the maximum permissible limit of 4.00MiB',
+                    },
+                  ],
+                })
+              );
+              return;
+            }
+            const m = String(contentRange).match(/^(\d+)-(\d+)$/);
+            if (!m || Number(m[1]) !== sess.offset || Number(m[2]) - Number(m[1]) + 1 !== body.length) {
+              res.statusCode = 416;
+              res.setHeader('Range', sess.offset > 0 ? `0-${sess.offset - 1}` : '0-0');
+              res.end('range mismatch');
+              return;
+            }
+            sess.chunks.push(body);
+            sess.offset += body.length;
+            sess.patchSizes.push(body.length);
+            res.statusCode = 202;
+            res.setHeader('Location', `/v2/alice/pkg/blobs/uploads/${sessMatch[1]}`);
+            res.setHeader('Range', `0-${sess.offset - 1}`);
+            res.end();
+          });
+          return;
+        }
+
+        if (req.method === 'PUT') {
+          const putChunks: Buffer[] = [];
+          req.on('data', (c: Buffer) => putChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          req.on('end', () => {
+            const body = Buffer.concat(putChunks);
+            const digest = urlObj.searchParams.get('digest');
+            if (body.length > 0) {
+              state.monolithicPutCalls += 1;
+              sess.chunks.push(body);
+              sess.offset += body.length;
+            }
+            const assembled = Buffer.concat(sess.chunks);
+            const actualDigest = `sha256:${crypto.createHash('sha256').update(assembled).digest('hex')}`;
+            if (digest !== actualDigest) {
+              res.statusCode = 400;
+              res.end(`digest mismatch: expected ${digest}, got ${actualDigest}`);
+              return;
+            }
+            sess.committedDigest = actualDigest;
+            state.lastCommittedSessionId = sessMatch[1];
+            res.statusCode = 201;
+            res.end();
+          });
+          return;
+        }
+
+        res.statusCode = 405;
+        res.end('method not allowed');
+      });
+
+      return new Promise<{
+        baseUrl: string;
+        state: typeof state;
+        close: () => Promise<void>;
+      }>((resolve) => {
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address();
+          assert.ok(addr && typeof addr === 'object');
+          resolve({
+            baseUrl: `http://127.0.0.1:${addr.port}`,
+            state,
+            close: () =>
+              new Promise<void>((done) => {
+                if (typeof srv.closeAllConnections === 'function') {
+                  srv.closeAllConnections();
+                }
+                srv.close(() => done());
+              }),
+          });
+        });
+      });
+    };
+
+    // Case A (Continuous): > 9 MiB incompressible bytes via single continuous Transfer-Encoding: chunked PATCH
+    const streamMockA = await createStreamingMockRegistry({});
+    try {
+      const tempBefore = (await fs.readdir(os.tmpdir())).filter((n) =>
+        n.startsWith('ghcr-manager-layer-')
+      );
+      const resA = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${streamMockA.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        retryDelayMs: 50,
+        fallbackDelayMs: 25,
+      });
+      const tempAfter = (await fs.readdir(os.tmpdir())).filter((n) =>
+        n.startsWith('ghcr-manager-layer-')
+      );
+      assert.equal(tempAfter.length, tempBefore.length);
+      assert.equal(resA.uploadMode, 'continuous');
+      assert.equal(streamMockA.state.streamingAttempts, 1);
+      assert.equal(streamMockA.state.chunkedPatchCalls, 0);
+      const sessA = streamMockA.state.sessions.get(streamMockA.state.lastCommittedSessionId)!;
+      assert.equal(sessA.streamingBytes, resA.compressedSize);
+      assert.equal(sessA.committedDigest, resA.compressedDigest);
+      const extractedA = await parseTarFromTargzBuffer(Buffer.concat(sessA.chunks));
+      assert.equal(extractedA.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await streamMockA.close();
+    }
+
+    // Case B (Continuous): Small file (< 4 MiB) uses monolithic PUT with 0 PATCH requests
+    const streamMockB = await createStreamingMockRegistry({});
+    try {
+      const resB = await streamAndUploadOciLayer({
+        files: [{ fullPath: smallPath, relativePath: 'small.bin', size: smallBytes.length }],
+        uploadInitUrl: `${streamMockB.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        retryDelayMs: 50,
+        fallbackDelayMs: 25,
+      });
+      assert.equal(resB.uploadMode, 'continuous');
+      assert.equal(streamMockB.state.streamingAttempts, 0);
+      assert.equal(streamMockB.state.chunkedPatchCalls, 0);
+      assert.equal(streamMockB.state.monolithicPutCalls, 1);
+      const sessB = streamMockB.state.sessions.get(streamMockB.state.lastCommittedSessionId)!;
+      const extractedB = await parseTarFromTargzBuffer(Buffer.concat(sessB.chunks));
+      assert.equal(extractedB.get('small.bin')?.equals(smallBytes), true);
+    } finally {
+      await streamMockB.close();
+    }
+
+    // Case C (Continuous): Proxy rejects streaming with 411 -> immediate 4 MiB fallback after 1 streaming attempt
+    const streamMockC = await createStreamingMockRegistry({ rejectStreamingStatus: 411 });
+    const statusMsgsC: string[] = [];
+    try {
+      const resC = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${streamMockC.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        retryDelayMs: 50,
+        fallbackDelayMs: 25,
+        onStatusMessage: (m: string) => statusMsgsC.push(m),
+      });
+      assert.equal(resC.uploadMode, 'chunked');
+      assert.equal(streamMockC.state.streamingAttempts, 1);
+      assert.ok(streamMockC.state.chunkedPatchCalls >= 3);
+      assert.ok(statusMsgsC.some((m) => m.includes('4 MiB chunked')));
+      const sessC = streamMockC.state.sessions.get(streamMockC.state.lastCommittedSessionId)!;
+      const extractedC = await parseTarFromTargzBuffer(Buffer.concat(sessC.chunks));
+      assert.equal(extractedC.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await streamMockC.close();
+    }
+
+    // Case D (Continuous): One-off socket reset on Attempt 1 retries continuous stream cleanly (Attempt 2 succeeds)
+    const streamMockD = await createStreamingMockRegistry({
+      dropSocketOnAttempt: new Set([1]),
+    });
+    const statusMsgsD: string[] = [];
+    try {
+      const resD = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${streamMockD.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        retryDelayMs: 50,
+        fallbackDelayMs: 25,
+        onStatusMessage: (m: string) => statusMsgsD.push(m),
+      });
+      assert.equal(resD.uploadMode, 'continuous');
+      assert.equal(streamMockD.state.streamingAttempts, 2);
+      assert.equal(streamMockD.state.chunkedPatchCalls, 0);
+      assert.ok(statusMsgsD.some((m) => m.includes('retrying continuous stream')));
+      const sessD = streamMockD.state.sessions.get(streamMockD.state.lastCommittedSessionId)!;
+      const extractedD = await parseTarFromTargzBuffer(Buffer.concat(sessD.chunks));
+      assert.equal(extractedD.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await streamMockD.close();
+    }
+
+    // Case E (Continuous): Two consecutive socket resets fall back automatically to 4 MiB chunks
+    const streamMockE = await createStreamingMockRegistry({
+      dropSocketOnAttempt: new Set([1, 2]),
+    });
+    try {
+      const resE = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${streamMockE.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        retryDelayMs: 50,
+        fallbackDelayMs: 25,
+      });
+      assert.equal(resE.uploadMode, 'chunked');
+      assert.equal(streamMockE.state.streamingAttempts, 2);
+      assert.ok(streamMockE.state.chunkedPatchCalls >= 3);
+      const sessE = streamMockE.state.sessions.get(streamMockE.state.lastCommittedSessionId)!;
+      const extractedE = await parseTarFromTargzBuffer(Buffer.concat(sessE.chunks));
+      assert.equal(extractedE.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await streamMockE.close();
+    }
+
+    // Case F (Continuous): Mid-stream 401 refreshes token and falls back immediately to 4 MiB chunks
+    const streamMockF = await createStreamingMockRegistry({
+      failStreaming401AfterBytes: 1024 * 1024,
+    });
+    let streamRefreshCount = 0;
+    try {
+      const resF = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${streamMockF.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        retryDelayMs: 50,
+        fallbackDelayMs: 25,
+        refreshToken: async () => {
+          streamRefreshCount += 1;
+          return 'tok-refreshed';
+        },
+      });
+      assert.equal(resF.uploadMode, 'chunked');
+      assert.equal(streamMockF.state.streamingAttempts, 1);
+      assert.equal(streamRefreshCount, 1);
+      assert.equal(resF.registryToken, 'tok-refreshed');
+      assert.ok(streamMockF.state.chunkedPatchCalls >= 3);
+      const sessF = streamMockF.state.sessions.get(streamMockF.state.lastCommittedSessionId)!;
+      const extractedF = await parseTarFromTargzBuffer(Buffer.concat(sessF.chunks));
+      assert.equal(extractedF.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await streamMockF.close();
+    }
+
+    // Case G (Continuous): User abort cancels immediately with 0 retries, 0 fallback, and DELETE cleanup
+    const continuousAbortCtrl = new AbortController();
+    const streamMockG = await createStreamingMockRegistry({
+      onContinuousBytes: () => continuousAbortCtrl.abort(),
+    });
+    try {
+      await assert.rejects(
+        streamAndUploadOciLayer({
+          files: [
+            {
+              fullPath: random95Path,
+              relativePath: 'random-9.5mb.bin',
+              size: random95Bytes.length,
+            },
+          ],
+          uploadInitUrl: `${streamMockG.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+          registryToken: 'tok-initial',
+          retryDelayMs: 50,
+          fallbackDelayMs: 25,
+          signal: continuousAbortCtrl.signal,
+        }),
+        (err: unknown) => Boolean(err && typeof err === 'object' && (err as Error).name === 'AbortError')
+      );
+      assert.equal(streamMockG.state.streamingAttempts, 1);
+      assert.equal(streamMockG.state.chunkedPatchCalls, 0);
+      assert.equal(streamMockG.state.deletedCount, 1);
+    } finally {
+      await streamMockG.close();
     }
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });

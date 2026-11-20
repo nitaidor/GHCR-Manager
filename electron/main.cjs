@@ -911,6 +911,18 @@ app.whenReady().then(() => {
               : undefined,
           fetchFn: fetchWithSafeRedirects,
           signal: abortController.signal,
+          onStatusMessage: (message) => {
+            if (requestId) {
+              lastSentPct = -1;
+              lastSentUploadedBytes = -1;
+              event.sender.send('desktop:transferProgress', {
+                requestId,
+                stage: 'uploading-layer',
+                message,
+                percent: 10,
+              });
+            }
+          },
           onProgress: ({ processedBytes, totalBytes, uploadedBytes, percent }) => {
             const scaledPct = 10 + Math.round((percent / 100) * 76); // 10% -> 86%
             if (
