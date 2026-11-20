@@ -129,6 +129,9 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               <li>
                 <strong>Cancel &amp; Multi-PC Coordination:</strong> Click <strong>Cancel</strong> at any time while an upload is running. If another PC is actively uploading or deleting the same package, your upload waits until it finishes and refreshes the version list if changes occurred.
               </li>
+              <li>
+                <strong>Close Protection:</strong> Closing the Desktop app is blocked while an upload, Root Folder Sync, or repository index upload is in progress until you cancel the upload or wait for it to finish (read-only index downloads remain interruptible).
+              </li>
             </ul>
           </section>
 
@@ -159,7 +162,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               </div>
             </div>
             <p className="text-xs text-gray-400 mt-4 bg-[#0d1117] p-3.5 rounded border border-[#30363d]">
-              In the review popup, set a shared <strong>Batch Tag</strong> (or override tags per item), inspect any existing GitHub versions, and choose <strong>New image</strong>, <strong>Replace</strong> (requires <code>delete:packages</code>), or <strong>Skip</strong> for each item before syncing. Active syncs can be cancelled mid-batch while keeping completed items uploaded and indexed.
+              In the review popup, set a shared <strong>Batch Tag</strong> (or override tags per item), inspect any existing GitHub versions, and choose <strong>New image</strong>, <strong>Replace</strong> (requires <code>delete:packages</code>), or <strong>Skip</strong> for each item before syncing. Active syncs can be cancelled mid-batch while keeping completed items uploaded and indexed, and closing the app is blocked while a sync or final index upload is running until you cancel or wait for it to finish.
             </p>
           </section>
 
@@ -190,13 +193,23 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
               <Settings className="w-5 h-5 header-logo" /> 5. Application Settings
             </h2>
             <div className="space-y-6">
-              <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
-                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-                  Target Repository
-                </h4>
-                <p className="text-sm text-gray-300">
-                  Switch your active repository when signed in, filter repositories by name, refresh your repository list, or open <strong>View Packages on GitHub</strong>. The active repository is shown in the header badge, and only repositories with read/write access and at least 1 commit can be selected.
-                </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
+                  <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                    Target Repository
+                  </h4>
+                  <p className="text-sm text-gray-300">
+                    Switch your active repository when signed in, filter repositories by name, refresh your repository list, or open <strong>View Packages on GitHub</strong>. The active repository is shown in the header badge, and only repositories with read/write access and at least 1 commit can be selected.
+                  </p>
+                </div>
+                <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
+                  <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                    Upload Transfer Mode
+                  </h4>
+                  <p className="text-sm text-gray-300">
+                    On Desktop, choose <strong>Fast Stream</strong> (default) to compress and stream directly from disk with zero temporary archive files on your OS drive, fast compression for large files (<code>&ge; 64 MiB</code>), automatic retry on transient drops, and <code>4 MiB</code> chunked fallback. Switch to <strong>Chunked (4 MiB)</strong> on slower or unstable connections (uploads over ~10 minutes) to skip streaming attempts. On Mobile and Web, <strong>Chunked (4 MiB)</strong> is always active and <strong>Fast Stream</strong> is disabled (<strong>Desktop only</strong>).
+                  </p>
+                </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div className="bg-[#0d1117] border border-[#30363d] p-4 rounded-md shadow-sm">
@@ -212,7 +225,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
                     Default Timestamp Tags
                   </h4>
                   <p className="text-sm text-gray-300">
-                    Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This affects only new uploads; existing tags on GitHub remain unchanged.
+                    Choose <strong>12-Hour (AM/PM)</strong> or <strong>24-Hour</strong> time and <code>YYYY-MM-DD</code>, <code>YY-MM-DD</code>, <code>DD-MM-YYYY</code>, or <code>DD-MM-YY</code> date layouts with a live preview. This also controls how version upload timestamps are displayed across the app, while existing tags on GitHub remain unchanged.
                   </p>
                 </div>
               </div>
