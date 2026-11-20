@@ -324,7 +324,7 @@ export function isRepoIndexPackageName(pkgName: string): boolean {
   return pkgName.toLowerCase().startsWith(REPO_INDEX_PACKAGE_PREFIX);
 }
 
-export const MAX_DISPLAY_TAG_CHARS = 28;
+export const MAX_DISPLAY_TAG_CHARS = 22;
 
 export function truncateTagForDisplay(
   text: string,

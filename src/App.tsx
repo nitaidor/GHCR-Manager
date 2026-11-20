@@ -5363,7 +5363,7 @@ export default function App() {
                       }) => {
                         const pkgKey = pkg.name.toLowerCase();
                         const shortPkgHeaderName = truncateTagForDisplay(pkg.name, 36);
-                        const shortPkgVersionName = truncateTagForDisplay(pkg.name, 28);
+                        const shortPkgVersionName = truncateTagForDisplay(pkg.name, 22);
                         const settingsUrl = `${pkg.html_url}/settings`;
                         const outerCardClass = isIndexCard
                           ? 'p-4 rounded-md theme-index-card space-y-3'
@@ -5499,15 +5499,15 @@ export default function App() {
                                     <div key={version.id} className={versionCardClass}>
                                       <div className="flex flex-wrap items-start justify-between gap-3">
                                         <div className="space-y-1 min-w-0 flex-1">
-                                          <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                          <div className="flex items-center gap-2 min-w-0">
                                             <code
-                                              className="text-xs font-bold text-white font-mono truncate max-w-full"
+                                              className="text-xs font-bold text-white font-mono truncate min-w-0"
                                               title={fullVersionTitle}
                                             >
                                               {displayVersionTitle}
                                             </code>
                                             {uploadedAt && (
-                                              <span className="text-[11px] text-gray-500 shrink-0">
+                                              <span className="text-[11px] text-gray-500 shrink-0 whitespace-nowrap">
                                                 {uploadedAt}
                                               </span>
                                             )}

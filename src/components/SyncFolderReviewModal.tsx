@@ -607,7 +607,7 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
                             className="text-xs font-mono font-bold text-white truncate max-w-full"
                             title={`${entry.ociName}${!isSkipped ? `:${val.resolvedTag || '...'}` : ''}`}
                           >
-                            {truncateTagForDisplay(entry.ociName, 28)}
+                            {truncateTagForDisplay(entry.ociName, 22)}
                             {!isSkipped &&
                               `:${truncateTagForDisplay(val.resolvedTag || '...')}`}
                           </code>
@@ -862,8 +862,8 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
                                       }
                                     >
                                       {info.isUntagged
-                                        ? `${truncateTagForDisplay(entry.ociName, 28)} (untagged · ${info.shortDigest})`
-                                        : `${truncateTagForDisplay(entry.ociName, 28)}:${info.shortTagsLabel}`}
+                                        ? `${truncateTagForDisplay(entry.ociName, 22)} (untagged · ${info.shortDigest})`
+                                        : `${truncateTagForDisplay(entry.ociName, 22)}:${info.shortTagsLabel}`}
                                     </code>
                                     {isChecked && (
                                       <span className="text-[10px] px-1.5 py-0.5 rounded status-badge-warning font-semibold">

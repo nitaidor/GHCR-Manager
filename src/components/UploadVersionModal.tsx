@@ -333,7 +333,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
               const isScanning = inspectingKey === stateKey;
               const isExpanded = expandedKeys.has(stateKey);
               const isChecked = selectedReplaceIds.has(version.id);
-              const shortPkgName = truncateTagForDisplay(packageName, 28);
+              const shortPkgName = truncateTagForDisplay(packageName, 22);
               const createdLabel = version.created_at
                 ? formatDisplayDateTime(version.created_at, clockFormat, dateFormat)
                 : '';
