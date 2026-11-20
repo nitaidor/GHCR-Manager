@@ -11,7 +11,11 @@ import {
   Check,
   Upload,
 } from 'lucide-react';
-import { isUnlinkedPackagesRepo, type GitHubRepo } from '../lib/github-oci';
+import {
+  isUnlinkedPackagesRepo,
+  type AccountPackageCountsSummary,
+  type GitHubRepo,
+} from '../lib/github-oci';
 import type { AppSettings, UploadTransferMode } from './Header';
 import {
   formatTimestampTag,
@@ -35,6 +39,7 @@ interface SettingsModalProps {
   onRefreshRepos: () => void;
   unlinkedPackagesCount?: number;
   unlinkedRepoOption?: GitHubRepo | null;
+  repoPackageCounts?: AccountPackageCountsSummary | null;
 }
 
 const DATE_FORMAT_OPTIONS: Array<{ value: DateFormat; label: string; sample: string }> = [
@@ -82,6 +87,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onRefreshRepos,
   unlinkedPackagesCount = 0,
   unlinkedRepoOption = null,
+  repoPackageCounts = null,
 }) => {
   const [previewNow, setPreviewNow] = useState<Date>(() => new Date());
   const [repoSearch, setRepoSearch] = useState<string>('');
@@ -157,23 +163,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   Target Repository ({repos.length})
                 </h3>
                 <div className="flex items-center gap-2">
-                  {selectedRepo && (
-                    <a
-                      href={
-                        isUnlinkedPackagesRepo(selectedRepo)
-                          ? selectedRepo.html_url
-                          : `${selectedRepo.html_url}/packages`
-                      }
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-modal-action px-2.5 py-1 rounded text-xs font-semibold inline-flex items-center gap-1.5"
-                    >
-                      {isUnlinkedPackagesRepo(selectedRepo)
-                        ? 'View Account Packages on GitHub'
-                        : 'View Repo Packages on GitHub'}
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
                   <button
                     type="button"
                     disabled={reposLoading}
@@ -217,10 +206,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       {showUnlinkedRow && unlinkedRepoOption && (() => {
                         const isSelected = isUnlinkedPackagesRepo(selectedRepo);
                         return (
-                          <button
+                          <div
                             key="unlinked-packages"
-                            type="button"
+                            role="button"
+                            tabIndex={0}
                             onClick={() => onSelectRepo(unlinkedRepoOption)}
+                            onKeyDown={(e) => {
+                              if (
+                                e.target === e.currentTarget &&
+                                (e.key === 'Enter' || e.key === ' ')
+                              ) {
+                                e.preventDefault();
+                                onSelectRepo(unlinkedRepoOption);
+                              }
+                            }}
                             className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition ${
                               isSelected
                                 ? 'active-variant font-bold cursor-pointer'
@@ -244,8 +243,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
                                 Unlinked
                               </span>
+                              <a
+                                href={unlinkedRepoOption.html_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="btn-modal-action text-[10px] px-2 py-0.5 rounded font-semibold inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                              >
+                                View on GitHub
+                                <ExternalLink className="w-2.5 h-2.5 shrink-0" />
+                              </a>
                             </div>
-                          </button>
+                          </div>
                         );
                       })()}
                       {filteredRepos.map((repo) => {
@@ -253,6 +262,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         const hasNoCommits = repo.hasCommits === false;
                         const needsRepoWrite = repo.permissions?.push === false;
                         const isDisabledRepo = hasNoCommits || needsRepoWrite;
+                        const repoPkgCount = repoPackageCounts
+                          ? (repoPackageCounts.byRepoId[repo.id] ??
+                            repoPackageCounts.byRepoFullName[repo.full_name.toLowerCase()] ??
+                            0)
+                          : null;
+                        const showPkgCount =
+                          repoPkgCount !== null && (!isDisabledRepo || repoPkgCount > 0);
                         const disabledTooltip = hasNoCommits
                           ? 'Requires at least 1 commit in this repository before it can be selected.'
                           : needsRepoWrite
@@ -260,14 +276,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           : undefined;
 
                         return (
-                          <button
+                          <div
                             key={repo.id}
-                            type="button"
+                            role="button"
                             aria-disabled={isDisabledRepo}
                             tabIndex={isDisabledRepo ? -1 : 0}
                             title={disabledTooltip}
                             onClick={() => {
                               if (isDisabledRepo) return;
+                              onSelectRepo(repo);
+                            }}
+                            onKeyDown={(e) => {
+                              if (
+                                isDisabledRepo ||
+                                e.target !== e.currentTarget ||
+                                (e.key !== 'Enter' && e.key !== ' ')
+                              ) {
+                                return;
+                              }
+                              e.preventDefault();
                               onSelectRepo(repo);
                             }}
                             className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition ${
@@ -292,6 +319,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               </div>
                             </div>
                             <div className="flex items-center gap-1.5 shrink-0">
+                              {showPkgCount && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
+                                  {repoPkgCount}{' '}
+                                  {repoPkgCount === 1 ? 'package' : 'packages'}
+                                </span>
+                              )}
                               {hasNoCommits && (
                                 <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
                                   0 commits
@@ -305,8 +338,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
                                 {repo.private ? 'Private' : 'Public'}
                               </span>
+                              <a
+                                href={`${repo.html_url}/packages`}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="btn-modal-action text-[10px] px-2 py-0.5 rounded font-semibold inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                              >
+                                View on GitHub
+                                <ExternalLink className="w-2.5 h-2.5 shrink-0" />
+                              </a>
                             </div>
-                          </button>
+                          </div>
                         );
                       })}
                     </>

@@ -13,6 +13,7 @@ import {
   formatTimestampTag,
   formatUniqueRepoIndexTag,
   getPackageLockKey,
+  getPackageSettingsUrl,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
   getVersionReferenceInfo,
@@ -20,6 +21,7 @@ import {
   isUnlinkedPackagesRepo,
   MAX_DISPLAY_TAG_CHARS,
   packageMatchesRepo,
+  summarizeAccountPackageCounts,
   toGitRefSafeLockSegment,
   toOciImageName,
   UNLINKED_PACKAGES_REPO_ID,
@@ -1999,6 +2001,64 @@ async function runTests() {
     'Alice'
   );
   assert.equal(lockPickedReal.id, 42);
+
+  console.log('19. Testing account package counts summary and package settings URL normalization...');
+  const pkgCountsSummary = summarizeAccountPackageCounts([
+    { id: 1, name: 'u1', owner: { login: 'Alice' }, repository: null },
+    { id: 2, name: 'u2', owner: { login: 'MyOrg' }, repository: undefined },
+    { id: 2, name: 'u2', owner: { login: 'MyOrg' }, repository: undefined },
+    { id: 3, name: 'p1', owner: { login: 'Alice' }, repository: { id: 100, full_name: 'Alice/RepoA' } },
+    { id: 4, name: 'p2', owner: { login: 'Alice' }, repository: { id: 100, full_name: 'Alice/RepoA' } },
+    { id: 5, name: 'p3', owner: { login: 'Alice' }, repository: { id: 200, full_name: 'Alice/RepoB' } },
+    { id: 6, name: 'ghcr-manager-index_repoa', owner: { login: 'Alice' }, repository: { id: 100, full_name: 'Alice/RepoA' } },
+    { id: 7, name: 'ghcr-manager-index_orphan', owner: { login: 'Alice' }, repository: null },
+  ]);
+  assert.equal(pkgCountsSummary.unlinkedCount, 2);
+  assert.equal(pkgCountsSummary.byRepoId[100], 2);
+  assert.equal(pkgCountsSummary.byRepoId[200], 1);
+  assert.equal(pkgCountsSummary.byRepoFullName['alice/repoa'], 2);
+  assert.equal(pkgCountsSummary.byRepoFullName['alice/repob'], 1);
+
+  assert.equal(
+    getPackageSettingsUrl({
+      name: '12',
+      html_url: 'https://github.com/users/nityanandos/packages/container/package/12',
+      owner: { login: 'nityanandos', type: 'User' },
+    }),
+    'https://github.com/users/nityanandos/packages/container/12/settings'
+  );
+  assert.equal(
+    getPackageSettingsUrl({
+      name: 'my/app',
+      html_url: 'https://github.com/orgs/acme/packages/container/package/my%2Fapp/',
+      owner: { login: 'acme', type: 'Organization' },
+    }),
+    'https://github.com/orgs/acme/packages/container/my%2Fapp/settings'
+  );
+  assert.equal(
+    getPackageSettingsUrl({
+      name: 'test',
+      html_url: 'https://github.com/nityanandos/Test/pkgs/container/test',
+      owner: { login: 'nityanandos', type: 'User' },
+    }),
+    'https://github.com/nityanandos/Test/pkgs/container/test/settings'
+  );
+  assert.equal(
+    getPackageSettingsUrl({
+      name: 'fallback-pkg',
+      html_url: '',
+      owner: { login: 'Alice', type: 'User' },
+    }),
+    'https://github.com/users/Alice/packages/container/fallback-pkg/settings'
+  );
+  assert.equal(
+    getPackageSettingsUrl({
+      name: 'org-pkg',
+      html_url: null,
+      owner: { login: 'MyOrg', type: 'Organization' },
+    }),
+    'https://github.com/orgs/MyOrg/packages/container/org-pkg/settings'
+  );
 
   console.log('All tests passed successfully!');
 }

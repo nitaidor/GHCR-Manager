@@ -15,8 +15,10 @@ import {
   type TarInputFile,
 } from './tar';
 import {
+  dedupeContainerPackages,
   filterUnlinkedContainerPackages,
   formatUniqueRepoIndexTag,
+  getPackageSettingsUrl,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
   getVersionReferenceInfo,
@@ -25,9 +27,11 @@ import {
   packageMatchesRepo,
   REPO_INDEX_KEEP_VERSIONS,
   REPO_INDEX_MODE,
+  summarizeAccountPackageCounts,
   toOciImageName,
   truncateTagForDisplay,
   UNLINKED_PACKAGES_REPO_ID,
+  type AccountPackageCountsSummary,
   type ClockFormat,
   type DateFormat,
 } from './naming';
@@ -35,9 +39,12 @@ import pkg from '../../package.json';
 
 export {
   filterUnlinkedContainerPackages,
+  getPackageSettingsUrl,
   isUnlinkedPackagesRepo,
   packageMatchesRepo,
+  summarizeAccountPackageCounts,
   UNLINKED_PACKAGES_REPO_ID,
+  type AccountPackageCountsSummary,
 };
 
 export interface GitHubUser {
@@ -1021,10 +1028,11 @@ export function createUnlinkedPackagesRepo(ownerLogin: string): GitHubRepo {
 }
 
 /**
- * Lists all unlinked container packages accessible to the signed-in account
- * (personal `/user/packages` plus any `Organization` owners present in `repos`).
+ * Lists all container packages accessible to the signed-in account
+ * (personal `/user/packages` plus any `Organization` owners present in `repos`),
+ * deduplicated by package identity.
  */
-export async function listUnlinkedContainerPackages(
+export async function listAllAccountContainerPackages(
   githubToken: string,
   currentUserLogin: string,
   repos: readonly Pick<GitHubRepo, 'owner'>[] = [],
@@ -1077,8 +1085,26 @@ export async function listUnlinkedContainerPackages(
     })
   );
 
-  const combined = [...userPackages, ...orgPackageLists.flat()];
-  return filterUnlinkedContainerPackages(combined);
+  return dedupeContainerPackages([...userPackages, ...orgPackageLists.flat()]);
+}
+
+/**
+ * Lists all unlinked container packages accessible to the signed-in account
+ * (personal `/user/packages` plus any `Organization` owners present in `repos`).
+ */
+export async function listUnlinkedContainerPackages(
+  githubToken: string,
+  currentUserLogin: string,
+  repos: readonly Pick<GitHubRepo, 'owner'>[] = [],
+  opts?: { throwOnUserError?: boolean }
+): Promise<GitHubPackageItem[]> {
+  const allPackages = await listAllAccountContainerPackages(
+    githubToken,
+    currentUserLogin,
+    repos,
+    opts
+  );
+  return filterUnlinkedContainerPackages(allPackages);
 }
 
 export async function listPackagesForRepo(

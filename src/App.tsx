@@ -60,14 +60,15 @@ import {
   fetchLivePackageState,
   filterUnlinkedContainerPackages,
   formatBytes,
+  getPackageSettingsUrl,
   getVersionReferenceInfo,
   getVersionStateSignature,
   indexRecordToOciDetails,
   inspectPackageManifest,
   isUnlinkedPackagesRepo,
+  listAllAccountContainerPackages,
   listPackageVersions,
   listPackagesForRepo,
-  listUnlinkedContainerPackages,
   listUserRepositories,
   ociDetailsToIndexRecord,
   packageMatchesRepo,
@@ -75,7 +76,9 @@ import {
   publishRepoIndexSnapshot,
   sortPackageVersionsNewestFirst,
   startGitHubDeviceFlow,
+  summarizeAccountPackageCounts,
   UNLINKED_PACKAGES_REPO_ID,
+  type AccountPackageCountsSummary,
   type DesktopStreamingInputFile,
   type GitHubPackageItem,
   type GitHubPackageVersion,
@@ -439,9 +442,9 @@ export default function App() {
 
   // --- TAB 3: Repo Packages state (Digest-keyed versions) ---
   const [repoPackages, setRepoPackages] = useState<GitHubPackageItem[]>([]);
-  const [otherPackages, setOtherPackages] = useState<GitHubPackageItem[]>([]);
-  const [unlinkedPackagesCount, setUnlinkedPackagesCount] = useState<number>(0);
-  const [showOtherPackages, setShowOtherPackages] = useState<boolean>(false);
+  const [repoPackageCounts, setRepoPackageCounts] =
+    useState<AccountPackageCountsSummary | null>(null);
+  const unlinkedPackagesCount = repoPackageCounts?.unlinkedCount ?? 0;
   const isUnlinkedView = isUnlinkedPackagesRepo(selectedRepo);
   const unlinkedRepoOption = useMemo(
     () =>
@@ -543,7 +546,6 @@ export default function App() {
       {
         pkg: GitHubPackageItem;
         index: number;
-        isOther: boolean;
         message: string;
       }
     >
@@ -733,12 +735,19 @@ export default function App() {
       const userRepos = await listUserRepositories(clean);
       setRepos(userRepos);
 
-      const unlinkedPkgs = await listUnlinkedContainerPackages(
+      const allAccountPkgs = await listAllAccountContainerPackages(
         clean,
         ghUser.login,
         userRepos
-      ).catch(() => []);
-      setUnlinkedPackagesCount(unlinkedPkgs.length);
+      ).catch(() => null);
+      if (allAccountPkgs) {
+        setRepoPackageCounts(summarizeAccountPackageCounts(allAccountPkgs));
+      } else {
+        setRepoPackageCounts(null);
+      }
+      const unlinkedPkgs = allAccountPkgs
+        ? filterUnlinkedContainerPackages(allAccountPkgs)
+        : [];
 
       const savedRepoRaw = localStorage.getItem(STORAGE_REPO_KEY);
       const savedRepoId =
@@ -780,9 +789,7 @@ export default function App() {
     setRepos([]);
     setSelectedRepo(null);
     setRepoPackages([]);
-    setOtherPackages([]);
-    setUnlinkedPackagesCount(0);
-    setShowOtherPackages(false);
+    setRepoPackageCounts(null);
     setPackageVersionsMap({});
     setInspectedByKey({});
     setIndexingKeys(new Set());
@@ -908,14 +915,14 @@ export default function App() {
     };
   }, [devicePolling, deviceFlowInfo, oauthClientId]);
 
-  // Silently refresh unlinked packages count when opening App Settings
+  // Silently refresh account package counts when opening App Settings
   useEffect(() => {
     if (!showSettingsModal || !authToken || !user) return;
     let cancelled = false;
-    listUnlinkedContainerPackages(authToken, user.login, repos)
-      .then((list) => {
+    listAllAccountContainerPackages(authToken, user.login, repos)
+      .then((allPkgs) => {
         if (!cancelled) {
-          setUnlinkedPackagesCount(list.length);
+          setRepoPackageCounts(summarizeAccountPackageCounts(allPkgs));
         }
       })
       .catch(() => {});
@@ -929,7 +936,6 @@ export default function App() {
     if (selectedRepo && authToken && user) {
       handleCancelInspect();
       downloadAbortRef.current?.abort();
-      setShowOtherPackages(false);
       if (isUnlinkedPackagesRepo(selectedRepo)) {
         setActiveTab('packages');
       }
@@ -1367,7 +1373,7 @@ export default function App() {
         repoIndexVersionsRef.current = [];
         setRepoIndexEntries({});
 
-        const unlinked = await listUnlinkedContainerPackages(
+        const allPkgs = await listAllAccountContainerPackages(
           authToken,
           user.login,
           repos,
@@ -1375,9 +1381,9 @@ export default function App() {
         );
         if (refreshSeqRef.current !== seq) return;
 
+        setRepoPackageCounts(summarizeAccountPackageCounts(allPkgs));
+        const unlinked = filterUnlinkedContainerPackages(allPkgs);
         setRepoPackages(unlinked);
-        setOtherPackages([]);
-        setUnlinkedPackagesCount(unlinked.length);
 
         const fetchedVersionsByPkg: Record<string, GitHubPackageVersion[]> = {};
         await Promise.all(
@@ -1423,12 +1429,12 @@ export default function App() {
         selectedRepo.owner.login.toLowerCase() === user.login.toLowerCase() &&
         !hasOrgRepos
       ) {
-        setUnlinkedPackagesCount(filterUnlinkedContainerPackages(rawOthers).length);
+        setRepoPackageCounts(summarizeAccountPackageCounts([...rawLinked, ...rawOthers]));
       } else {
-        void listUnlinkedContainerPackages(authToken, user.login, repos)
-          .then((list) => {
+        void listAllAccountContainerPackages(authToken, user.login, repos)
+          .then((allPkgs) => {
             if (refreshSeqRef.current === seq) {
-              setUnlinkedPackagesCount(list.length);
+              setRepoPackageCounts(summarizeAccountPackageCounts(allPkgs));
             }
           })
           .catch(() => {});
@@ -1461,7 +1467,6 @@ export default function App() {
       const linked = rawLinked.filter((p) => !isRepoIndexPackageName(p.name));
       const others = rawOthers.filter((p) => !isRepoIndexPackageName(p.name));
       setRepoPackages(linked);
-      setOtherPackages(others);
 
       let indexVersions: GitHubPackageVersion[] = directIdxVersions || [];
       const fetchedVersionsByPkg: Record<string, GitHubPackageVersion[]> = {};
@@ -1471,7 +1476,6 @@ export default function App() {
       const fetchList: GitHubPackageItem[] = [
         ...(matchedIndexPkg && directIdxVersions === null ? [matchedIndexPkg] : []),
         ...linked,
-        ...others,
       ];
       const linkedNameSet = new Set(linked.map((p) => p.name.toLowerCase()));
       const otherNameSet = new Set(others.map((p) => p.name.toLowerCase()));
@@ -1521,7 +1525,7 @@ export default function App() {
 
       if (refreshSeqRef.current !== seq) return;
 
-      // Mark index packages that were returned in `otherPackages` (unlinked or linked to another repo)
+      // Mark index packages that were returned in `others` (unlinked or linked to another repo)
       // as confirmed checked so stale entries are cleaned out of this repo's index.
       for (const rec of Object.values(currentIndexMap)) {
         const pkgLower = rec.packageName.toLowerCase();
@@ -1605,7 +1609,7 @@ export default function App() {
         });
       }
 
-      for (const pkg of [...linked, ...others]) {
+      for (const pkg of linked) {
         const versions = fetchedVersionsByPkg[pkg.name.toLowerCase()];
         if (versions && versions.length > 0) {
           void indexVersionList(pkg.name, pkg.owner.login, versions, currentIndexMap);
@@ -3225,13 +3229,8 @@ export default function App() {
     });
 
     try {
-      const isOtherPkg = otherPackages.some(
-        (p) => p.name.toLowerCase() === pkgName.toLowerCase()
-      );
-
       if (
         !isRepoIndexPackageName(pkgName) &&
-        !isOtherPkg &&
         !isUnlinkedPackagesRepo(selectedRepo)
       ) {
         const latestIndexMap = await syncRemoteRepoIndexIfChanged(selectedRepo);
@@ -3274,7 +3273,6 @@ export default function App() {
 
       if (
         !isRepoIndexPackageName(pkgName) &&
-        !isOtherPkg &&
         !isUnlinkedPackagesRepo(selectedRepo)
       ) {
         void enqueueRepoIndexMutation({
@@ -3383,14 +3381,10 @@ export default function App() {
         [vKey]: res.details,
       }));
 
-      const isOtherPkg = otherPackages.some(
-        (p) => p.name.toLowerCase() === pkg.name.toLowerCase()
-      );
       if (
         res.saved &&
         wasUnindexed &&
         !isRepoIndexPackageName(pkg.name) &&
-        !isOtherPkg &&
         !isUnlinkedPackagesRepo(selectedRepo)
       ) {
         void enqueueRepoIndexMutation({
@@ -3560,13 +3554,9 @@ export default function App() {
         [vKey]: details,
       }));
 
-      const isOtherPkg = otherPackages.some(
-        (p) => p.name.toLowerCase() === pkg.name.toLowerCase()
-      );
       if (
         wasUnindexed &&
         !isRepoIndexPackageName(pkg.name) &&
-        !isOtherPkg &&
         !isUnlinkedPackagesRepo(selectedRepo)
       ) {
         void enqueueRepoIndexMutation({
@@ -3674,13 +3664,11 @@ export default function App() {
   function recordDeletedPkgTombstone(pkg: GitHubPackageItem, message: string) {
     const pkgKey = pkg.name.toLowerCase();
     const repoIdx = repoPackages.findIndex((p) => p.name.toLowerCase() === pkgKey);
-    const otherIdx = otherPackages.findIndex((p) => p.name.toLowerCase() === pkgKey);
-    const isOther = repoIdx === -1 && otherIdx !== -1;
-    const index = isOther ? otherIdx : Math.max(0, repoIdx);
+    const index = Math.max(0, repoIdx);
 
     setDeletedPkgTombstones((prev) => ({
       ...prev,
-      [pkgKey]: { pkg, index, isOther, message },
+      [pkgKey]: { pkg, index, message },
     }));
     setPkgNotices((prev) => {
       if (!prev[pkgKey]) return prev;
@@ -3698,7 +3686,6 @@ export default function App() {
       return next;
     });
     setRepoPackages((prev) => prev.filter((p) => p.name.toLowerCase() !== pkgKey));
-    setOtherPackages((prev) => prev.filter((p) => p.name.toLowerCase() !== pkgKey));
   }
 
   function dismissPkgNotice(pkgKey: string) {
@@ -3772,13 +3759,9 @@ export default function App() {
       return next;
     });
 
-    const isOtherPkg = otherPackages.some(
-      (p) => p.name.toLowerCase() === pkgKey
-    );
     const lockRepo = resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login);
     const shouldLockPkg = !isRepoIndexPackageName(pkg.name) && !isUnlinkedPackagesRepo(lockRepo);
     const shouldUpdateSelectedIndex =
-      !isOtherPkg &&
       !isRepoIndexPackageName(pkg.name) &&
       !isUnlinkedPackagesRepo(selectedRepo);
     let pkgLock: ActiveRepoLock | null = null;
@@ -3901,13 +3884,9 @@ export default function App() {
   async function handleDeletePackageConfirmed(pkg: GitHubPackageItem) {
     if (!selectedRepo || !user || !authToken) return;
     const pkgKey = pkg.name.toLowerCase();
-    const isOtherPkg = otherPackages.some(
-      (p) => p.name.toLowerCase() === pkgKey
-    );
     const lockRepo = resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login);
     const shouldLockPkg = !isRepoIndexPackageName(pkg.name) && !isUnlinkedPackagesRepo(lockRepo);
     const shouldUpdateSelectedIndex =
-      !isOtherPkg &&
       !isRepoIndexPackageName(pkg.name) &&
       !isUnlinkedPackagesRepo(selectedRepo);
     const beforeVersions = packageVersionsMap[pkgKey] || [];
@@ -5534,17 +5513,6 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {!isUnlinkedView && otherPackages.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => setShowOtherPackages(!showOtherPackages)}
-                            className="btn-modal-action px-3 py-1.5 rounded-md text-xs cursor-pointer"
-                          >
-                            {showOtherPackages
-                              ? 'Hide other owner packages'
-                              : `Show ${otherPackages.length} other account package(s)`}
-                          </button>
-                        )}
                         <button
                           type="button"
                           disabled={packagesLoading}
@@ -5569,14 +5537,12 @@ export default function App() {
                             tombstone: {
                               pkg: GitHubPackageItem;
                               index: number;
-                              isOther: boolean;
                               message: string;
                             };
                           };
 
                       const mergeWithTombstones = (
-                        baseList: GitHubPackageItem[],
-                        isOtherList: boolean
+                        baseList: GitHubPackageItem[]
                       ): MergedPackageEntry[] => {
                         const seenPkgKeys = new Set<string>();
                         const entries: MergedPackageEntry[] = baseList.map((pkg) => {
@@ -5592,11 +5558,7 @@ export default function App() {
                         const missingTombstones = Object.values(
                           deletedPkgTombstones
                         )
-                          .filter(
-                            (t) =>
-                              t.isOther === isOtherList &&
-                              !seenPkgKeys.has(t.pkg.name.toLowerCase())
-                          )
+                          .filter((t) => !seenPkgKeys.has(t.pkg.name.toLowerCase()))
                           .sort((a, b) => a.index - b.index);
 
                         for (const tombstone of missingTombstones) {
@@ -5613,12 +5575,8 @@ export default function App() {
                         return entries;
                       };
 
-                      const rawMergedEntries: MergedPackageEntry[] = [
-                        ...mergeWithTombstones(repoPackages, false),
-                        ...(showOtherPackages
-                          ? mergeWithTombstones(otherPackages, true)
-                          : []),
-                      ];
+                      const rawMergedEntries: MergedPackageEntry[] =
+                        mergeWithTombstones(repoPackages);
                       const seenMergedNames = new Set<string>();
                       const mergedEntries: MergedPackageEntry[] = rawMergedEntries.filter(
                         (entry) => {
@@ -5658,7 +5616,7 @@ export default function App() {
                         const pkgKey = pkg.name.toLowerCase();
                         const shortPkgHeaderName = truncateTagForDisplay(pkg.name, 36);
                         const shortPkgVersionName = truncateTagForDisplay(pkg.name, 22);
-                        const settingsUrl = `${pkg.html_url}/settings`;
+                        const settingsUrl = getPackageSettingsUrl(pkg);
                         const outerCardClass = isIndexCard
                           ? 'p-4 rounded-md theme-index-card space-y-3'
                           : 'p-4 rounded-md bg-[#0d1117] border border-[#30363d] space-y-3';
@@ -5945,8 +5903,7 @@ export default function App() {
                       return (
                         <>
                           {/* Search Bar (Searches Package Names, Original Names, and Files Inside Images) */}
-                          {(repoPackages.length > 0 ||
-                            (showOtherPackages && otherPackages.length > 0)) && (
+                          {repoPackages.length > 0 && (
                             <div className="relative">
                               <Search className="w-4 h-4 text-gray-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
                               <input
@@ -5983,7 +5940,7 @@ export default function App() {
                               <Loader2 className="w-6 h-6 animate-spin theme-spinner" />
                               <span className="text-xs">Loading packages from GitHub...</span>
                             </div>
-                          ) : mergedEntries.length === 0 && !showOtherPackages ? (
+                          ) : mergedEntries.length === 0 ? (
                             <div
                               key="packages-empty"
                               className="p-10 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-2"
@@ -6469,6 +6426,7 @@ export default function App() {
         }}
         unlinkedPackagesCount={unlinkedPackagesCount}
         unlinkedRepoOption={unlinkedRepoOption}
+        repoPackageCounts={repoPackageCounts}
       />
 
       <HelpModal

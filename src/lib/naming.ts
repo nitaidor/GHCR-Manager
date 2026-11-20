@@ -396,6 +396,34 @@ export function packageMatchesRepo(
   );
 }
 
+export function getContainerPackageDedupeKey(pkg: {
+  id?: number;
+  name: string;
+  owner?: { login: string };
+}): string {
+  return typeof pkg.id === 'number'
+    ? `id:${pkg.id}`
+    : `name:${(pkg.owner?.login || '').toLowerCase()}/${pkg.name.toLowerCase()}`;
+}
+
+export function dedupeContainerPackages<
+  T extends {
+    id?: number;
+    name: string;
+    owner?: { login: string };
+  },
+>(packages: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const pkg of packages) {
+    const key = getContainerPackageDedupeKey(pkg);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(pkg);
+  }
+  return result;
+}
+
 export function filterUnlinkedContainerPackages<
   T extends {
     id?: number;
@@ -404,17 +432,66 @@ export function filterUnlinkedContainerPackages<
     repository?: { id: number; full_name: string } | null;
   },
 >(packages: readonly T[]): T[] {
-  const seen = new Set<string>();
-  const result: T[] = [];
-  for (const pkg of packages) {
-    if (pkg.repository || isRepoIndexPackageName(pkg.name)) continue;
-    const dedupKey =
-      typeof pkg.id === 'number'
-        ? `id:${pkg.id}`
-        : `name:${(pkg.owner?.login || '').toLowerCase()}/${pkg.name.toLowerCase()}`;
-    if (seen.has(dedupKey)) continue;
-    seen.add(dedupKey);
-    result.push(pkg);
+  return dedupeContainerPackages(packages).filter(
+    (pkg) => !pkg.repository && !isRepoIndexPackageName(pkg.name)
+  );
+}
+
+export interface AccountPackageCountsSummary {
+  unlinkedCount: number;
+  byRepoId: Record<number, number>;
+  byRepoFullName: Record<string, number>;
+}
+
+/**
+ * Counts unique non-index container packages per linked repository and unlinked pool.
+ */
+export function summarizeAccountPackageCounts<
+  T extends {
+    id?: number;
+    name: string;
+    owner?: { login: string };
+    repository?: { id: number; full_name: string } | null;
+  },
+>(packages: readonly T[]): AccountPackageCountsSummary {
+  let unlinkedCount = 0;
+  const byRepoId: Record<number, number> = {};
+  const byRepoFullName: Record<string, number> = {};
+
+  for (const pkg of dedupeContainerPackages(packages)) {
+    if (isRepoIndexPackageName(pkg.name)) continue;
+    if (!pkg.repository) {
+      unlinkedCount += 1;
+      continue;
+    }
+    byRepoId[pkg.repository.id] = (byRepoId[pkg.repository.id] || 0) + 1;
+    const repoKey = pkg.repository.full_name.toLowerCase();
+    byRepoFullName[repoKey] = (byRepoFullName[repoKey] || 0) + 1;
   }
-  return result;
+
+  return { unlinkedCount, byRepoId, byRepoFullName };
+}
+
+/**
+ * Resolves the browser-facing GitHub Package Settings URL, normalizing API URLs that
+ * still include the legacy `/packages/container/package/` segment.
+ */
+export function getPackageSettingsUrl(pkg: {
+  name: string;
+  html_url?: string | null;
+  owner: { login: string; type: 'User' | 'Organization' };
+}): string {
+  const rawUrl = pkg.html_url?.trim();
+  if (rawUrl) {
+    const clean = rawUrl.replace(/\/+$/, '');
+    const normalized = clean.replace(
+      /\/packages\/container\/package\//i,
+      '/packages/container/'
+    );
+    return /\/settings$/i.test(normalized) ? normalized : `${normalized}/settings`;
+  }
+  const scope = pkg.owner.type === 'Organization' ? 'orgs' : 'users';
+  return `https://github.com/${scope}/${encodeURIComponent(
+    pkg.owner.login
+  )}/packages/container/${encodeURIComponent(pkg.name)}/settings`;
 }
