@@ -11,7 +11,7 @@ import {
   Check,
   Upload,
 } from 'lucide-react';
-import type { GitHubRepo } from '../lib/github-oci';
+import { isUnlinkedPackagesRepo, type GitHubRepo } from '../lib/github-oci';
 import type { AppSettings, UploadTransferMode } from './Header';
 import {
   formatTimestampTag,
@@ -33,6 +33,8 @@ interface SettingsModalProps {
   onSelectRepo: (repo: GitHubRepo) => void;
   reposLoading: boolean;
   onRefreshRepos: () => void;
+  unlinkedPackagesCount?: number;
+  unlinkedRepoOption?: GitHubRepo | null;
 }
 
 const DATE_FORMAT_OPTIONS: Array<{ value: DateFormat; label: string; sample: string }> = [
@@ -78,6 +80,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSelectRepo,
   reposLoading,
   onRefreshRepos,
+  unlinkedPackagesCount = 0,
+  unlinkedRepoOption = null,
 }) => {
   const [previewNow, setPreviewNow] = useState<Date>(() => new Date());
   const [repoSearch, setRepoSearch] = useState<string>('');
@@ -91,6 +95,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         (r.description && r.description.toLowerCase().includes(q))
     );
   }, [repos, repoSearch]);
+
+  const showUnlinkedRow = useMemo(() => {
+    if (!unlinkedRepoOption) return false;
+    const q = repoSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      unlinkedRepoOption.full_name.toLowerCase().includes(q) ||
+      (unlinkedRepoOption.description?.toLowerCase().includes(q) ?? false)
+    );
+  }, [unlinkedRepoOption, repoSearch]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -145,12 +159,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div className="flex items-center gap-2">
                   {selectedRepo && (
                     <a
-                      href={`${selectedRepo.html_url}/packages`}
+                      href={
+                        isUnlinkedPackagesRepo(selectedRepo)
+                          ? selectedRepo.html_url
+                          : `${selectedRepo.html_url}/packages`
+                      }
                       target="_blank"
                       rel="noreferrer"
                       className="btn-modal-action px-2.5 py-1 rounded text-xs font-semibold inline-flex items-center gap-1.5"
                     >
-                      View Repo Packages on GitHub
+                      {isUnlinkedPackagesRepo(selectedRepo)
+                        ? 'View Account Packages on GitHub'
+                        : 'View Repo Packages on GitHub'}
                       <ExternalLink className="w-3 h-3" />
                     </a>
                   )}
@@ -188,72 +208,108 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <div className="p-4 text-center text-xs text-gray-500">
                       Loading repositories...
                     </div>
-                  ) : filteredRepos.length === 0 ? (
+                  ) : filteredRepos.length === 0 && !showUnlinkedRow ? (
                     <div className="p-4 text-center text-xs text-gray-500">
                       No matching repositories.
                     </div>
                   ) : (
-                    filteredRepos.map((repo) => {
-                      const isSelected = selectedRepo?.id === repo.id;
-                      const hasNoCommits = repo.hasCommits === false;
-                      const needsRepoWrite = repo.permissions?.push === false;
-                      const isDisabledRepo = hasNoCommits || needsRepoWrite;
-                      const disabledTooltip = hasNoCommits
-                        ? 'Requires at least 1 commit in this repository before it can be selected.'
-                        : needsRepoWrite
-                        ? 'Requires read/write access to this repository.'
-                        : undefined;
-
-                      return (
-                        <button
-                          key={repo.id}
-                          type="button"
-                          aria-disabled={isDisabledRepo}
-                          tabIndex={isDisabledRepo ? -1 : 0}
-                          title={disabledTooltip}
-                          onClick={() => {
-                            if (isDisabledRepo) return;
-                            onSelectRepo(repo);
-                          }}
-                          className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition ${
-                            isDisabledRepo
-                              ? 'repo-option-disabled'
-                              : isSelected
-                              ? 'active-variant font-bold cursor-pointer'
-                              : 'hover:bg-[#21262d] text-gray-300 cursor-pointer'
-                          }`}
-                        >
-                          <div className="min-w-0 flex items-center gap-2">
-                            {isSelected && !isDisabledRepo && (
-                              <Check className="w-3.5 h-3.5 shrink-0" />
-                            )}
-                            <div className="min-w-0">
-                              <div className="truncate">{repo.full_name}</div>
-                              {repo.description && (
+                    <>
+                      {showUnlinkedRow && unlinkedRepoOption && (() => {
+                        const isSelected = isUnlinkedPackagesRepo(selectedRepo);
+                        return (
+                          <button
+                            key="unlinked-packages"
+                            type="button"
+                            onClick={() => onSelectRepo(unlinkedRepoOption)}
+                            className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition ${
+                              isSelected
+                                ? 'active-variant font-bold cursor-pointer'
+                                : 'hover:bg-[#21262d] text-gray-300 cursor-pointer'
+                            }`}
+                          >
+                            <div className="min-w-0 flex items-center gap-2">
+                              {isSelected && <Check className="w-3.5 h-3.5 shrink-0" />}
+                              <div className="min-w-0">
+                                <div className="truncate">Unlinked Packages</div>
                                 <div className="text-[11px] text-gray-500 truncate">
-                                  {repo.description}
+                                  Container packages not linked to any GitHub repository
                                 </div>
-                              )}
+                              </div>
                             </div>
-                          </div>
-                          <div className="flex items-center gap-1.5 shrink-0">
-                            {hasNoCommits && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
-                                0 commits
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
+                                {unlinkedPackagesCount}{' '}
+                                {unlinkedPackagesCount === 1 ? 'package' : 'packages'}
                               </span>
-                            )}
-                            {!hasNoCommits && needsRepoWrite && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
-                                Read-only
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
+                                Unlinked
                               </span>
-                            )}
-                            <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
-                              {repo.private ? 'Private' : 'Public'}
-                            </span>
-                          </div>
-                        </button>
-                      );
-                    })
+                            </div>
+                          </button>
+                        );
+                      })()}
+                      {filteredRepos.map((repo) => {
+                        const isSelected = selectedRepo?.id === repo.id;
+                        const hasNoCommits = repo.hasCommits === false;
+                        const needsRepoWrite = repo.permissions?.push === false;
+                        const isDisabledRepo = hasNoCommits || needsRepoWrite;
+                        const disabledTooltip = hasNoCommits
+                          ? 'Requires at least 1 commit in this repository before it can be selected.'
+                          : needsRepoWrite
+                          ? 'Requires read/write access to this repository.'
+                          : undefined;
+
+                        return (
+                          <button
+                            key={repo.id}
+                            type="button"
+                            aria-disabled={isDisabledRepo}
+                            tabIndex={isDisabledRepo ? -1 : 0}
+                            title={disabledTooltip}
+                            onClick={() => {
+                              if (isDisabledRepo) return;
+                              onSelectRepo(repo);
+                            }}
+                            className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition ${
+                              isDisabledRepo
+                                ? 'repo-option-disabled'
+                                : isSelected
+                                ? 'active-variant font-bold cursor-pointer'
+                                : 'hover:bg-[#21262d] text-gray-300 cursor-pointer'
+                            }`}
+                          >
+                            <div className="min-w-0 flex items-center gap-2">
+                              {isSelected && !isDisabledRepo && (
+                                <Check className="w-3.5 h-3.5 shrink-0" />
+                              )}
+                              <div className="min-w-0">
+                                <div className="truncate">{repo.full_name}</div>
+                                {repo.description && (
+                                  <div className="text-[11px] text-gray-500 truncate">
+                                    {repo.description}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {hasNoCommits && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
+                                  0 commits
+                                </span>
+                              )}
+                              {!hasNoCommits && needsRepoWrite && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
+                                  Read-only
+                                </span>
+                              )}
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-gray-400">
+                                {repo.private ? 'Private' : 'Public'}
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </>
                   )}
                 </div>
               </div>

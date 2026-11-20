@@ -15,19 +15,30 @@ import {
   type TarInputFile,
 } from './tar';
 import {
+  filterUnlinkedContainerPackages,
   formatUniqueRepoIndexTag,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
   getVersionReferenceInfo,
+  isUnlinkedPackagesRepo,
   MAX_DISPLAY_TAG_CHARS,
+  packageMatchesRepo,
   REPO_INDEX_KEEP_VERSIONS,
   REPO_INDEX_MODE,
   toOciImageName,
   truncateTagForDisplay,
+  UNLINKED_PACKAGES_REPO_ID,
   type ClockFormat,
   type DateFormat,
 } from './naming';
 import pkg from '../../package.json';
+
+export {
+  filterUnlinkedContainerPackages,
+  isUnlinkedPackagesRepo,
+  packageMatchesRepo,
+  UNLINKED_PACKAGES_REPO_ID,
+};
 
 export interface GitHubUser {
   login: string;
@@ -990,6 +1001,86 @@ export async function buildAndPushOciImage(opts: {
  * Lists container packages for the selected repository's owner, separating those linked
  * directly to the chosen repository and any other container packages owned by the user/org.
  */
+export function createUnlinkedPackagesRepo(ownerLogin: string): GitHubRepo {
+  return {
+    id: UNLINKED_PACKAGES_REPO_ID,
+    name: 'Unlinked Packages',
+    full_name: 'Unlinked Packages',
+    private: false,
+    html_url: `https://github.com/${encodeURIComponent(ownerLogin)}?tab=packages`,
+    description: 'Container packages not linked to any GitHub repository',
+    updated_at: '',
+    hasCommits: true,
+    permissions: { push: true },
+    owner: {
+      login: ownerLogin,
+      avatar_url: '',
+      type: 'User',
+    },
+  };
+}
+
+/**
+ * Lists all unlinked container packages accessible to the signed-in account
+ * (personal `/user/packages` plus any `Organization` owners present in `repos`).
+ */
+export async function listUnlinkedContainerPackages(
+  githubToken: string,
+  currentUserLogin: string,
+  repos: readonly Pick<GitHubRepo, 'owner'>[] = [],
+  opts?: { throwOnUserError?: boolean }
+): Promise<GitHubPackageItem[]> {
+  let userPackages: GitHubPackageItem[] = [];
+  const userRes = await crossPlatformHttpRequest({
+    url: 'https://api.github.com/user/packages?package_type=container&per_page=100',
+    method: 'GET',
+    headers: githubApiHeaders(githubToken),
+  });
+
+  if (userRes.status === 200) {
+    userPackages = decodeJson<GitHubPackageItem[]>(userRes.body);
+  } else if (opts?.throwOnUserError) {
+    const errText = decodeText(userRes.body);
+    throw new Error(
+      `Failed to list packages (HTTP ${userRes.status}). Ensure your token includes 'read:packages'. Details: ${errText}`
+    );
+  }
+
+  const currentLower = currentUserLogin.toLowerCase();
+  const orgLogins = Array.from(
+    new Set(
+      repos
+        .filter(
+          (r) =>
+            r.owner.type === 'Organization' &&
+            r.owner.login.toLowerCase() !== currentLower
+        )
+        .map((r) => r.owner.login)
+    )
+  );
+
+  const orgPackageLists = await Promise.all(
+    orgLogins.map(async (org) => {
+      try {
+        const res = await crossPlatformHttpRequest({
+          url: `https://api.github.com/orgs/${encodeURIComponent(
+            org
+          )}/packages?package_type=container&per_page=100`,
+          method: 'GET',
+          headers: githubApiHeaders(githubToken),
+        });
+        if (res.status !== 200) return [] as GitHubPackageItem[];
+        return decodeJson<GitHubPackageItem[]>(res.body);
+      } catch {
+        return [] as GitHubPackageItem[];
+      }
+    })
+  );
+
+  const combined = [...userPackages, ...orgPackageLists.flat()];
+  return filterUnlinkedContainerPackages(combined);
+}
+
 export async function listPackagesForRepo(
   githubToken: string,
   currentUserLogin: string,
@@ -1028,12 +1119,7 @@ export async function listPackagesForRepo(
   const otherOwnerPackages: GitHubPackageItem[] = [];
 
   for (const pkg of allPackages) {
-    const matchesRepo =
-      pkg.repository &&
-      (pkg.repository.id === repo.id ||
-        pkg.repository.full_name.toLowerCase() === repo.full_name.toLowerCase());
-
-    if (matchesRepo) {
+    if (packageMatchesRepo(pkg, repo)) {
       repoPackages.push(pkg);
     } else {
       otherOwnerPackages.push(pkg);

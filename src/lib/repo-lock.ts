@@ -3,7 +3,11 @@ import {
   decodeJson,
   type HttpResponseData,
 } from './http.ts';
-import { getPackageLockKey, REPO_INDEX_LOCK_KEY } from './naming.ts';
+import {
+  getPackageLockKey,
+  isUnlinkedPackagesRepo,
+  REPO_INDEX_LOCK_KEY,
+} from './naming.ts';
 
 export const DEFAULT_LOCK_TTL_MS = 45_000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 12_000;
@@ -38,6 +42,7 @@ export function resolveCanonicalOwnerLockRepo<T extends RepoLockRepoTarget>(
   const ownerLower = (targetOwnerLogin || fallbackRepo.owner.login).trim().toLowerCase();
   let best: T | null = null;
   for (const r of repos) {
+    if (isUnlinkedPackagesRepo(r)) continue;
     if (r.owner.login.trim().toLowerCase() !== ownerLower) continue;
     if (r.hasCommits === false || r.permissions?.push === false) continue;
     if (!best || r.id < best.id) {

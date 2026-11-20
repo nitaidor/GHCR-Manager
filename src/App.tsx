@@ -49,6 +49,7 @@ import {
 } from './components/VersionInspectButton';
 import {
   buildAndPushOciImage,
+  createUnlinkedPackagesRepo,
   deleteGitHubPackage,
   deletePackageVersion,
   deleteReplacedVersions,
@@ -57,19 +58,24 @@ import {
   fetchGitHubAuthInfo,
   fetchLatestRepoIndex,
   fetchLivePackageState,
+  filterUnlinkedContainerPackages,
   formatBytes,
   getVersionReferenceInfo,
   getVersionStateSignature,
   indexRecordToOciDetails,
   inspectPackageManifest,
+  isUnlinkedPackagesRepo,
   listPackageVersions,
   listPackagesForRepo,
+  listUnlinkedContainerPackages,
   listUserRepositories,
   ociDetailsToIndexRecord,
+  packageMatchesRepo,
   pollGitHubDeviceFlowToken,
   publishRepoIndexSnapshot,
   sortPackageVersionsNewestFirst,
   startGitHubDeviceFlow,
+  UNLINKED_PACKAGES_REPO_ID,
   type DesktopStreamingInputFile,
   type GitHubPackageItem,
   type GitHubPackageVersion,
@@ -434,7 +440,16 @@ export default function App() {
   // --- TAB 3: Repo Packages state (Digest-keyed versions) ---
   const [repoPackages, setRepoPackages] = useState<GitHubPackageItem[]>([]);
   const [otherPackages, setOtherPackages] = useState<GitHubPackageItem[]>([]);
+  const [unlinkedPackagesCount, setUnlinkedPackagesCount] = useState<number>(0);
   const [showOtherPackages, setShowOtherPackages] = useState<boolean>(false);
+  const isUnlinkedView = isUnlinkedPackagesRepo(selectedRepo);
+  const unlinkedRepoOption = useMemo(
+    () =>
+      user && (unlinkedPackagesCount > 0 || isUnlinkedView)
+        ? createUnlinkedPackagesRepo(user.login)
+        : null,
+    [user, unlinkedPackagesCount, isUnlinkedView]
+  );
   const [packageSearch, setPackageSearch] = useState<string>('');
   const [packageVersionsMap, setPackageVersionsMap] = useState<
     Record<string, GitHubPackageVersion[]>
@@ -718,12 +733,29 @@ export default function App() {
       const userRepos = await listUserRepositories(clean);
       setRepos(userRepos);
 
-      const savedRepoId = Number(localStorage.getItem(STORAGE_REPO_KEY));
+      const unlinkedPkgs = await listUnlinkedContainerPackages(
+        clean,
+        ghUser.login,
+        userRepos
+      ).catch(() => []);
+      setUnlinkedPackagesCount(unlinkedPkgs.length);
+
+      const savedRepoRaw = localStorage.getItem(STORAGE_REPO_KEY);
+      const savedRepoId =
+        savedRepoRaw !== null && savedRepoRaw !== '' ? Number(savedRepoRaw) : NaN;
+      const unlinkedVirtualRepo =
+        unlinkedPkgs.length > 0 ? createUnlinkedPackagesRepo(ghUser.login) : null;
+
       const matched =
+        (savedRepoId === UNLINKED_PACKAGES_REPO_ID && unlinkedVirtualRepo) ||
         userRepos.find((r) => r.id === savedRepoId && isRepoSelectable(r)) ||
         userRepos.find(isRepoSelectable) ||
+        unlinkedVirtualRepo ||
         null;
       setSelectedRepo(matched);
+      if (isUnlinkedPackagesRepo(matched)) {
+        setActiveTab('packages');
+      }
     } catch (err: unknown) {
       setAuthError(err instanceof Error ? err.message : String(err));
       setUser(null);
@@ -749,6 +781,8 @@ export default function App() {
     setSelectedRepo(null);
     setRepoPackages([]);
     setOtherPackages([]);
+    setUnlinkedPackagesCount(0);
+    setShowOtherPackages(false);
     setPackageVersionsMap({});
     setInspectedByKey({});
     setIndexingKeys(new Set());
@@ -874,11 +908,31 @@ export default function App() {
     };
   }, [devicePolling, deviceFlowInfo, oauthClientId]);
 
+  // Silently refresh unlinked packages count when opening App Settings
+  useEffect(() => {
+    if (!showSettingsModal || !authToken || !user) return;
+    let cancelled = false;
+    listUnlinkedContainerPackages(authToken, user.login, repos)
+      .then((list) => {
+        if (!cancelled) {
+          setUnlinkedPackagesCount(list.length);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [showSettingsModal, authToken, user, repos]);
+
   // Refresh packages when selectedRepo changes or when switching to Repo Packages tab
   useEffect(() => {
     if (selectedRepo && authToken && user) {
       handleCancelInspect();
       downloadAbortRef.current?.abort();
+      setShowOtherPackages(false);
+      if (isUnlinkedPackagesRepo(selectedRepo)) {
+        setActiveTab('packages');
+      }
       setExpandedVersionKeys(new Set());
       setConfirmDeletePkg(null);
       setConfirmDeleteVersion(null);
@@ -936,7 +990,7 @@ export default function App() {
       liveVKeys?: Set<string>;
     }
   ): Promise<Record<string, RepoIndexVersionRecord>> {
-    if (!user || !authToken) return {};
+    if (!user || !authToken || isUnlinkedPackagesRepo(repo)) return {};
     if (!preloaded && repoIndexLoadedForRepoIdRef.current === repo.id) {
       return repoIndexEntriesRef.current;
     }
@@ -1037,7 +1091,7 @@ export default function App() {
   async function syncRemoteRepoIndexIfChanged(
     repo: GitHubRepo
   ): Promise<Record<string, RepoIndexVersionRecord>> {
-    if (!user || !authToken) return repoIndexEntriesRef.current;
+    if (!user || !authToken || isUnlinkedPackagesRepo(repo)) return {};
 
     if (
       repoIndexRemoteCheckRef.current &&
@@ -1098,6 +1152,9 @@ export default function App() {
     removeKeys?: string[];
     removePkgNames?: string[];
   }): Promise<void> {
+    if (isUnlinkedPackagesRepo(opts.repo)) {
+      return Promise.resolve();
+    }
     repoIndexPendingCountRef.current += 1;
     setRepoIndexUpdating(true);
 
@@ -1238,6 +1295,7 @@ export default function App() {
     if (
       !indexMap &&
       selectedRepo &&
+      !isUnlinkedPackagesRepo(selectedRepo) &&
       repoIndexLoadedForRepoIdRef.current !== selectedRepo.id &&
       !isRepoIndexPackageName(pkgName)
     ) {
@@ -1303,9 +1361,78 @@ export default function App() {
     setPackagesLoading(true);
     setPackagesError(null);
     try {
+      if (isUnlinkedPackagesRepo(selectedRepo)) {
+        setRepoIndexPkg(null);
+        setRepoIndexVersions([]);
+        repoIndexVersionsRef.current = [];
+        setRepoIndexEntries({});
+
+        const unlinked = await listUnlinkedContainerPackages(
+          authToken,
+          user.login,
+          repos,
+          { throwOnUserError: true }
+        );
+        if (refreshSeqRef.current !== seq) return;
+
+        setRepoPackages(unlinked);
+        setOtherPackages([]);
+        setUnlinkedPackagesCount(unlinked.length);
+
+        const fetchedVersionsByPkg: Record<string, GitHubPackageVersion[]> = {};
+        await Promise.all(
+          unlinked.map(async (pkg) => {
+            try {
+              const versions = await listPackageVersions({
+                githubToken: authToken,
+                currentUserLogin: user.login,
+                owner: pkg.owner.login,
+                ownerType: pkg.owner.type,
+                packageName: pkg.name,
+              });
+              if (refreshSeqRef.current !== seq) return;
+              const lowerName = pkg.name.toLowerCase();
+              fetchedVersionsByPkg[lowerName] = versions;
+              setPackageVersionsMap((prev) => ({
+                ...prev,
+                [lowerName]: versions,
+              }));
+            } catch {
+              // ignore individual version fetch failures
+            }
+          })
+        );
+
+        if (refreshSeqRef.current !== seq) return;
+
+        for (const pkg of unlinked) {
+          const versions = fetchedVersionsByPkg[pkg.name.toLowerCase()];
+          if (versions && versions.length > 0) {
+            void indexVersionList(pkg.name, pkg.owner.login, versions, {});
+          }
+        }
+        return;
+      }
+
       const { repoPackages: rawLinked, otherOwnerPackages: rawOthers } =
         await listPackagesForRepo(authToken, user.login, selectedRepo);
       if (refreshSeqRef.current !== seq) return;
+
+      const hasOrgRepos = repos.some((r) => r.owner.type === 'Organization');
+      if (
+        selectedRepo.owner.login.toLowerCase() === user.login.toLowerCase() &&
+        !hasOrgRepos
+      ) {
+        setUnlinkedPackagesCount(filterUnlinkedContainerPackages(rawOthers).length);
+      } else {
+        void listUnlinkedContainerPackages(authToken, user.login, repos)
+          .then((list) => {
+            if (refreshSeqRef.current === seq) {
+              setUnlinkedPackagesCount(list.length);
+            }
+          })
+          .catch(() => {});
+      }
 
       const expectedIdxPkgName = getRepoIndexPackageName(
         selectedRepo.name
@@ -1347,6 +1474,7 @@ export default function App() {
         ...others,
       ];
       const linkedNameSet = new Set(linked.map((p) => p.name.toLowerCase()));
+      const otherNameSet = new Set(others.map((p) => p.name.toLowerCase()));
 
       await Promise.all(
         fetchList.map(async (pkg) => {
@@ -1393,6 +1521,15 @@ export default function App() {
 
       if (refreshSeqRef.current !== seq) return;
 
+      // Mark index packages that were returned in `otherPackages` (unlinked or linked to another repo)
+      // as confirmed checked so stale entries are cleaned out of this repo's index.
+      for (const rec of Object.values(currentIndexMap)) {
+        const pkgLower = rec.packageName.toLowerCase();
+        if (otherNameSet.has(pkgLower)) {
+          succeededLinkedPkgNames.add(pkgLower);
+        }
+      }
+
       const missingFromListPkgNames = Array.from(
         new Set(
           Object.values(currentIndexMap)
@@ -1400,6 +1537,7 @@ export default function App() {
             .filter(
               (pkgLower) =>
                 !linkedNameSet.has(pkgLower) &&
+                !otherNameSet.has(pkgLower) &&
                 !deletedPkgTombstones[pkgLower] &&
                 !isRepoIndexPackageName(pkgLower)
             )
@@ -1424,19 +1562,22 @@ export default function App() {
         for (const { pkgLower, live } of directChecked) {
           if (!live) continue;
           succeededLinkedPkgNames.add(pkgLower);
-          if (live.exists && live.packageItem) {
-            if (live.versions.length > 0) {
-              linked.push(live.packageItem);
-              linkedNameSet.add(pkgLower);
-              fetchedVersionsByPkg[pkgLower] = live.versions;
-              for (const v of live.versions) {
-                liveLinkedVKeys.add(makeVersionStateKey(pkgLower, v.name));
-              }
-              setPackageVersionsMap((prev) => ({
-                ...prev,
-                [pkgLower]: live.versions,
-              }));
+          if (
+            live.exists &&
+            live.packageItem &&
+            packageMatchesRepo(live.packageItem, selectedRepo) &&
+            live.versions.length > 0
+          ) {
+            linked.push(live.packageItem);
+            linkedNameSet.add(pkgLower);
+            fetchedVersionsByPkg[pkgLower] = live.versions;
+            for (const v of live.versions) {
+              liveLinkedVKeys.add(makeVersionStateKey(pkgLower, v.name));
             }
+            setPackageVersionsMap((prev) => ({
+              ...prev,
+              [pkgLower]: live.versions,
+            }));
           }
         }
         setRepoPackages([...linked]);
@@ -1779,7 +1920,7 @@ export default function App() {
   }
 
   function handleOpenUploadVersionModal() {
-    if (!selectedRepo || !user || !authToken) return;
+    if (!selectedRepo || isUnlinkedPackagesRepo(selectedRepo) || !user || !authToken) return;
     if (!fileNamingValidation.valid) {
       setUploadError(fileNamingValidation.error || 'Invalid image name.');
       return;
@@ -1799,7 +1940,7 @@ export default function App() {
     replaceVersions: GitHubPackageVersion[];
     isTagManuallyEdited: boolean;
   }) {
-    if (!selectedRepo || !user || !authToken) return;
+    if (!selectedRepo || isUnlinkedPackagesRepo(selectedRepo) || !user || !authToken) return;
     if (!fileNamingValidation.valid) {
       setUploadError(fileNamingValidation.error || 'Invalid image name.');
       return;
@@ -2572,7 +2713,7 @@ export default function App() {
   }
 
   function handleOpenSyncReviewModal() {
-    if (!rootScan || !selectedRepo || !user || !authToken) return;
+    if (!rootScan || !selectedRepo || isUnlinkedPackagesRepo(selectedRepo) || !user || !authToken) return;
     const indicesToSync = Array.from(selectedSyncIndices).sort((a, b) => a - b);
     if (indicesToSync.length === 0) {
       setSyncError('Please select at least one item in the root folder to sync.');
@@ -2604,7 +2745,7 @@ export default function App() {
   }
 
   async function handleExecuteBatchSync(plans: SyncBatchItemPlan[]) {
-    if (!selectedRepo || !user || !authToken) return;
+    if (!selectedRepo || isUnlinkedPackagesRepo(selectedRepo) || !user || !authToken) return;
     const activePlans = plans.filter((p) => p.action !== 'skip');
     if (activePlans.length === 0) return;
 
@@ -3088,7 +3229,11 @@ export default function App() {
         (p) => p.name.toLowerCase() === pkgName.toLowerCase()
       );
 
-      if (!isRepoIndexPackageName(pkgName) && !isOtherPkg) {
+      if (
+        !isRepoIndexPackageName(pkgName) &&
+        !isOtherPkg &&
+        !isUnlinkedPackagesRepo(selectedRepo)
+      ) {
         const latestIndexMap = await syncRemoteRepoIndexIfChanged(selectedRepo);
         if (ac.signal.aborted) return;
         const remoteRecord = latestIndexMap[vKey];
@@ -3109,7 +3254,11 @@ export default function App() {
       const details = await inspectPackageManifest({
         username: user.login,
         githubToken: authToken,
-        owner: ownerLogin || selectedRepo.owner.login,
+        owner:
+          ownerLogin ||
+          (isUnlinkedPackagesRepo(selectedRepo)
+            ? user.login
+            : selectedRepo.owner.login),
         packageName: pkgName,
         tag: info.primaryTag || info.shortDigest,
         reference: info.inspectRef,
@@ -3123,7 +3272,11 @@ export default function App() {
       }));
       setExpandedVersionKeys((prev) => new Set(prev).add(vKey));
 
-      if (!isRepoIndexPackageName(pkgName) && !isOtherPkg) {
+      if (
+        !isRepoIndexPackageName(pkgName) &&
+        !isOtherPkg &&
+        !isUnlinkedPackagesRepo(selectedRepo)
+      ) {
         void enqueueRepoIndexMutation({
           repo: selectedRepo,
           addOrUpdate: [
@@ -3237,7 +3390,8 @@ export default function App() {
         res.saved &&
         wasUnindexed &&
         !isRepoIndexPackageName(pkg.name) &&
-        !isOtherPkg
+        !isOtherPkg &&
+        !isUnlinkedPackagesRepo(selectedRepo)
       ) {
         void enqueueRepoIndexMutation({
           repo: selectedRepo,
@@ -3409,7 +3563,12 @@ export default function App() {
       const isOtherPkg = otherPackages.some(
         (p) => p.name.toLowerCase() === pkg.name.toLowerCase()
       );
-      if (wasUnindexed && !isRepoIndexPackageName(pkg.name) && !isOtherPkg) {
+      if (
+        wasUnindexed &&
+        !isRepoIndexPackageName(pkg.name) &&
+        !isOtherPkg &&
+        !isUnlinkedPackagesRepo(selectedRepo)
+      ) {
         void enqueueRepoIndexMutation({
           repo: selectedRepo,
           addOrUpdate: [
@@ -3616,14 +3775,18 @@ export default function App() {
     const isOtherPkg = otherPackages.some(
       (p) => p.name.toLowerCase() === pkgKey
     );
-    const shouldLockPkg = !isRepoIndexPackageName(pkg.name);
-    const shouldUpdateSelectedIndex = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
+    const lockRepo = resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login);
+    const shouldLockPkg = !isRepoIndexPackageName(pkg.name) && !isUnlinkedPackagesRepo(lockRepo);
+    const shouldUpdateSelectedIndex =
+      !isOtherPkg &&
+      !isRepoIndexPackageName(pkg.name) &&
+      !isUnlinkedPackagesRepo(selectedRepo);
     let pkgLock: ActiveRepoLock | null = null;
 
     try {
       if (shouldLockPkg) {
         pkgLock = await acquireRepoLock({
-          repo: resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login),
+          repo: lockRepo,
           githubToken: authToken,
           ownerLogin: user.login,
           lockKey: getPackageLockKey(pkg.name),
@@ -3741,8 +3904,12 @@ export default function App() {
     const isOtherPkg = otherPackages.some(
       (p) => p.name.toLowerCase() === pkgKey
     );
-    const shouldLockPkg = !isRepoIndexPackageName(pkg.name);
-    const shouldUpdateSelectedIndex = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
+    const lockRepo = resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login);
+    const shouldLockPkg = !isRepoIndexPackageName(pkg.name) && !isUnlinkedPackagesRepo(lockRepo);
+    const shouldUpdateSelectedIndex =
+      !isOtherPkg &&
+      !isRepoIndexPackageName(pkg.name) &&
+      !isUnlinkedPackagesRepo(selectedRepo);
     const beforeVersions = packageVersionsMap[pkgKey] || [];
     setDeletingPkgName(pkg.name);
     setConfirmDeletePkg(null);
@@ -3750,7 +3917,7 @@ export default function App() {
     try {
       if (shouldLockPkg) {
         pkgLock = await acquireRepoLock({
-          repo: resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login),
+          repo: lockRepo,
           githubToken: authToken,
           ownerLogin: user.login,
           lockKey: getPackageLockKey(pkg.name),
@@ -4305,6 +4472,7 @@ export default function App() {
             setActiveTab={setActiveTab}
             packageCount={repoPackages.length}
             isDesktop={isDesktopEnv}
+            isUnlinkedMode={isUnlinkedView}
           />
 
           <main className="w-full max-w-4xl relative z-10 space-y-6">
@@ -4343,7 +4511,7 @@ export default function App() {
             {selectedRepo && (
               <>
                 {/* ==================== TAB 1: UPLOAD FILES ==================== */}
-                {activeTab === 'upload-files' && (
+                {activeTab === 'upload-files' && !isUnlinkedView && (
                   <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-6">
                     <div>
                       <h3 className="text-base font-bold text-white flex items-center gap-2">
@@ -4974,7 +5142,7 @@ export default function App() {
                 )}
 
                 {/* ==================== TAB 2: SYNC ROOT FOLDER ==================== */}
-                {activeTab === 'sync-folder' && (
+                {activeTab === 'sync-folder' && !isUnlinkedView && (
                   <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-6">
                     <div className="flex flex-wrap items-start justify-between gap-4">
                       <div>
@@ -5348,22 +5516,25 @@ export default function App() {
                 )}
 
                 {/* ==================== TAB 3: REPO PACKAGES ==================== */}
-                {activeTab === 'packages' && (
+                {(activeTab === 'packages' || isUnlinkedView) && (
                   <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-6 shadow-md space-y-5">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <h3 className="text-base font-bold text-white flex items-center gap-2">
                           <Layers className="w-5 h-5 icon-packages" />
-                          Packages in {selectedRepo.full_name}
+                          {isUnlinkedView
+                            ? 'Unlinked Packages'
+                            : `Packages in ${selectedRepo.full_name}`}
                         </h3>
                         <p className="text-xs text-gray-400 mt-0.5">
-                          Search packages or files inside images, inspect layers, download &
-                          extract, or remove packages.
+                          {isUnlinkedView
+                            ? 'Container packages on your GitHub account not linked to any repository. Inspect layers, download & extract, or remove packages.'
+                            : 'Search packages or files inside images, inspect layers, download & extract, or remove packages.'}
                         </p>
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {otherPackages.length > 0 && (
+                        {!isUnlinkedView && otherPackages.length > 0 && (
                           <button
                             type="button"
                             onClick={() => setShowOtherPackages(!showOtherPackages)}
@@ -5442,12 +5613,24 @@ export default function App() {
                         return entries;
                       };
 
-                      const mergedEntries: MergedPackageEntry[] = [
+                      const rawMergedEntries: MergedPackageEntry[] = [
                         ...mergeWithTombstones(repoPackages, false),
                         ...(showOtherPackages
                           ? mergeWithTombstones(otherPackages, true)
                           : []),
                       ];
+                      const seenMergedNames = new Set<string>();
+                      const mergedEntries: MergedPackageEntry[] = rawMergedEntries.filter(
+                        (entry) => {
+                          const nameKey =
+                            entry.kind === 'tombstone'
+                              ? entry.tombstone.pkg.name.toLowerCase()
+                              : entry.pkg.name.toLowerCase();
+                          if (seenMergedNames.has(nameKey)) return false;
+                          seenMergedNames.add(nameKey);
+                          return true;
+                        }
+                      );
 
                       const renderRepoPackageCard = ({
                         pkg,
@@ -5484,7 +5667,10 @@ export default function App() {
                           : 'p-3 rounded-md bg-[#161b22] border border-[#30363d] space-y-2.5';
 
                         return (
-                          <div key={pkg.id} className={outerCardClass}>
+                          <div
+                            key={isIndexCard ? `idx-${pkg.id}` : `pkg-${pkg.id}-${pkgKey}`}
+                            className={outerCardClass}
+                          >
                             <div className="flex flex-wrap items-center justify-between gap-3">
                               <div className="flex items-center gap-2 flex-wrap min-w-0 flex-1">
                                 <Package className="w-4 h-4 icon-packages shrink-0" />
@@ -5790,24 +5976,32 @@ export default function App() {
                           )}
 
                           {packagesLoading ? (
-                            <div className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2">
+                            <div
+                              key="packages-loading"
+                              className="p-12 flex flex-col items-center justify-center text-gray-400 gap-2"
+                            >
                               <Loader2 className="w-6 h-6 animate-spin theme-spinner" />
                               <span className="text-xs">Loading packages from GitHub...</span>
                             </div>
                           ) : mergedEntries.length === 0 && !showOtherPackages ? (
-                            <div className="p-10 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-2">
+                            <div
+                              key="packages-empty"
+                              className="p-10 rounded-md bg-[#0d1117] border border-[#30363d] text-center space-y-2"
+                            >
                               <Package className="w-8 h-8 text-gray-500 mx-auto" />
                               <div className="text-sm font-semibold text-gray-300">
-                                No packages linked to {selectedRepo.full_name} yet
+                                {isUnlinkedView
+                                  ? 'No unlinked packages found'
+                                  : `No packages linked to ${selectedRepo.full_name} yet`}
                               </div>
                               <p className="text-xs text-gray-500 max-w-md mx-auto">
-                                Use the &quot;Upload Files&quot; or &quot;Sync Root
-                                Folder&quot; tabs to create and push your first container
-                                package image.
+                                {isUnlinkedView
+                                  ? 'All container packages on your GitHub account are currently linked to a repository (or none exist yet). Choose a repository in App Settings to manage repo packages.'
+                                  : 'Use the "Upload Files" or "Sync Root Folder" tabs to create and push your first container package image.'}
                               </p>
                             </div>
                           ) : (
-                            <div className="space-y-3">
+                            <div key="packages-list" className="space-y-3">
                               {mergedEntries
                                 .filter((entry) => {
                                   const q = packageSearch.trim().toLowerCase();
@@ -5910,7 +6104,9 @@ export default function App() {
                             </div>
                           )}
 
-                          {!packagesLoading && (repoIndexPkg || repoIndexNotice || repoIndexUpdating) && (
+                          {!packagesLoading &&
+                            !isUnlinkedView &&
+                            (repoIndexPkg || repoIndexNotice || repoIndexUpdating) && (
                             <div className="border-t border-[#30363d] pt-5 mt-5 space-y-3">
                               <button
                                 type="button"
@@ -6259,13 +6455,20 @@ export default function App() {
         isDesktopEnv={isDesktopEnv}
         repos={repos}
         selectedRepo={selectedRepo}
-        onSelectRepo={(repo) => setSelectedRepo(repo)}
+        onSelectRepo={(repo) => {
+          setSelectedRepo(repo);
+          if (isUnlinkedPackagesRepo(repo)) {
+            setActiveTab('packages');
+          }
+        }}
         reposLoading={reposLoading}
         onRefreshRepos={() => {
           if (authToken) {
             void handleSignInWithToken(authToken, { source: 'restore' });
           }
         }}
+        unlinkedPackagesCount={unlinkedPackagesCount}
+        unlinkedRepoOption={unlinkedRepoOption}
       />
 
       <HelpModal

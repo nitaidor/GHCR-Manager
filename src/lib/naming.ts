@@ -378,3 +378,43 @@ export function getVersionReferenceInfo(version: {
     displayPullSuffix,
   };
 }
+
+export const UNLINKED_PACKAGES_REPO_ID = -1;
+
+export function isUnlinkedPackagesRepo(repo: { id: number } | null | undefined): boolean {
+  return repo?.id === UNLINKED_PACKAGES_REPO_ID;
+}
+
+export function packageMatchesRepo(
+  pkg: { repository?: { id: number; full_name: string } | null },
+  repo: { id: number; full_name: string } | null | undefined
+): boolean {
+  if (!repo || isUnlinkedPackagesRepo(repo) || !pkg.repository) return false;
+  return (
+    pkg.repository.id === repo.id ||
+    pkg.repository.full_name.toLowerCase() === repo.full_name.toLowerCase()
+  );
+}
+
+export function filterUnlinkedContainerPackages<
+  T extends {
+    id?: number;
+    name: string;
+    owner?: { login: string };
+    repository?: { id: number; full_name: string } | null;
+  },
+>(packages: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const pkg of packages) {
+    if (pkg.repository || isRepoIndexPackageName(pkg.name)) continue;
+    const dedupKey =
+      typeof pkg.id === 'number'
+        ? `id:${pkg.id}`
+        : `name:${(pkg.owner?.login || '').toLowerCase()}/${pkg.name.toLowerCase()}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+    result.push(pkg);
+  }
+  return result;
+}

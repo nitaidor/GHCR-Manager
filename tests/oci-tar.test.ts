@@ -8,6 +8,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import {
+  filterUnlinkedContainerPackages,
   formatDisplayDateTime,
   formatTimestampTag,
   formatUniqueRepoIndexTag,
@@ -16,9 +17,12 @@ import {
   getRepoIndexPackageName,
   getVersionReferenceInfo,
   isRepoIndexPackageName,
+  isUnlinkedPackagesRepo,
   MAX_DISPLAY_TAG_CHARS,
+  packageMatchesRepo,
   toGitRefSafeLockSegment,
   toOciImageName,
+  UNLINKED_PACKAGES_REPO_ID,
   validateFilesSelectionName,
   validateOciTag,
 } from '../src/lib/naming.ts';
@@ -1924,6 +1928,77 @@ async function runTests() {
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }
+
+  console.log('18. Testing Unlinked Packages helpers and canonical lock guard...');
+  assert.equal(isUnlinkedPackagesRepo(null), false);
+  assert.equal(isUnlinkedPackagesRepo(undefined), false);
+  assert.equal(isUnlinkedPackagesRepo({ id: UNLINKED_PACKAGES_REPO_ID }), true);
+  assert.equal(isUnlinkedPackagesRepo({ id: 12345 }), false);
+
+  const sampleRepoA = { id: 100, full_name: 'Alice/RepoA' };
+  const sampleUnlinkedRepo = { id: UNLINKED_PACKAGES_REPO_ID, full_name: 'Unlinked Packages' };
+  assert.equal(
+    packageMatchesRepo({ repository: { id: 100, full_name: 'other/name' } }, sampleRepoA),
+    true
+  );
+  assert.equal(
+    packageMatchesRepo({ repository: { id: 999, full_name: 'alice/repoa' } }, sampleRepoA),
+    true
+  );
+  assert.equal(
+    packageMatchesRepo({ repository: { id: 200, full_name: 'Alice/RepoB' } }, sampleRepoA),
+    false
+  );
+  assert.equal(packageMatchesRepo({ repository: null }, sampleRepoA), false);
+  assert.equal(packageMatchesRepo({ repository: undefined }, sampleRepoA), false);
+  assert.equal(
+    packageMatchesRepo({ repository: { id: -1, full_name: 'Unlinked Packages' } }, sampleUnlinkedRepo),
+    false
+  );
+
+  const mixedPkgs = [
+    { id: 1, name: 'unlinked-one', owner: { login: 'Alice' }, repository: null },
+    { id: 1, name: 'unlinked-one', owner: { login: 'Alice' }, repository: null },
+    { id: 2, name: 'linked-pkg', owner: { login: 'Alice' }, repository: { id: 100, full_name: 'Alice/RepoA' } },
+    { id: 3, name: 'ghcr-manager-index_repoa', owner: { login: 'Alice' }, repository: null },
+    { id: 4, name: 'unlinked-org', owner: { login: 'MyOrg' }, repository: undefined },
+  ];
+  const filteredUnlinked = filterUnlinkedContainerPackages(mixedPkgs);
+  assert.deepEqual(
+    filteredUnlinked.map((p) => p.name),
+    ['unlinked-one', 'unlinked-org']
+  );
+
+  const lockPickedReal = resolveCanonicalOwnerLockRepo(
+    [
+      {
+        id: UNLINKED_PACKAGES_REPO_ID,
+        name: 'Unlinked Packages',
+        full_name: 'Unlinked Packages',
+        hasCommits: true,
+        permissions: { push: true },
+        owner: { login: 'Alice' },
+      },
+      {
+        id: 42,
+        name: 'real-repo',
+        full_name: 'Alice/real-repo',
+        hasCommits: true,
+        permissions: { push: true },
+        owner: { login: 'Alice' },
+      },
+    ],
+    {
+      id: UNLINKED_PACKAGES_REPO_ID,
+      name: 'Unlinked Packages',
+      full_name: 'Unlinked Packages',
+      hasCommits: true,
+      permissions: { push: true },
+      owner: { login: 'Alice' },
+    },
+    'Alice'
+  );
+  assert.equal(lockPickedReal.id, 42);
 
   console.log('All tests passed successfully!');
 }
