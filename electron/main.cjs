@@ -22,17 +22,42 @@ const {
 
 const activeLayerStreams = new Map();
 const activeTransfers = new Map();
-const activeUploadTransfers = new Set();
+const activeUploadTransfersByToken = new Map();
+const closeGuardModeByWebContents = new Map();
 const activeTempFiles = new Set();
 const activeStagingDirs = new Set();
 
-let mainWindow = null;
-let closeGuardMode = 'none';
-
-function getEffectiveCloseGuardMode() {
-  if (closeGuardMode !== 'none') return closeGuardMode;
-  if (activeUploadTransfers.size > 0) return 'upload';
+function getEffectiveCloseGuardModeForWebContents(webContentsId) {
+  const mode = closeGuardModeByWebContents.get(webContentsId);
+  if (mode && mode !== 'none') return mode;
+  for (const ownerId of activeUploadTransfersByToken.values()) {
+    if (ownerId === webContentsId) return 'upload';
+  }
   return 'none';
+}
+
+function findFirstCloseBlockedWindow() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) continue;
+    const mode = getEffectiveCloseGuardModeForWebContents(win.webContents.id);
+    if (mode !== 'none') {
+      return { win, mode };
+    }
+  }
+  return null;
+}
+
+function sendToSender(sender, channel, payload) {
+  if (sender && !sender.isDestroyed()) {
+    sender.send(channel, payload);
+  }
+}
+
+function showOpenDialogForEvent(event, options) {
+  const parentWin = BrowserWindow.fromWebContents(event.sender);
+  return parentWin && !parentWin.isDestroyed()
+    ? dialog.showOpenDialog(parentWin, options)
+    : dialog.showOpenDialog(options);
 }
 
 function notifyCloseBlocked(win, mode) {
@@ -269,6 +294,21 @@ if (process.platform === 'win32' && !process.env.PORTABLE_EXECUTABLE_FILE) {
   app.setAppUserModelId('io.ghcr.manager');
 }
 
+const gotTheLock = app.requestSingleInstanceLock();
+let pendingSecondInstanceCount = 0;
+
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (app.isReady()) {
+      createWindow();
+    } else {
+      pendingSecondInstanceCount += 1;
+    }
+  });
+}
+
 // Synchronize native OS right-click context menus with the app's Dark/Light theme state
 ipcMain.on('set-native-theme', (_event, mode) => {
   if (mode === 'dark' || mode === 'light' || mode === 'system') {
@@ -279,6 +319,13 @@ ipcMain.on('set-native-theme', (_event, mode) => {
 function createWindow() {
   const iconFile = process.platform === 'win32' ? 'icon.ico' : 'icon.png';
   const iconPath = path.join(__dirname, '../assets', iconFile);
+  const existingWindows = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed());
+  const anchor = BrowserWindow.getFocusedWindow() || existingWindows[existingWindows.length - 1];
+  let windowPos = {};
+  if (anchor && !anchor.isMaximized() && !anchor.isMinimized()) {
+    const bounds = anchor.getBounds();
+    windowPos = { x: bounds.x + 28, y: bounds.y + 28 };
+  }
 
   const win = new BrowserWindow({
     title: 'GHCR Manager',
@@ -287,6 +334,7 @@ function createWindow() {
     height: 860,
     minWidth: 800,
     minHeight: 600,
+    ...windowPos,
     backgroundColor: '#0d1117',
     autoHideMenuBar: true,
     webPreferences: {
@@ -297,10 +345,10 @@ function createWindow() {
   });
 
   win.setMenuBarVisibility(false);
-  mainWindow = win;
+  const wcId = win.webContents.id;
 
   win.on('close', (event) => {
-    const activeMode = getEffectiveCloseGuardMode();
+    const activeMode = getEffectiveCloseGuardModeForWebContents(wcId);
     if (activeMode !== 'none') {
       event.preventDefault();
       notifyCloseBlocked(win, activeMode);
@@ -308,18 +356,20 @@ function createWindow() {
   });
 
   win.on('closed', () => {
-    if (mainWindow === win) {
-      mainWindow = null;
+    closeGuardModeByWebContents.delete(wcId);
+    for (const [tok, ownerId] of activeUploadTransfersByToken.entries()) {
+      if (ownerId === wcId) {
+        activeUploadTransfersByToken.delete(tok);
+      }
     }
-    closeGuardMode = 'none';
   });
 
   win.webContents.on('did-start-loading', () => {
-    closeGuardMode = 'none';
+    closeGuardModeByWebContents.set(wcId, 'none');
   });
 
   win.webContents.on('render-process-gone', () => {
-    closeGuardMode = 'none';
+    closeGuardModeByWebContents.delete(wcId);
   });
 
   // Native right-click context menu (Undo, Redo, Cut, Copy, Paste, Select All)
@@ -556,9 +606,10 @@ async function scanPathsForUpload(targetPaths, scanId = null) {
   return items;
 }
 
+if (gotTheLock) {
 app.whenReady().then(() => {
-  ipcMain.handle('desktop:pickDirectoryPath', async () => {
-    const res = await dialog.showOpenDialog({
+  ipcMain.handle('desktop:pickDirectoryPath', async (event) => {
+    const res = await showOpenDialogForEvent(event, {
       title: 'Select Root Folder to Sync with GitHub Packages',
       properties: ['openDirectory'],
     });
@@ -566,8 +617,8 @@ app.whenReady().then(() => {
     return res.filePaths[0];
   });
 
-  ipcMain.handle('desktop:pickDirectoriesForUpload', async () => {
-    const res = await dialog.showOpenDialog({
+  ipcMain.handle('desktop:pickDirectoriesForUpload', async (event) => {
+    const res = await showOpenDialogForEvent(event, {
       title: 'Select Folder(s) to Upload as OCI Image',
       properties: ['openDirectory', 'multiSelections'],
     });
@@ -575,8 +626,8 @@ app.whenReady().then(() => {
     return res.filePaths;
   });
 
-  ipcMain.handle('desktop:pickRootFolder', async () => {
-    const res = await dialog.showOpenDialog({
+  ipcMain.handle('desktop:pickRootFolder', async (event) => {
+    const res = await showOpenDialogForEvent(event, {
       title: 'Select Root Folder to Sync with GitHub Packages',
       properties: ['openDirectory'],
     });
@@ -611,8 +662,8 @@ app.whenReady().then(() => {
     return new Uint8Array(buf);
   });
 
-  ipcMain.handle('desktop:prepareExtractDestination', async (_event, { defaultFolderName }) => {
-    const res = await dialog.showOpenDialog({
+  ipcMain.handle('desktop:prepareExtractDestination', async (event, { defaultFolderName }) => {
+    const res = await showOpenDialogForEvent(event, {
       title: `Select Destination Folder to Extract "${defaultFolderName}"`,
       properties: ['openDirectory', 'createDirectory'],
     });
@@ -623,8 +674,8 @@ app.whenReady().then(() => {
     return { canceled: false, ...info };
   });
 
-  ipcMain.handle('desktop:saveExtractedFiles', async (_event, defaultFolderName, files) => {
-    const res = await dialog.showOpenDialog({
+  ipcMain.handle('desktop:saveExtractedFiles', async (event, defaultFolderName, files) => {
+    const res = await showOpenDialogForEvent(event, {
       title: `Select Destination Folder to Extract "${defaultFolderName}"`,
       properties: ['openDirectory', 'createDirectory'],
     });
@@ -659,9 +710,9 @@ app.whenReady().then(() => {
     }
   });
 
-  ipcMain.on('desktop:setCloseGuardMode', (_event, mode) => {
+  ipcMain.on('desktop:setCloseGuardMode', (event, mode) => {
     if (mode === 'none' || mode === 'upload' || mode === 'sync' || mode === 'index') {
-      closeGuardMode = mode;
+      closeGuardModeByWebContents.set(event.sender.id, mode);
     }
   });
 
@@ -692,7 +743,7 @@ app.whenReady().then(() => {
     const abortController = new AbortController();
     if (requestId) activeTransfers.set(requestId, abortController);
     const uploadToken = Symbol('buildOciLayerFile');
-    activeUploadTransfers.add(uploadToken);
+    activeUploadTransfersByToken.set(uploadToken, event.sender.id);
 
     let lastSentPct = -1;
     try {
@@ -704,7 +755,7 @@ app.whenReady().then(() => {
           const scaledPct = 10 + Math.round((percent / 100) * 35); // 10% -> 45%
           if (requestId && scaledPct !== lastSentPct) {
             lastSentPct = scaledPct;
-            event.sender.send('desktop:transferProgress', {
+            sendToSender(event.sender, 'desktop:transferProgress', {
               requestId,
               stage: 'archiving',
               message: `Archiving & compressing layer (${formatBytesNode(processedBytes)} / ${formatBytesNode(totalBytes)})...`,
@@ -718,7 +769,7 @@ app.whenReady().then(() => {
       await fs.unlink(tempPath).catch(() => {});
       throw err;
     } finally {
-      activeUploadTransfers.delete(uploadToken);
+      activeUploadTransfersByToken.delete(uploadToken);
       if (requestId) activeTransfers.delete(requestId);
     }
   });
@@ -747,7 +798,7 @@ app.whenReady().then(() => {
       const abortController = new AbortController();
       if (requestId) activeTransfers.set(requestId, abortController);
       const uploadToken = Symbol('uploadBlobFromFile');
-      activeUploadTransfers.add(uploadToken);
+      activeUploadTransfersByToken.set(uploadToken, event.sender.id);
       let token = registryToken;
       let fileHandle = null;
       let sessionUrl = '';
@@ -833,7 +884,7 @@ app.whenReady().then(() => {
           }
 
           if (requestId) {
-            event.sender.send('desktop:transferProgress', {
+            sendToSender(event.sender, 'desktop:transferProgress', {
               requestId,
               stage: 'uploading-layer',
               message: `Uploaded compressed image layer (${formatBytesNode(totalSize)})`,
@@ -897,7 +948,7 @@ app.whenReady().then(() => {
           const scaledPct = 55 + Math.round((offset / totalSize) * 35); // 55% -> 90%
           if (requestId && scaledPct !== lastSentPct) {
             lastSentPct = scaledPct;
-            event.sender.send('desktop:transferProgress', {
+            sendToSender(event.sender, 'desktop:transferProgress', {
               requestId,
               stage: 'uploading-layer',
               message: `Uploading compressed image layer (${formatBytesNode(offset)} / ${formatBytesNode(totalSize)})...`,
@@ -933,7 +984,7 @@ app.whenReady().then(() => {
         }
         throw err;
       } finally {
-        activeUploadTransfers.delete(uploadToken);
+        activeUploadTransfersByToken.delete(uploadToken);
         if (requestId) activeTransfers.delete(requestId);
         if (fileHandle) {
           await fileHandle.close().catch(() => {});
@@ -959,7 +1010,7 @@ app.whenReady().then(() => {
       const abortController = new AbortController();
       if (requestId) activeTransfers.set(requestId, abortController);
       const uploadToken = Symbol('streamAndUploadOciLayer');
-      activeUploadTransfers.add(uploadToken);
+      activeUploadTransfersByToken.set(uploadToken, event.sender.id);
       let lastSentPct = -1;
       let lastSentUploadedBytes = -1;
 
@@ -979,7 +1030,7 @@ app.whenReady().then(() => {
             if (requestId) {
               lastSentPct = -1;
               lastSentUploadedBytes = -1;
-              event.sender.send('desktop:transferProgress', {
+              sendToSender(event.sender, 'desktop:transferProgress', {
                 requestId,
                 stage: 'uploading-layer',
                 message,
@@ -999,7 +1050,7 @@ app.whenReady().then(() => {
                 totalBytes > 0
                   ? `Streaming & uploading layer (${formatBytesNode(processedBytes)} / ${formatBytesNode(totalBytes)}, ${formatBytesNode(uploadedBytes)} sent)...`
                   : `Streaming & uploading layer (${formatBytesNode(uploadedBytes)} sent)...`;
-              event.sender.send('desktop:transferProgress', {
+              sendToSender(event.sender, 'desktop:transferProgress', {
                 requestId,
                 stage: 'uploading-layer',
                 message,
@@ -1010,7 +1061,7 @@ app.whenReady().then(() => {
         });
 
         if (requestId) {
-          event.sender.send('desktop:transferProgress', {
+          sendToSender(event.sender, 'desktop:transferProgress', {
             requestId,
             stage: 'uploading-layer',
             message: `Uploaded compressed image layer (${formatBytesNode(result.compressedSize)})`,
@@ -1028,7 +1079,7 @@ app.whenReady().then(() => {
           registryToken: result.registryToken,
         };
       } finally {
-        activeUploadTransfers.delete(uploadToken);
+        activeUploadTransfersByToken.delete(uploadToken);
         if (requestId) activeTransfers.delete(requestId);
       }
     }
@@ -1053,7 +1104,7 @@ app.whenReady().then(() => {
       let desiredFolderName = folderName || defaultFolderName || 'package';
 
       if (!chosenParentDir) {
-        const dialogRes = await dialog.showOpenDialog({
+        const dialogRes = await showOpenDialogForEvent(event, {
           title: `Select Destination Folder to Extract "${desiredFolderName}"`,
           properties: ['openDirectory', 'createDirectory'],
         });
@@ -1111,7 +1162,7 @@ app.whenReady().then(() => {
 
       try {
         if (requestId) {
-          event.sender.send('desktop:transferProgress', {
+          sendToSender(event.sender, 'desktop:transferProgress', {
             requestId,
             stage: 'downloading',
             message: 'Connecting to ghcr.io...',
@@ -1210,7 +1261,7 @@ app.whenReady().then(() => {
                   : 50;
               if (pct !== lastEmittedPct) {
                 lastEmittedPct = pct;
-                event.sender.send('desktop:transferProgress', {
+                sendToSender(event.sender, 'desktop:transferProgress', {
                   requestId,
                   stage: 'downloading',
                   message:
@@ -1247,7 +1298,7 @@ app.whenReady().then(() => {
 
         const extractedRegularCount = extractedMeta.filter((m) => !m.isDirectory).length;
         if (requestId) {
-          event.sender.send('desktop:transferProgress', {
+          sendToSender(event.sender, 'desktop:transferProgress', {
             requestId,
             stage: 'downloading',
             message:
@@ -1311,7 +1362,7 @@ app.whenReady().then(() => {
               const pct = Math.min(99, Math.round((receivedBytes / totalBytes) * 100));
               if (pct !== lastEmittedPct) {
                 lastEmittedPct = pct;
-                event.sender.send('desktop:layerStreamProgress', {
+                sendToSender(event.sender, 'desktop:layerStreamProgress', {
                   requestId,
                   percent: pct,
                 });
@@ -1325,7 +1376,7 @@ app.whenReady().then(() => {
         });
 
         if (requestId) {
-          event.sender.send('desktop:layerStreamProgress', {
+          sendToSender(event.sender, 'desktop:layerStreamProgress', {
             requestId,
             percent: 100,
           });
@@ -1338,7 +1389,49 @@ app.whenReady().then(() => {
     }
   );
 
+  // Checks GitHub releases for application updates without CORS restrictions or stale browser caching
+  ipcMain.handle('desktop:checkForUpdates', async () => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      const timestamp = Date.now();
+      const res = await fetch(
+        `https://api.github.com/repos/nitaidor/GHCR-Manager/releases?per_page=15&_t=${timestamp}`,
+        {
+          cache: 'no-store',
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'User-Agent': 'GHCR-Manager-Desktop',
+          },
+          signal: controller.signal,
+        }
+      );
+
+      if (!res.ok) {
+        throw new Error(`GitHub API returned status ${res.status}`);
+      }
+
+      const releases = await res.json();
+      return { ok: true, releases };
+    } catch (err) {
+      return {
+        ok: false,
+        error:
+          err && err.name === 'AbortError'
+            ? 'Connection timed out'
+            : (err && err.message) || 'Failed to fetch',
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  });
+
   createWindow();
+  while (pendingSecondInstanceCount > 0) {
+    pendingSecondInstanceCount -= 1;
+    createWindow();
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -1346,10 +1439,10 @@ app.whenReady().then(() => {
 });
 
 app.on('before-quit', (event) => {
-  const activeMode = getEffectiveCloseGuardMode();
-  if (activeMode !== 'none' && mainWindow && !mainWindow.isDestroyed()) {
+  const blocked = findFirstCloseBlockedWindow();
+  if (blocked) {
     event.preventDefault();
-    notifyCloseBlocked(mainWindow, activeMode);
+    notifyCloseBlocked(blocked.win, blocked.mode);
     return;
   }
 
@@ -1375,3 +1468,4 @@ app.on('before-quit', (event) => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+}

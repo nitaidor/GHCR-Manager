@@ -176,6 +176,11 @@ declare global {
       onLayerStreamProgress?: (
         cb: (payload: { requestId: string; percent: number }) => void
       ) => () => void;
+      checkForUpdates?: () => Promise<{
+        ok: boolean;
+        releases?: unknown[];
+        error?: string;
+      }>;
     };
     showDirectoryPicker?: (options?: {
       mode?: 'read' | 'readwrite';

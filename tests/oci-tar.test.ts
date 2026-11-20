@@ -29,6 +29,11 @@ import {
   validateOciTag,
 } from '../src/lib/naming.ts';
 import {
+  cleanVersion,
+  compareVersions,
+  resolveUpdateCheckFromReleases,
+} from '../src/lib/updater.ts';
+import {
   acquireRepoIndexLock,
   acquireRepoLock,
   acquireRepoPackageLocks,
@@ -2059,6 +2064,71 @@ async function runTests() {
     }),
     'https://github.com/orgs/MyOrg/packages/container/org-pkg/settings'
   );
+
+  console.log('20. Testing SemVer update comparison and GitHub release resolution...');
+  assert.equal(cleanVersion('v1.2.3'), '1.2.3');
+  assert.equal(cleanVersion(' V1.10.0 '), '1.10.0');
+  assert.equal(compareVersions('v1.2.10', 'v1.2.3'), 1);
+  assert.equal(compareVersions('v1.2.3', 'v1.2.10'), -1);
+  assert.equal(compareVersions('v1.4.0', 'v1.2.10'), 1);
+  assert.equal(compareVersions('v1.1.3', '1.1.3'), 0);
+  assert.equal(compareVersions('v2.0.0', 'v1.99.99'), 1);
+  assert.equal(compareVersions('v1.2.0', 'v1.2'), 0);
+
+  const emptyRes = resolveUpdateCheckFromReleases('1.1.3', []);
+  assert.equal(emptyRes.status, 'up-to-date');
+  assert.equal(emptyRes.latestVersion, '1.1.3');
+
+  const releaseCheckNewer = resolveUpdateCheckFromReleases('1.1.3', [
+    {
+      tag_name: 'nightly',
+      draft: false,
+      html_url: 'https://github.com/nitaidor/GHCR-Manager/releases/tag/nightly',
+    },
+    {
+      tag_name: 'v9.9.9',
+      draft: true,
+      html_url: 'https://github.com/nitaidor/GHCR-Manager/releases/tag/v9.9.9',
+    },
+    {
+      tag_name: 'v1.2.2',
+      draft: false,
+      name: 'Release v1.2.2',
+      html_url: 'https://github.com/nitaidor/GHCR-Manager/releases/tag/v1.2.2',
+      published_at: '2026-11-18T10:00:00Z',
+    },
+    {
+      tag_name: 'v1.2.10',
+      draft: false,
+      name: 'GHCR Manager v1.2.10',
+      html_url: 'https://github.com/nitaidor/GHCR-Manager/releases/tag/v1.2.10',
+      published_at: '2026-11-20T12:00:00Z',
+    },
+  ]);
+  assert.equal(releaseCheckNewer.status, 'update-available');
+  assert.equal(releaseCheckNewer.currentVersion, '1.1.3');
+  assert.equal(releaseCheckNewer.latestVersion, '1.2.10');
+  assert.equal(releaseCheckNewer.releaseName, 'GHCR Manager v1.2.10');
+  assert.equal(
+    releaseCheckNewer.releaseUrl,
+    'https://github.com/nitaidor/GHCR-Manager/releases/tag/v1.2.10'
+  );
+  assert.equal(releaseCheckNewer.publishedAt, '2026-11-20T12:00:00Z');
+
+  const releaseCheckUpToDate = resolveUpdateCheckFromReleases('1.2.10', [
+    {
+      tag_name: 'v1.2.10',
+      draft: false,
+      html_url: 'https://github.com/nitaidor/GHCR-Manager/releases/tag/v1.2.10',
+    },
+    {
+      tag_name: 'v1.2.3',
+      draft: false,
+      html_url: 'https://github.com/nitaidor/GHCR-Manager/releases/tag/v1.2.3',
+    },
+  ]);
+  assert.equal(releaseCheckUpToDate.status, 'up-to-date');
+  assert.equal(releaseCheckUpToDate.latestVersion, '1.2.10');
 
   console.log('All tests passed successfully!');
 }

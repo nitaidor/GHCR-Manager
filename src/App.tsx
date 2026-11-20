@@ -35,6 +35,7 @@ import TabNav, { type ActiveTab } from './components/TabNav';
 import SettingsModal from './components/SettingsModal';
 import HelpModal from './components/HelpModal';
 import AboutModal from './components/AboutModal';
+import UpdateModal from './components/UpdateModal';
 import SubfolderFileTree from './components/SubfolderFileTree';
 import UploadVersionModal, {
   makeVersionStateKey,
@@ -129,6 +130,12 @@ import {
   summarizeArchiveEntries,
   type TarInputFile,
 } from './lib/tar';
+import {
+  checkForUpdates,
+  type UpdateCheckResult,
+  type UpdateCheckStatus,
+} from './lib/updater';
+import pkg from '../package.json';
 
 function isRepoSelectable(repo: GitHubRepo): boolean {
   return repo.hasCommits !== false && repo.permissions?.push !== false;
@@ -268,6 +275,56 @@ export default function App() {
   const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
   const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
   const [showAboutModal, setShowAboutModal] = useState<boolean>(false);
+  const [showUpdateModal, setShowUpdateModal] = useState<boolean>(false);
+  const [updateStatus, setUpdateStatus] = useState<UpdateCheckStatus>('checking');
+  const [updateData, setUpdateData] = useState<UpdateCheckResult | null>(null);
+  const updateCheckSeqRef = useRef<number>(0);
+
+  // Background check for updates on app startup
+  useEffect(() => {
+    let isCancelled = false;
+    const seq = ++updateCheckSeqRef.current;
+    const timer = setTimeout(async () => {
+      try {
+        const result = await checkForUpdates(pkg.version);
+        if (isCancelled || updateCheckSeqRef.current !== seq) return;
+        if (result.status === 'update-available') {
+          setUpdateData(result);
+          setUpdateStatus('update-available');
+          setShowUpdateModal(true);
+        }
+      } catch (err) {
+        console.debug('Background update check failed:', err);
+      }
+    }, 1500);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, []);
+
+  const handleCheckForUpdates = async () => {
+    const seq = ++updateCheckSeqRef.current;
+    setUpdateStatus('checking');
+    setUpdateData(null);
+    setShowUpdateModal(true);
+
+    try {
+      const result = await checkForUpdates(pkg.version);
+      if (updateCheckSeqRef.current !== seq) return;
+      setUpdateData(result);
+      setUpdateStatus(result.status);
+    } catch (err: unknown) {
+      if (updateCheckSeqRef.current !== seq) return;
+      setUpdateData({
+        status: 'error',
+        currentVersion: pkg.version,
+        error: err instanceof Error ? err.message : 'Failed to check for updates',
+      });
+      setUpdateStatus('error');
+    }
+  };
 
   // Sync theme classes onto <html> root element & save to localStorage
   useEffect(() => {
@@ -338,6 +395,43 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_SAVED_OAUTHS_KEY, JSON.stringify(savedOAuths));
   }, [savedOAuths]);
+
+  // Keep saved credentials and appearance/transfer preferences in sync across open windows
+  useEffect(() => {
+    const handleStorage = (e: StorageEvent) => {
+      if (!e.newValue) return;
+      try {
+        if (e.key === STORAGE_SAVED_PATS_KEY) {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) setSavedPats(parsed);
+        } else if (e.key === STORAGE_SAVED_OAUTHS_KEY) {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) setSavedOAuths(parsed);
+        } else if (e.key === STORAGE_THEME_SETTINGS_KEY) {
+          const parsed = JSON.parse(e.newValue);
+          if (parsed && typeof parsed === 'object') {
+            if (typeof parsed.isDarkMode === 'boolean') {
+              setIsDarkMode(parsed.isDarkMode);
+            }
+            setSettings({
+              darkTheme: parsed.darkTheme || 'default',
+              lightTheme: parsed.lightTheme || 'default',
+              clockFormat: parsed.clockFormat === '24h' ? '24h' : '12h',
+              dateFormat: VALID_DATE_FORMATS.includes(parsed.dateFormat)
+                ? parsed.dateFormat
+                : 'YYYY-MM-DD',
+              uploadTransferMode:
+                parsed.uploadTransferMode === 'chunked' ? 'chunked' : 'stream',
+            });
+          }
+        }
+      } catch {
+        // ignore malformed cross-window storage payload
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
 
   // Inline Rename state for Saved PATs & Saved OAuth Client IDs
   const [editingPatIndex, setEditingPatIndex] = useState<number | null>(null);
@@ -558,6 +652,7 @@ export default function App() {
     showSettingsModal ||
     showHelpModal ||
     showAboutModal ||
+    showUpdateModal ||
     showUploadPickerPrompt ||
     showUploadVersionModal ||
     showSyncReviewModal ||
@@ -4014,6 +4109,7 @@ export default function App() {
         onOpenSettings={() => setShowSettingsModal(true)}
         onOpenHelp={() => setShowHelpModal(true)}
         onOpenAbout={() => setShowAboutModal(true)}
+        onCheckForUpdates={handleCheckForUpdates}
         onSignOut={handleSignOut}
       />
 
@@ -6437,6 +6533,13 @@ export default function App() {
       <AboutModal
         isOpen={showAboutModal}
         onClose={() => setShowAboutModal(false)}
+      />
+
+      <UpdateModal
+        isOpen={showUpdateModal}
+        onClose={() => setShowUpdateModal(false)}
+        updateStatus={updateStatus}
+        updateData={updateData}
       />
 
       {visibleCloseBlockedMode &&

@@ -54,4 +54,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('desktop:layerStreamProgress', listener);
     return () => ipcRenderer.removeListener('desktop:layerStreamProgress', listener);
   },
+  checkForUpdates: () => ipcRenderer.invoke('desktop:checkForUpdates'),
 });

@@ -7,6 +7,7 @@ import {
   Loader2,
   Info,
   LogOut,
+  RotateCw,
 } from 'lucide-react';
 import type { GitHubRepo, GitHubUser } from '../lib/github-oci';
 import type { ClockFormat, DateFormat } from '../lib/naming';
@@ -33,6 +34,7 @@ interface HeaderProps {
   onOpenSettings: () => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
+  onCheckForUpdates: () => void;
   onSignOut: () => void;
 }
 
@@ -48,6 +50,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenSettings,
   onOpenHelp,
   onOpenAbout,
+  onCheckForUpdates,
   onSignOut,
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -187,6 +190,16 @@ export const Header: React.FC<HeaderProps> = ({
               className="theme-menu-item w-full text-left px-4 py-3 text-sm flex items-center gap-2 border-t border-[#30363d] whitespace-nowrap transition-colors"
             >
               <Info className="w-4 h-4 shrink-0" /> About GHCR Manager
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onCheckForUpdates();
+                setShowMenu(false);
+              }}
+              className="theme-menu-item w-full text-left px-4 py-3 text-sm flex items-center gap-2 border-t border-[#30363d] whitespace-nowrap transition-colors"
+            >
+              <RotateCw className="w-4 h-4 shrink-0" /> Check for Updates
             </button>
             {user && (
               <button
