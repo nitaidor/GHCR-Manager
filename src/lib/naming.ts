@@ -15,6 +15,25 @@ export type DateFormat = 'YYYY-MM-DD' | 'YY-MM-DD' | 'DD-MM-YYYY' | 'DD-MM-YY';
 
 const OCI_TAG_REGEX = /^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$/;
 
+function formatDatePart(date: Date, dateFormat: DateFormat): string {
+  const fullYear = String(date.getFullYear());
+  const shortYear = fullYear.slice(-2);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+
+  switch (dateFormat) {
+    case 'YY-MM-DD':
+      return `${shortYear}-${month}-${day}`;
+    case 'DD-MM-YYYY':
+      return `${day}-${month}-${fullYear}`;
+    case 'DD-MM-YY':
+      return `${day}-${month}-${shortYear}`;
+    case 'YYYY-MM-DD':
+    default:
+      return `${fullYear}-${month}-${day}`;
+  }
+}
+
 /**
  * Formats a Date in local time into a valid OCI tag using the user's preferred date and clock formats.
  * Dots separate HH.MM.SS (since ':' and '/' are invalid in OCI tags), e.g. "2026-11-16_13.05.09".
@@ -24,28 +43,7 @@ export function formatTimestampTag(
   clockFormat: ClockFormat = '24h',
   dateFormat: DateFormat = 'YYYY-MM-DD'
 ): string {
-  const fullYear = String(date.getFullYear());
-  const shortYear = fullYear.slice(-2);
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-
-  let datePart: string;
-  switch (dateFormat) {
-    case 'YY-MM-DD':
-      datePart = `${shortYear}-${month}-${day}`;
-      break;
-    case 'DD-MM-YYYY':
-      datePart = `${day}-${month}-${fullYear}`;
-      break;
-    case 'DD-MM-YY':
-      datePart = `${day}-${month}-${shortYear}`;
-      break;
-    case 'YYYY-MM-DD':
-    default:
-      datePart = `${fullYear}-${month}-${day}`;
-      break;
-  }
-
+  const datePart = formatDatePart(date, dateFormat);
   const h24 = date.getHours();
   const min = String(date.getMinutes()).padStart(2, '0');
   const sec = String(date.getSeconds()).padStart(2, '0');
@@ -60,6 +58,35 @@ export function formatTimestampTag(
   }
 
   return `${datePart}_${timePart}`;
+}
+
+/**
+ * Formats a Date or ISO timestamp for human-readable UI display using the user's
+ * configured DateFormat and ClockFormat settings.
+ */
+export function formatDisplayDateTime(
+  dateInput: Date | string | number,
+  clockFormat: ClockFormat = '24h',
+  dateFormat: DateFormat = 'YYYY-MM-DD'
+): string {
+  const date = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (Number.isNaN(date.getTime())) return '';
+
+  const datePart = formatDatePart(date, dateFormat);
+  const h24 = date.getHours();
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const sec = String(date.getSeconds()).padStart(2, '0');
+
+  let timePart: string;
+  if (clockFormat === '12h') {
+    const suffix = h24 >= 12 ? 'PM' : 'AM';
+    const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+    timePart = `${String(h12).padStart(2, '0')}:${min}:${sec} ${suffix}`;
+  } else {
+    timePart = `${String(h24).padStart(2, '0')}:${min}:${sec}`;
+  }
+
+  return `${datePart}, ${timePart}`;
 }
 
 /**

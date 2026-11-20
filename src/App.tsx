@@ -92,6 +92,7 @@ import {
 } from './lib/http';
 import { isAbortError } from './lib/http';
 import {
+  formatDisplayDateTime,
   formatTimestampTag,
   getPackageLockKey,
   getRepoIndexDisplayTitle,
@@ -1812,6 +1813,28 @@ export default function App() {
       const isSingleFolderOnly =
         pickedItems.length === 1 && pickedItems[0].kind === 'folder';
 
+      const usedTopLevelNames = new Set<string>();
+      const pickUniqueTopLevelName = (rawName: string): string => {
+        const clean = rawName.trim() || 'item';
+        if (!usedTopLevelNames.has(clean.toLowerCase())) {
+          usedTopLevelNames.add(clean.toLowerCase());
+          return clean;
+        }
+        let idx = 1;
+        while (true) {
+          const dotIdx = clean.lastIndexOf('.');
+          const candidate =
+            dotIdx > 0
+              ? `${clean.slice(0, dotIdx)} (${idx})${clean.slice(dotIdx)}`
+              : `${clean} (${idx})`;
+          if (!usedTopLevelNames.has(candidate.toLowerCase())) {
+            usedTopLevelNames.add(candidate.toLowerCase());
+            return candidate;
+          }
+          idx += 1;
+        }
+      };
+
       const pendingEntries: Array<{
         relativePath: string;
         mtime?: number;
@@ -1825,8 +1848,11 @@ export default function App() {
       for (const item of pickedItems) {
         if (item.kind === 'file') {
           const entry = item.files[0];
+          const topName = isSingleFolderOnly
+            ? item.name
+            : pickUniqueTopLevelName(item.name);
           pendingEntries.push({
-            relativePath: item.name,
+            relativePath: topName,
             mtime: item.mtime,
             size: item.size,
             fullPath: entry?.fullPath || item.fullPath,
@@ -1834,7 +1860,9 @@ export default function App() {
             entry,
           });
         } else if (item.files.length === 0) {
-          const dirRelPath = isSingleFolderOnly ? '.' : item.name;
+          const dirRelPath = isSingleFolderOnly
+            ? '.'
+            : pickUniqueTopLevelName(item.name);
           pendingEntries.push({
             relativePath: dirRelPath,
             mtime: item.mtime,
@@ -1851,10 +1879,13 @@ export default function App() {
             },
           });
         } else {
+          const topFolderName = isSingleFolderOnly
+            ? ''
+            : pickUniqueTopLevelName(item.name);
           for (const entry of item.files) {
             const archivePath = isSingleFolderOnly
               ? entry.relativePath
-              : `${item.name}/${entry.relativePath}`;
+              : `${topFolderName}/${entry.relativePath}`;
             pendingEntries.push({
               relativePath: archivePath,
               mtime: entry.mtime,
@@ -3088,7 +3119,7 @@ export default function App() {
         }));
       }
     } catch (err: unknown) {
-      if (isAbortError(err)) {
+      if (abortCtrl.signal.aborted) {
         setVersionNotices((prev) => ({
           ...prev,
           [vKey]: {
@@ -3307,7 +3338,7 @@ export default function App() {
         }));
       }
     } catch (err: unknown) {
-      if (isAbortError(err)) {
+      if (abortCtrl.signal.aborted) {
         setVersionNotices((prev) => ({
           ...prev,
           [vKey]: {
@@ -3739,16 +3770,6 @@ export default function App() {
                     <ShieldCheck className="w-4 h-4 header-logo" />
                     Required GitHub Permissions (Read &amp; Write):
                   </div>
-                  <ul className="text-[11px] text-gray-400 space-y-1 list-disc list-inside">
-                    <li>
-                      <span className="text-gray-200 font-semibold">Repositories (read/write):</span>{' '}
-                      <code>repo</code> scope (required for repo access and cross-PC locking; selected repos need at least 1 commit).
-                    </li>
-                    <li>
-                      <span className="text-gray-200 font-semibold">Packages (read/write &amp; delete):</span>{' '}
-                      <code>read:packages</code>, <code>write:packages</code>, and <code>delete:packages</code>.
-                    </li>
-                  </ul>
                   <div className="flex flex-wrap gap-1.5">
                     {['repo', 'write:packages', 'read:packages', 'delete:packages'].map(
                       (scope) => (
@@ -5410,9 +5431,10 @@ export default function App() {
                                     expandedVersionKeys.has(vKey) || hasMatchingInnerFile;
                                   const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.pullSuffix}`;
                                   const uploadedAt = version.created_at
-                                    ? new Date(version.created_at).toLocaleString(
-                                        undefined,
-                                        { hour12: settings.clockFormat === '12h' }
+                                    ? formatDisplayDateTime(
+                                        version.created_at,
+                                        settings.clockFormat,
+                                        settings.dateFormat
                                       )
                                     : '';
 

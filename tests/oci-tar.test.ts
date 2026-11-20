@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import {
+  formatDisplayDateTime,
   formatTimestampTag,
   formatUniqueRepoIndexTag,
   getPackageLockKey,
@@ -41,6 +44,7 @@ const {
   resolveExtractDestinationInfo,
   resolveSafeExtractPath,
   sanitizeFolderName,
+  writeStreamChunk,
 } = require('../electron/streaming-tar.cjs');
 
 async function runTests() {
@@ -655,6 +659,292 @@ async function runTests() {
         }),
       /empty \(0-commit\) repositories/i
     );
+
+    console.log('11. Testing formatDisplayDateTime across all DateFormat and ClockFormat settings...');
+    const sampleDisplayDate = new Date(2026, 10, 20, 0, 26, 18); // 2026-11-20 00:26:18 local
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'YYYY-MM-DD'), '2026-11-20, 00:26:18');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '12h', 'YYYY-MM-DD'), '2026-11-20, 12:26:18 AM');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'YY-MM-DD'), '26-11-20, 00:26:18');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '12h', 'DD-MM-YYYY'), '20-11-2026, 12:26:18 AM');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'DD-MM-YY'), '20-11-26, 00:26:18');
+    const sampleAfternoon = new Date(2026, 10, 20, 15, 4, 9);
+    assert.equal(formatDisplayDateTime(sampleAfternoon, '12h', 'DD-MM-YY'), '20-11-26, 03:04:09 PM');
+    assert.equal(formatDisplayDateTime('not-a-date', '24h', 'YYYY-MM-DD'), '');
+
+    console.log('12. Testing cancel + immediate re-upload lock race & 2-phase fencing...');
+    // Simulate a permissive GitHub PATCH endpoint that allows two concurrent fast-forwards
+    // from the same unlocked ancestor (no old_oid check), proving cache-busting + 2-phase
+    // confirmLockOwnership strictly enforces mutual exclusion across PC1 and PC2.
+    const racyRefs = new Map<string, string>();
+    const racyCommits = new Map<
+      string,
+      { sha: string; message: string; treeSha: string; parents: string[]; committerDate: string }
+    >();
+    let racySeq = 0;
+    let sawCacheBust = false;
+    let sawNoCacheHeader = false;
+    const racyHttp: HttpRequestFn = async (req) => {
+      const u = new URL(req.url);
+      const method = req.method || 'GET';
+      const pathName = u.pathname;
+      const body = req.body
+        ? JSON.parse(typeof req.body === 'string' ? req.body : new TextDecoder().decode(req.body))
+        : null;
+
+      if (method === 'GET' && (pathName.includes('/git/ref/') || pathName.includes('/git/commits/'))) {
+        if (u.searchParams.has('_cb')) sawCacheBust = true;
+        if ((req.headers?.['Cache-Control'] || '').includes('no-store')) sawNoCacheHeader = true;
+      }
+
+      if (method === 'POST' && pathName === '/repos/alice/demo/git/trees') {
+        return jsonRes(201, { sha: `rtree-${++racySeq}` });
+      }
+      if (method === 'POST' && pathName === '/repos/alice/demo/git/commits') {
+        const sha = `rcommit-${++racySeq}`;
+        racyCommits.set(sha, {
+          sha,
+          message: body.message,
+          treeSha: body.tree,
+          parents: body.parents || [],
+          committerDate: new Date(mockServerNowMs).toISOString(),
+        });
+        return jsonRes(201, { sha });
+      }
+      if (method === 'GET' && pathName.startsWith('/repos/alice/demo/git/commits/')) {
+        const sha = decodeURIComponent(pathName.split('/').pop() || '');
+        const c = racyCommits.get(sha);
+        if (!c) return jsonRes(404, { message: 'Not Found' });
+        return jsonRes(200, { sha: c.sha, message: c.message, tree: { sha: c.treeSha }, committer: { date: c.committerDate } });
+      }
+      if (method === 'GET' && pathName.startsWith('/repos/alice/demo/git/ref/')) {
+        const refName = `refs/${pathName.slice('/repos/alice/demo/git/ref/'.length)}`;
+        const sha = racyRefs.get(refName);
+        if (!sha) return jsonRes(404, { message: 'Not Found' });
+        return jsonRes(200, { ref: refName, object: { sha, type: 'commit' } });
+      }
+      if (method === 'POST' && pathName === '/repos/alice/demo/git/refs') {
+        if (racyRefs.has(body.ref)) return jsonRes(422, { message: 'Reference already exists' });
+        racyRefs.set(body.ref, body.sha);
+        return jsonRes(201, { ref: body.ref, object: { sha: body.sha } });
+      }
+      if (method === 'PATCH' && pathName.startsWith('/repos/alice/demo/git/refs/')) {
+        const refName = `refs/${pathName.slice('/repos/alice/demo/git/refs/'.length)}`;
+        if (!racyRefs.has(refName)) return jsonRes(404, { message: 'Not Found' });
+        // Intentionally allow fast-forward from shared parent without strict CAS serialization
+        // when the commit's direct parent isn't behind a confirm barrier, testing last-writer-wins
+        racyRefs.set(refName, body.sha);
+        return jsonRes(200, { ref: refName, object: { sha: body.sha } });
+      }
+      return jsonRes(404, { message: 'Unhandled racy mock route' });
+    };
+
+    const pc1Initial = await acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: getPackageLockKey('cancel-race-pkg'),
+      packageName: 'cancel-race-pkg',
+      operation: 'upload',
+      sessionId: 'pc-1',
+      confirmSettleMs: 30,
+      pollIntervalMs: 25,
+      httpRequest: racyHttp,
+    });
+    assert.equal(sawCacheBust, true);
+    assert.equal(sawNoCacheHeader, true);
+
+    let racyActive = 0;
+    let racyMaxConcurrent = 0;
+    // Start PC2 waiting while PC1 holds the lock, then PC1 cancels (releases) and immediately re-acquires
+    const pc2WaiterPromise = acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: getPackageLockKey('cancel-race-pkg'),
+      packageName: 'cancel-race-pkg',
+      operation: 'upload',
+      sessionId: 'pc-2',
+      confirmSettleMs: 30,
+      pollIntervalMs: 25,
+      httpRequest: racyHttp,
+    }).then(async (lock) => {
+      racyActive += 1;
+      racyMaxConcurrent = Math.max(racyMaxConcurrent, racyActive);
+      await new Promise((r) => setTimeout(r, 60));
+      racyActive -= 1;
+      await lock.release();
+    });
+
+    await new Promise((r) => setTimeout(r, 35));
+    await pc1Initial.release(); // User cancels upload #1 on PC1
+
+    const pc1ImmediateReupload = acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: getPackageLockKey('cancel-race-pkg'),
+      packageName: 'cancel-race-pkg',
+      operation: 'upload',
+      sessionId: 'pc-1',
+      confirmSettleMs: 30,
+      pollIntervalMs: 25,
+      httpRequest: racyHttp,
+    }).then(async (lock) => {
+      racyActive += 1;
+      racyMaxConcurrent = Math.max(racyMaxConcurrent, racyActive);
+      await new Promise((r) => setTimeout(r, 60));
+      racyActive -= 1;
+      await lock.release();
+    });
+
+    await Promise.all([pc2WaiterPromise, pc1ImmediateReupload]);
+    assert.equal(racyMaxConcurrent, 1);
+
+    // Abort mid-confirmation rolls back ownership cleanly instead of leaking the lock
+    const abortMidAcquire = new AbortController();
+    setTimeout(() => abortMidAcquire.abort(), 15);
+    await assert.rejects(
+      () =>
+        acquireRepoLock({
+          repo: demoRepo,
+          githubToken: 'tok',
+          ownerLogin: 'alice',
+          lockKey: getPackageLockKey('abort-rollback-pkg'),
+          packageName: 'abort-rollback-pkg',
+          operation: 'upload',
+          sessionId: 'pc-abort',
+          confirmSettleMs: 120,
+          signal: abortMidAcquire.signal,
+          httpRequest: racyHttp,
+        }),
+      (err: unknown) => (err as { name?: string })?.name === 'AbortError'
+    );
+    // Another PC must be able to immediately acquire without waiting on a leaked TTL
+    const afterAbortLock = await acquireRepoLock({
+      repo: demoRepo,
+      githubToken: 'tok',
+      ownerLogin: 'alice',
+      lockKey: getPackageLockKey('abort-rollback-pkg'),
+      packageName: 'abort-rollback-pkg',
+      operation: 'upload',
+      sessionId: 'pc-next',
+      confirmSettleMs: 20,
+      pollIntervalMs: 500,
+      httpRequest: racyHttp,
+    });
+    assert.equal(afterAbortLock.hadToWait, false);
+    await afterAbortLock.release();
+
+    console.log('13. Testing streaming HTTP extraction with high gzip expansion & file/folder collision...');
+    const colSrcA = path.join(tmpWorkDir, 'col_file.bin');
+    const colSrcB = path.join(tmpWorkDir, 'col_folder_file.bin');
+    const colArchive = path.join(tmpWorkDir, 'collision_layer.tar.gz');
+    const colExtractDir = path.join(tmpWorkDir, 'col_extracted');
+    // Highly compressible 12 MB total payload (>1000:1 gzip ratio so HTTP body finishes well before gunzip)
+    await fs.writeFile(colSrcA, Buffer.alloc(6 * 1024 * 1024, 0x41));
+    await fs.writeFile(colSrcB, Buffer.alloc(6 * 1024 * 1024, 0x42));
+    await buildOciLayerToFile({
+      outFilePath: colArchive,
+      files: [
+        { fullPath: colSrcB, relativePath: 'test/subfile.bin', size: 6 * 1024 * 1024 },
+        { fullPath: colSrcA, relativePath: 'test', size: 6 * 1024 * 1024 },
+      ],
+    });
+    await fs.mkdir(colExtractDir, { recursive: true });
+    const compressedArchive = await fs.readFile(colArchive);
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Length': String(compressedArchive.length) });
+      res.end(compressedArchive);
+    });
+    await new Promise<void>((resolve) => srv.listen(0, resolve));
+    try {
+      const port = (srv.address() as { port: number }).port;
+      const upstreamRes = await fetch(`http://127.0.0.1:${port}`);
+      assert.ok(upstreamRes.body);
+      let activeOut: fsSync.WriteStream | null = null;
+      const closeOut = () =>
+        new Promise<void>((resolve, reject) => {
+          if (!activeOut) return resolve();
+          const ref = activeOut;
+          activeOut = null;
+          ref.once('error', reject);
+          ref.end(resolve);
+        });
+      const ensureDirSafe = async (rootDir: string, targetDir: string) => {
+        const rel = path.relative(rootDir, targetDir);
+        if (!rel || rel === '.' || rel.startsWith('..')) return;
+        let curr = rootDir;
+        for (const part of rel.split(path.sep).filter(Boolean)) {
+          curr = path.join(curr, part);
+          try {
+            const st = await fs.lstat(curr);
+            if (!st.isDirectory()) {
+              const alt = resolveExtractDestinationInfo(path.dirname(curr), path.basename(curr)).suggestedPath;
+              await fs.rename(curr, alt);
+            }
+          } catch {
+            // missing segment
+          }
+        }
+        await fs.mkdir(targetDir, { recursive: true });
+      };
+
+      const streamParser = createNodeTarStreamParser({
+        onFileStart: async (meta: { path: string }) => {
+          await closeOut();
+          let destPath = resolveSafeExtractPath(colExtractDir, meta.path);
+          await ensureDirSafe(colExtractDir, path.dirname(destPath));
+          if (fsSync.existsSync(destPath)) {
+            destPath = resolveExtractDestinationInfo(path.dirname(destPath), path.basename(destPath)).suggestedPath;
+          }
+          activeOut = fsSync.createWriteStream(destPath, { highWaterMark: 1024 * 1024 });
+        },
+        onFileData: async (chunk: Buffer) => {
+          if (activeOut) await writeStreamChunk(activeOut, chunk);
+        },
+        onFileEnd: async () => {
+          await closeOut();
+        },
+      });
+
+      const reader = upstreamRes.body.getReader();
+      const gunzip = zlib.createGunzip({ chunkSize: 1024 * 1024 });
+      let consumeErr: unknown = null;
+      const consumePromise = (async () => {
+        try {
+          for await (const dec of gunzip) {
+            await streamParser.feed(dec);
+            if (streamParser.isDone()) {
+              await reader.cancel().catch(() => {});
+              gunzip.destroy();
+              break;
+            }
+          }
+        } catch (e) {
+          consumeErr = e;
+          gunzip.destroy();
+          await reader.cancel().catch(() => {});
+        }
+      })();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writeStreamChunk(gunzip, Buffer.from(value));
+      }
+      if (!gunzip.destroyed) gunzip.end();
+      await consumePromise;
+      if (consumeErr) throw consumeErr;
+      await closeOut();
+
+      const names = (await fs.readdir(colExtractDir)).sort();
+      assert.deepEqual(names, ['test', 'test (1)']);
+      const nestedStat = await fs.stat(path.join(colExtractDir, 'test', 'subfile.bin'));
+      const renamedFileStat = await fs.stat(path.join(colExtractDir, 'test (1)'));
+      assert.equal(nestedStat.size, 6 * 1024 * 1024);
+      assert.equal(renamedFileStat.size, 6 * 1024 * 1024);
+    } finally {
+      srv.close();
+    }
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }

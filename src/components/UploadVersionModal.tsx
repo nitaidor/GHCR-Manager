@@ -22,6 +22,7 @@ import {
   type PushProgressUpdate,
 } from '../lib/github-oci';
 import {
+  formatDisplayDateTime,
   formatTimestampTag,
   validateOciTag,
   type ClockFormat,
@@ -329,9 +330,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
               const isExpanded = expandedKeys.has(stateKey);
               const isChecked = selectedReplaceIds.has(version.id);
               const createdLabel = version.created_at
-                ? new Date(version.created_at).toLocaleString(undefined, {
-                    hour12: clockFormat === '12h',
-                  })
+                ? formatDisplayDateTime(version.created_at, clockFormat, dateFormat)
                 : '';
 
               return (

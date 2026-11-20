@@ -97,13 +97,19 @@ function unregisterUnloadRelease(handler: () => void) {
   unloadReleaseHandlers.delete(handler);
 }
 
-function githubLockHeaders(token: string): Record<string, string> {
+function githubLockHeaders(token: string, noCache = false): Record<string, string> {
   return {
     Authorization: `Bearer ${token.trim()}`,
     Accept: 'application/vnd.github+json',
     'Content-Type': 'application/json',
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': 'GHCR-Manager',
+    ...(noCache
+      ? {
+          'Cache-Control': 'no-cache, no-store, max-age=0',
+          Pragma: 'no-cache',
+        }
+      : {}),
   };
 }
 
@@ -179,12 +185,13 @@ async function readLockRefCommitSha(opts: {
   signal?: AbortSignal;
 }): Promise<string | null> {
   const fullRef = `refs/${opts.refSubPath}`;
+  const cacheBust = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const res = await opts.httpRequest({
     url: `https://api.github.com/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(
       opts.repoName
-    )}/git/ref/${opts.refSubPath}`,
+    )}/git/ref/${opts.refSubPath}?_cb=${cacheBust}`,
     method: 'GET',
-    headers: githubLockHeaders(opts.githubToken),
+    headers: githubLockHeaders(opts.githubToken, true),
     signal: opts.signal,
   });
 
@@ -276,12 +283,13 @@ async function readLockCommitState(opts: {
   fallbackTtlMs: number;
   signal?: AbortSignal;
 }): Promise<ParsedLockCommitState> {
+  const cacheBust = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const res = await opts.httpRequest({
     url: `https://api.github.com/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(
       opts.repoName
-    )}/git/commits/${encodeURIComponent(opts.commitSha)}`,
+    )}/git/commits/${encodeURIComponent(opts.commitSha)}?_cb=${cacheBust}`,
     method: 'GET',
-    headers: githubLockHeaders(opts.githubToken),
+    headers: githubLockHeaders(opts.githubToken, true),
     signal: opts.signal,
   });
 
@@ -710,6 +718,7 @@ export async function acquireRepoLock(opts: {
   leaseTtlMs?: number;
   heartbeatIntervalMs?: number;
   pollIntervalMs?: number;
+  confirmSettleMs?: number;
   httpRequest?: HttpRequestFn;
 }): Promise<ActiveRepoLock> {
   const httpRequest = opts.httpRequest || crossPlatformHttpRequest;
@@ -721,6 +730,155 @@ export async function acquireRepoLock(opts: {
   const repoName = opts.repo.name;
   const repoFullName = opts.repo.full_name;
   const refSubPath = `${LOCK_REFS_NAMESPACE}/${opts.lockKey}`;
+
+  const bestEffortReleaseClaimedSha = async (
+    ownedSha: string,
+    treeSha: string,
+    acquiredAt: number
+  ) => {
+    try {
+      const unlockPayload: RepoLockLeasePayload = {
+        schemaVersion: 1,
+        status: 'unlocked',
+        lockKey: opts.lockKey,
+        ...(opts.packageName ? { packageName: opts.packageName } : {}),
+        ownerLogin: opts.ownerLogin,
+        sessionId,
+        operation: opts.operation,
+        leaseTtlMs,
+        acquiredAt,
+        heartbeatAt: Date.now(),
+      };
+      const unlockSha = await createLockCommit({
+        httpRequest,
+        githubToken: opts.githubToken,
+        owner,
+        repoName,
+        repoFullName,
+        treeSha,
+        parents: [ownedSha],
+        payload: unlockPayload,
+      });
+      await tryFastForwardLockRef({
+        httpRequest,
+        githubToken: opts.githubToken,
+        owner,
+        repoName,
+        repoFullName,
+        refSubPath,
+        commitSha: unlockSha,
+      });
+    } catch {
+      // Best-effort cleanup so abort rollback never masks AbortError
+    }
+  };
+
+  /**
+   * 2-phase post-claim fencing: waits for concurrent writers to settle, verifies
+   * the ref still points to `claimSha`, appends a child confirmation commit via
+   * fast-forward PATCH, and re-verifies HEAD before granting ownership.
+   */
+  const confirmLockOwnership = async (
+    claimSha: string,
+    treeSha: string,
+    acquiredAt: number
+  ): Promise<string | null> => {
+    const settleMs =
+      opts.confirmSettleMs ??
+      (opts.httpRequest ? 15 : 300 + Math.floor(Math.random() * 150));
+
+    let currentOwnedSha = claimSha;
+    try {
+      await abortableSleep(settleMs, opts.signal);
+
+      const verifySha1 = await readLockRefCommitSha({
+        httpRequest,
+        githubToken: opts.githubToken,
+        owner,
+        repoName,
+        repoFullName,
+        refSubPath,
+        signal: opts.signal,
+      });
+      if (verifySha1 !== claimSha) {
+        return null;
+      }
+
+      const confirmPayload: RepoLockLeasePayload = {
+        schemaVersion: 1,
+        status: 'locked',
+        lockKey: opts.lockKey,
+        ...(opts.packageName ? { packageName: opts.packageName } : {}),
+        ownerLogin: opts.ownerLogin,
+        sessionId,
+        operation: opts.operation,
+        leaseTtlMs,
+        acquiredAt,
+        heartbeatAt: Date.now(),
+      };
+      const confirmSha = await createLockCommit({
+        httpRequest,
+        githubToken: opts.githubToken,
+        owner,
+        repoName,
+        repoFullName,
+        treeSha,
+        parents: [claimSha],
+        payload: confirmPayload,
+        signal: opts.signal,
+      });
+
+      const confirmRes = await tryFastForwardLockRef({
+        httpRequest,
+        githubToken: opts.githubToken,
+        owner,
+        repoName,
+        repoFullName,
+        refSubPath,
+        commitSha: confirmSha,
+        signal: opts.signal,
+      });
+      if (!confirmRes.ok) {
+        return null;
+      }
+      currentOwnedSha = confirmSha;
+
+      const verifySha2 = await readLockRefCommitSha({
+        httpRequest,
+        githubToken: opts.githubToken,
+        owner,
+        repoName,
+        repoFullName,
+        refSubPath,
+        signal: opts.signal,
+      });
+      if (verifySha2 !== confirmSha) {
+        return null;
+      }
+
+      if (opts.signal?.aborted) {
+        await bestEffortReleaseClaimedSha(confirmSha, treeSha, acquiredAt);
+        throw new DOMException('Operation aborted', 'AbortError');
+      }
+
+      return confirmSha;
+    } catch (err) {
+      if (opts.signal?.aborted) {
+        const liveSha = await readLockRefCommitSha({
+          httpRequest,
+          githubToken: opts.githubToken,
+          owner,
+          repoName,
+          repoFullName,
+          refSubPath,
+        }).catch(() => null);
+        if (liveSha === currentOwnedSha || liveSha === claimSha) {
+          await bestEffortReleaseClaimedSha(liveSha, treeSha, acquiredAt);
+        }
+      }
+      throw err;
+    }
+  };
 
   let hadToWait = false;
   let uncontendedRejects = 0;
@@ -808,30 +966,63 @@ export async function acquireRepoLock(opts: {
         signal: opts.signal,
       });
 
-      const claimRes =
-        parents.length === 0
-          ? await tryCreateLockRef({
-              httpRequest,
-              githubToken: opts.githubToken,
-              owner,
-              repoName,
-              repoFullName,
-              refSubPath,
-              commitSha,
-              signal: opts.signal,
-            })
-          : await tryFastForwardLockRef({
-              httpRequest,
-              githubToken: opts.githubToken,
-              owner,
-              repoName,
-              repoFullName,
-              refSubPath,
-              commitSha,
-              signal: opts.signal,
-            });
+      let claimRes: { ok: boolean; status: number; detail?: string };
+      try {
+        claimRes =
+          parents.length === 0
+            ? await tryCreateLockRef({
+                httpRequest,
+                githubToken: opts.githubToken,
+                owner,
+                repoName,
+                repoFullName,
+                refSubPath,
+                commitSha,
+                signal: opts.signal,
+              })
+            : await tryFastForwardLockRef({
+                httpRequest,
+                githubToken: opts.githubToken,
+                owner,
+                repoName,
+                repoFullName,
+                refSubPath,
+                commitSha,
+                signal: opts.signal,
+              });
+      } catch (err) {
+        if (opts.signal?.aborted) {
+          const liveSha = await readLockRefCommitSha({
+            httpRequest,
+            githubToken: opts.githubToken,
+            owner,
+            repoName,
+            repoFullName,
+            refSubPath,
+          }).catch(() => null);
+          if (liveSha === commitSha) {
+            await bestEffortReleaseClaimedSha(commitSha, candidateTreeSha, now);
+          }
+        }
+        throw err;
+      }
 
       if (claimRes.ok) {
+        if (opts.signal?.aborted) {
+          await bestEffortReleaseClaimedSha(commitSha, candidateTreeSha, now);
+          throw new DOMException('Operation aborted', 'AbortError');
+        }
+        const confirmedSha = await confirmLockOwnership(
+          commitSha,
+          candidateTreeSha,
+          now
+        );
+        if (!confirmedSha) {
+          uncontendedRejects = 0;
+          hadToWait = true;
+          await abortableSleep(40 + Math.floor(Math.random() * 60), opts.signal);
+          continue;
+        }
         return createActiveRepoLockHandle({
           httpRequest,
           githubToken: opts.githubToken,
@@ -845,7 +1036,7 @@ export async function acquireRepoLock(opts: {
           sessionId,
           operation: opts.operation,
           hadToWait,
-          initialCommitSha: commitSha,
+          initialCommitSha: confirmedSha,
           treeSha: candidateTreeSha,
           acquiredAt: now,
           leaseTtlMs,
@@ -917,6 +1108,7 @@ export function acquireRepoIndexLock(opts: {
   leaseTtlMs?: number;
   heartbeatIntervalMs?: number;
   pollIntervalMs?: number;
+  confirmSettleMs?: number;
   httpRequest?: HttpRequestFn;
 }): Promise<ActiveRepoLock> {
   return acquireRepoLock({
@@ -943,6 +1135,7 @@ export async function acquireRepoPackageLocks(opts: {
   leaseTtlMs?: number;
   heartbeatIntervalMs?: number;
   pollIntervalMs?: number;
+  confirmSettleMs?: number;
   httpRequest?: HttpRequestFn;
 }): Promise<ActiveRepoLockBundle> {
   const uniqueByLockKey = new Map<string, string>();
@@ -978,6 +1171,7 @@ export async function acquireRepoPackageLocks(opts: {
         leaseTtlMs: opts.leaseTtlMs,
         heartbeatIntervalMs: opts.heartbeatIntervalMs,
         pollIntervalMs: opts.pollIntervalMs,
+        confirmSettleMs: opts.confirmSettleMs,
         httpRequest: opts.httpRequest,
       });
       if (handle.hadToWait) hadToWait = true;

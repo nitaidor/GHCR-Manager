@@ -113,6 +113,7 @@ async function pumpResponseStream(responseBody, { onProgress, onFirstDetectGzip,
   const parserMode = { gunzip: null, detectBuf: Buffer.alloc(0), initialized: false };
 
   let pumpErr = null;
+  let consumeErr = null;
   let consumePromise = null;
   let stopEarly = false;
 
@@ -121,7 +122,10 @@ async function pumpResponseStream(responseBody, { onProgress, onFirstDetectGzip,
     if (onFirstDetectGzip) onFirstDetectGzip(isGzip);
     if (!isGzip) return;
 
-    const gunzip = zlib.createGunzip();
+    const gunzip = zlib.createGunzip({ chunkSize: 1024 * 1024 });
+    gunzip.on('error', (err) => {
+      if (!consumeErr) consumeErr = err;
+    });
     parserMode.gunzip = gunzip;
     consumePromise = (async () => {
       try {
@@ -136,9 +140,10 @@ async function pumpResponseStream(responseBody, { onProgress, onFirstDetectGzip,
           }
         }
       } catch (err) {
-        gunzip.destroy(err);
-        await reader.cancel(err).catch(() => {});
-        throw err;
+        if (!consumeErr) consumeErr = err;
+        stopEarly = true;
+        gunzip.destroy();
+        await reader.cancel().catch(() => {});
       }
     })();
   }
@@ -212,13 +217,17 @@ async function pumpResponseStream(responseBody, { onProgress, onFirstDetectGzip,
       }
     } catch (err) {
       pumpErr = err;
-      if (parserMode.gunzip) parserMode.gunzip.destroy(err);
-      await reader.cancel(err).catch(() => {});
+      if (parserMode.gunzip) parserMode.gunzip.destroy();
+      await reader.cancel().catch(() => {});
     }
   })();
 
-  await Promise.all([pumpPromise, consumePromise].filter(Boolean));
+  await pumpPromise;
+  if (consumePromise) {
+    await consumePromise;
+  }
   if (pumpErr) throw pumpErr;
+  if (consumeErr) throw consumeErr;
 }
 
 app.setName('GHCR Manager');
@@ -961,19 +970,50 @@ app.whenReady().then(() => {
         let receivedBytes = 0;
         let lastEmittedPct = -1;
 
+        async function ensureDirectoryPathSafe(rootDir, targetDir) {
+          const rel = path.relative(rootDir, targetDir);
+          if (!rel || rel === '.' || rel.startsWith('..')) return;
+          const parts = rel.split(path.sep).filter(Boolean);
+          let curr = rootDir;
+          for (const part of parts) {
+            curr = path.join(curr, part);
+            try {
+              const st = await fs.lstat(curr);
+              if (!st.isDirectory()) {
+                const renamed = resolveExtractDestinationInfo(
+                  path.dirname(curr),
+                  path.basename(curr)
+                ).suggestedPath;
+                await renameWithRetry(curr, renamed);
+              }
+            } catch {
+              // Segment does not exist yet
+            }
+          }
+          await fs.mkdir(targetDir, { recursive: true });
+        }
+
         const parser = createNodeTarStreamParser({
           onDirectory: async (meta) => {
             if (meta.path && meta.path !== '.') {
               const dirDest = resolveSafeExtractPath(stagingDest, meta.path);
-              await fs.mkdir(dirDest, { recursive: true });
+              await ensureDirectoryPathSafe(stagingDest, dirDest);
             }
           },
           onFileStart: async (meta) => {
             await closeActiveStream();
-            const destPath = resolveSafeExtractPath(stagingDest, meta.path);
-            await fs.mkdir(path.dirname(destPath), { recursive: true });
+            let destPath = resolveSafeExtractPath(stagingDest, meta.path);
+            await ensureDirectoryPathSafe(stagingDest, path.dirname(destPath));
+            if (fsSync.existsSync(destPath)) {
+              destPath = resolveExtractDestinationInfo(
+                path.dirname(destPath),
+                path.basename(destPath)
+              ).suggestedPath;
+            }
             activeOutStreamError = null;
-            const ws = fsSync.createWriteStream(destPath);
+            const ws = fsSync.createWriteStream(destPath, {
+              highWaterMark: 1024 * 1024,
+            });
             ws.on('error', (err) => {
               activeOutStreamError = err;
             });

@@ -26,6 +26,7 @@ import {
 } from '../lib/github-oci';
 import type { DesktopRootFolderItem } from '../lib/http';
 import {
+  formatDisplayDateTime,
   formatTimestampTag,
   validateOciTag,
   type ClockFormat,
@@ -811,9 +812,7 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
                         const isChecked = dec.replaceIds.has(version.id);
                         const isFilesExpanded = expandedVersionKeys.has(vKey);
                         const createdLabel = version.created_at
-                          ? new Date(version.created_at).toLocaleString(undefined, {
-                              hour12: clockFormat === '12h',
-                            })
+                          ? formatDisplayDateTime(version.created_at, clockFormat, dateFormat)
                           : '';
 
                         return (
