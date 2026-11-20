@@ -22,8 +22,32 @@ const {
 
 const activeLayerStreams = new Map();
 const activeTransfers = new Map();
+const activeUploadTransfers = new Set();
 const activeTempFiles = new Set();
 const activeStagingDirs = new Set();
+
+let mainWindow = null;
+let closeGuardMode = 'none';
+
+function getEffectiveCloseGuardMode() {
+  if (closeGuardMode !== 'none') return closeGuardMode;
+  if (activeUploadTransfers.size > 0) return 'upload';
+  return 'none';
+}
+
+function notifyCloseBlocked(win, mode) {
+  if (!win || win.isDestroyed()) return;
+  try {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  } catch {
+    // ignore focus/restore errors on window transitions
+  }
+  if (!win.webContents.isDestroyed()) {
+    win.webContents.send('desktop:closeBlocked', { mode });
+  }
+}
 
 async function renameWithRetry(srcPath, destPath) {
   let lastErr = null;
@@ -273,6 +297,30 @@ function createWindow() {
   });
 
   win.setMenuBarVisibility(false);
+  mainWindow = win;
+
+  win.on('close', (event) => {
+    const activeMode = getEffectiveCloseGuardMode();
+    if (activeMode !== 'none') {
+      event.preventDefault();
+      notifyCloseBlocked(win, activeMode);
+    }
+  });
+
+  win.on('closed', () => {
+    if (mainWindow === win) {
+      mainWindow = null;
+    }
+    closeGuardMode = 'none';
+  });
+
+  win.webContents.on('did-start-loading', () => {
+    closeGuardMode = 'none';
+  });
+
+  win.webContents.on('render-process-gone', () => {
+    closeGuardMode = 'none';
+  });
 
   // Native right-click context menu (Undo, Redo, Cut, Copy, Paste, Select All)
   win.webContents.on('context-menu', (_event, params) => {
@@ -611,6 +659,12 @@ app.whenReady().then(() => {
     }
   });
 
+  ipcMain.on('desktop:setCloseGuardMode', (_event, mode) => {
+    if (mode === 'none' || mode === 'upload' || mode === 'sync' || mode === 'index') {
+      closeGuardMode = mode;
+    }
+  });
+
   ipcMain.handle('desktop:httpRequest', async (_event, reqOpts) => {
     const upstreamRes = await fetchWithSafeRedirects(reqOpts.url, {
       method: reqOpts.method || 'GET',
@@ -637,6 +691,8 @@ app.whenReady().then(() => {
 
     const abortController = new AbortController();
     if (requestId) activeTransfers.set(requestId, abortController);
+    const uploadToken = Symbol('buildOciLayerFile');
+    activeUploadTransfers.add(uploadToken);
 
     let lastSentPct = -1;
     try {
@@ -662,6 +718,7 @@ app.whenReady().then(() => {
       await fs.unlink(tempPath).catch(() => {});
       throw err;
     } finally {
+      activeUploadTransfers.delete(uploadToken);
       if (requestId) activeTransfers.delete(requestId);
     }
   });
@@ -689,6 +746,8 @@ app.whenReady().then(() => {
     ) => {
       const abortController = new AbortController();
       if (requestId) activeTransfers.set(requestId, abortController);
+      const uploadToken = Symbol('uploadBlobFromFile');
+      activeUploadTransfers.add(uploadToken);
       let token = registryToken;
       let fileHandle = null;
       let sessionUrl = '';
@@ -874,6 +933,7 @@ app.whenReady().then(() => {
         }
         throw err;
       } finally {
+        activeUploadTransfers.delete(uploadToken);
         if (requestId) activeTransfers.delete(requestId);
         if (fileHandle) {
           await fileHandle.close().catch(() => {});
@@ -897,6 +957,8 @@ app.whenReady().then(() => {
     ) => {
       const abortController = new AbortController();
       if (requestId) activeTransfers.set(requestId, abortController);
+      const uploadToken = Symbol('streamAndUploadOciLayer');
+      activeUploadTransfers.add(uploadToken);
       let lastSentPct = -1;
       let lastSentUploadedBytes = -1;
 
@@ -964,6 +1026,7 @@ app.whenReady().then(() => {
           registryToken: result.registryToken,
         };
       } finally {
+        activeUploadTransfers.delete(uploadToken);
         if (requestId) activeTransfers.delete(requestId);
       }
     }
@@ -1280,7 +1343,14 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  const activeMode = getEffectiveCloseGuardMode();
+  if (activeMode !== 'none' && mainWindow && !mainWindow.isDestroyed()) {
+    event.preventDefault();
+    notifyCloseBlocked(mainWindow, activeMode);
+    return;
+  }
+
   for (const tempPath of activeTempFiles) {
     try {
       fsSync.unlinkSync(tempPath);

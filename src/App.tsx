@@ -85,6 +85,7 @@ import {
   mapWithConcurrency,
   scanBrowserDirectoryHandle,
   scanBrowserDirectoryForUpload,
+  type DesktopCloseGuardMode,
   type DesktopRootFolderFileEntry,
   type DesktopRootFolderItem,
   type DesktopRootFolderScanResult,
@@ -493,9 +494,21 @@ export default function App() {
     promise: Promise<Record<string, RepoIndexVersionRecord>>;
   } | null>(null);
   const repoIndexWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const repoIndexPendingCountRef = useRef<number>(0);
   const [repoIndexUpdating, setRepoIndexUpdating] = useState<boolean>(false);
   const [repoIndexNotice, setRepoIndexNotice] = useState<InlineNotice | null>(null);
   const [isRepoIndexExpanded, setIsRepoIndexExpanded] = useState<boolean>(false);
+  const [closeBlockedMode, setCloseBlockedMode] = useState<
+    Exclude<DesktopCloseGuardMode, 'none'> | null
+  >(null);
+
+  const closeGuardMode: DesktopCloseGuardMode = repoIndexUpdating
+    ? 'index'
+    : isSyncingFolder
+      ? 'sync'
+      : uploadProgress
+        ? 'upload'
+        : 'none';
 
   const [deletedPkgTombstones, setDeletedPkgTombstones] = useState<
     Record<
@@ -521,7 +534,8 @@ export default function App() {
     showSyncReviewModal ||
     Boolean(extractConflict) ||
     Boolean(confirmDeletePkg) ||
-    Boolean(confirmDeleteVersion);
+    Boolean(confirmDeleteVersion) ||
+    Boolean(closeBlockedMode);
   useEffect(() => {
     if (isAnyModalOpen) {
       document.documentElement.classList.add('modal-open');
@@ -545,6 +559,57 @@ export default function App() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [confirmDeletePkg, confirmDeleteVersion, extractConflict]);
+  useEffect(() => {
+    window.electronAPI?.setCloseGuardMode?.(closeGuardMode);
+  }, [closeGuardMode]);
+
+  useEffect(() => {
+    return () => {
+      window.electronAPI?.setCloseGuardMode?.('none');
+    };
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onCloseBlocked?.(({ mode }) => {
+      setCloseBlockedMode(mode);
+    });
+    return () => {
+      unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (closeGuardMode === 'none') {
+      setCloseBlockedMode(null);
+    } else if (closeBlockedMode !== null && closeGuardMode !== closeBlockedMode) {
+      setCloseBlockedMode(closeGuardMode);
+    }
+  }, [closeGuardMode, closeBlockedMode]);
+
+  useEffect(() => {
+    if (window.electronAPI?.isDesktop || closeGuardMode === 'none') return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [closeGuardMode]);
+
+  useEffect(() => {
+    if (!closeBlockedMode) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        setCloseBlockedMode(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [closeBlockedMode]);
+
   const [copiedText, setCopiedText] = useState<string | null>(null);
 
   // Auto sign-in if an active session token exists
@@ -1020,12 +1085,14 @@ export default function App() {
     removeKeys?: string[];
     removePkgNames?: string[];
   }): Promise<void> {
+    repoIndexPendingCountRef.current += 1;
+    setRepoIndexUpdating(true);
+
     const task = repoIndexWriteQueueRef.current.then(async () => {
-      if (!user || !authToken) return;
-      setRepoIndexUpdating(true);
       setRepoIndexNotice(null);
       let indexLock: ActiveRepoLock | null = null;
       try {
+        if (!user || !authToken) return;
         indexLock = await acquireRepoIndexLock({
           repo: opts.repo,
           githubToken: authToken,
@@ -1128,7 +1195,13 @@ export default function App() {
         });
       } finally {
         await indexLock?.release();
-        setRepoIndexUpdating(false);
+        repoIndexPendingCountRef.current = Math.max(
+          0,
+          repoIndexPendingCountRef.current - 1
+        );
+        if (repoIndexPendingCountRef.current === 0) {
+          setRepoIndexUpdating(false);
+        }
       }
     });
 
@@ -6165,6 +6238,81 @@ export default function App() {
         isOpen={showAboutModal}
         onClose={() => setShowAboutModal(false)}
       />
+
+      {closeBlockedMode &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+            onClick={() => setCloseBlockedMode(null)}
+          >
+            <div
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="close-blocked-title"
+              onClick={(e) => e.stopPropagation()}
+              className="bg-[#161b22] border border-[#30363d] rounded-xl w-full max-w-md overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-150"
+            >
+              <div className="flex items-center justify-between p-5 border-b border-[#30363d] bg-[#0d1117]">
+                <h4
+                  id="close-blocked-title"
+                  className="text-sm font-bold text-white flex items-center gap-2"
+                >
+                  {closeBlockedMode === 'upload' && (
+                    <>
+                      <Upload className="w-4 h-4 icon-upload" />
+                      Upload in Progress
+                    </>
+                  )}
+                  {closeBlockedMode === 'sync' && (
+                    <>
+                      <FolderSync className="w-4 h-4 icon-sync" />
+                      Folder Sync in Progress
+                    </>
+                  )}
+                  {closeBlockedMode === 'index' && (
+                    <>
+                      <Layers className="w-4 h-4 icon-packages" />
+                      Repository Index Syncing
+                    </>
+                  )}
+                </h4>
+                <button
+                  type="button"
+                  onClick={() => setCloseBlockedMode(null)}
+                  aria-label="Dismiss close warning"
+                  className="modal-close-btn p-1"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="p-3.5 rounded-md theme-warning-banner text-xs leading-relaxed flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>
+                    {closeBlockedMode === 'upload' &&
+                      'A package upload is currently in progress. Please cancel the active upload or wait for it to finish before closing GHCR Manager.'}
+                    {closeBlockedMode === 'sync' &&
+                      'A folder sync is currently in progress. Please cancel the active folder sync or wait for it to finish before closing GHCR Manager.'}
+                    {closeBlockedMode === 'index' &&
+                      'The repository file index is currently syncing with GitHub. Please wait a few seconds for it to finish before closing GHCR Manager.'}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setCloseBlockedMode(null)}
+                    className="px-4 py-1.5 rounded-md bg-blue-600 text-xs font-semibold text-white cursor-pointer"
+                  >
+                    OK
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

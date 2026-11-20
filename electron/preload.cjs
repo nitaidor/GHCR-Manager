@@ -13,6 +13,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
   setNativeTheme: (mode) => ipcRenderer.send('set-native-theme', mode),
+  setCloseGuardMode: (mode) => ipcRenderer.send('desktop:setCloseGuardMode', mode),
+  onCloseBlocked: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on('desktop:closeBlocked', listener);
+    return () => ipcRenderer.removeListener('desktop:closeBlocked', listener);
+  },
   pickDirectoryPath: () => ipcRenderer.invoke('desktop:pickDirectoryPath'),
   pickDirectoriesForUpload: () => ipcRenderer.invoke('desktop:pickDirectoriesForUpload'),
   pickRootFolder: () => ipcRenderer.invoke('desktop:pickRootFolder'),

@@ -1,3 +1,5 @@
+export type DesktopCloseGuardMode = 'none' | 'upload' | 'sync' | 'index';
+
 export interface HttpResponseData {
   status: number;
   headers: Record<string, string>;
@@ -49,6 +51,10 @@ declare global {
       platform: string;
       getPathForFile?: (file: File) => string | undefined;
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void;
+      setCloseGuardMode?: (mode: DesktopCloseGuardMode) => void;
+      onCloseBlocked?: (
+        cb: (payload: { mode: Exclude<DesktopCloseGuardMode, 'none'> }) => void
+      ) => () => void;
       pickDirectoryPath?: () => Promise<string | null>;
       pickDirectoriesForUpload?: () => Promise<string[]>;
       pickRootFolder: () => Promise<DesktopRootFolderScanResult | null>;
