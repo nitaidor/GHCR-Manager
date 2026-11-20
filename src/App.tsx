@@ -505,13 +505,22 @@ export default function App() {
     Exclude<DesktopCloseGuardMode, 'none'> | null
   >(null);
 
-  const closeGuardMode: DesktopCloseGuardMode = repoIndexUpdating
+  const isFinalizingIndex =
+    repoIndexUpdating ||
+    uploadProgress?.message === 'Updating repository file index...' ||
+    syncOverallProgress?.message === 'Updating repository file index...';
+
+  const closeGuardMode: DesktopCloseGuardMode = isFinalizingIndex
     ? 'index'
     : isSyncingFolder
       ? 'sync'
       : uploadProgress
         ? 'upload'
         : 'none';
+  const closeGuardModeRef = useRef<DesktopCloseGuardMode>('none');
+  closeGuardModeRef.current = closeGuardMode;
+  const visibleCloseBlockedMode: Exclude<DesktopCloseGuardMode, 'none'> | null =
+    closeBlockedMode && closeGuardMode !== 'none' ? closeGuardMode : null;
 
   const [deletedPkgTombstones, setDeletedPkgTombstones] = useState<
     Record<
@@ -538,7 +547,7 @@ export default function App() {
     Boolean(extractConflict) ||
     Boolean(confirmDeletePkg) ||
     Boolean(confirmDeleteVersion) ||
-    Boolean(closeBlockedMode);
+    Boolean(visibleCloseBlockedMode);
   useEffect(() => {
     if (isAnyModalOpen) {
       document.documentElement.classList.add('modal-open');
@@ -573,8 +582,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = window.electronAPI?.onCloseBlocked?.(({ mode }) => {
-      setCloseBlockedMode(mode);
+    const unsubscribe = window.electronAPI?.onCloseBlocked?.(() => {
+      const liveMode = closeGuardModeRef.current;
+      setCloseBlockedMode(liveMode === 'none' ? null : liveMode);
     });
     return () => {
       unsubscribe?.();
@@ -600,7 +610,7 @@ export default function App() {
   }, [closeGuardMode]);
 
   useEffect(() => {
-    if (!closeBlockedMode) return;
+    if (!visibleCloseBlockedMode) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -611,7 +621,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [closeBlockedMode]);
+  }, [visibleCloseBlockedMode]);
 
   const [copiedText, setCopiedText] = useState<string | null>(null);
 
@@ -1432,10 +1442,18 @@ export default function App() {
         setRepoPackages([...linked]);
       }
 
+      const nowMs = Date.now();
       const staleKeys = Object.entries(currentIndexMap)
         .filter(([k, rec]) => {
           const pkgLower = rec.packageName.toLowerCase();
-          return succeededLinkedPkgNames.has(pkgLower) && !liveLinkedVKeys.has(k);
+          if (!succeededLinkedPkgNames.has(pkgLower) || liveLinkedVKeys.has(k)) {
+            return false;
+          }
+          const createdMs = rec.createdAt ? Date.parse(rec.createdAt) : NaN;
+          if (Number.isFinite(createdMs) && nowMs - createdMs < 60_000) {
+            return false;
+          }
+          return true;
         })
         .map(([k]) => k);
 
@@ -2117,6 +2135,13 @@ export default function App() {
         });
       }
 
+      await pkgLock?.release();
+      pkgLock = null;
+      if (uploadAbortRef.current === abortCtrl) {
+        uploadAbortRef.current = null;
+      }
+      setUploadProgress(null);
+
       setUploadSuccess(details);
       if (deleteErrors.length > 0) {
         setUploadError(
@@ -2128,7 +2153,7 @@ export default function App() {
       setLoadingUploadFolders(new Set());
       setCustomImageName('');
       setShowUploadVersionModal(false);
-      await refreshPackages();
+      void refreshPackages();
     } catch (err: unknown) {
       if (leaseLost) {
         setUploadError(
@@ -2964,7 +2989,13 @@ export default function App() {
         });
       }
 
-      await refreshPackages();
+      await lockBundle?.releaseAll();
+      lockBundle = null;
+      if (syncAbortRef.current === abortCtrl) {
+        syncAbortRef.current = null;
+      }
+      setSyncOverallProgress(null);
+      setIsSyncingFolder(false);
 
       if (leaseLost) {
         setSyncModalError(
@@ -2988,6 +3019,8 @@ export default function App() {
           replacedCount: totalReplacedCount,
         });
       }
+
+      void refreshPackages();
     } catch (err: unknown) {
       if (leaseLost) {
         setSyncModalError(
@@ -6245,7 +6278,7 @@ export default function App() {
         onClose={() => setShowAboutModal(false)}
       />
 
-      {closeBlockedMode &&
+      {visibleCloseBlockedMode &&
         createPortal(
           <div
             className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
@@ -6263,19 +6296,19 @@ export default function App() {
                   id="close-blocked-title"
                   className="text-sm font-bold text-white flex items-center gap-2"
                 >
-                  {closeBlockedMode === 'upload' && (
+                  {visibleCloseBlockedMode === 'upload' && (
                     <>
                       <Upload className="w-4 h-4 icon-upload" />
                       Upload in Progress
                     </>
                   )}
-                  {closeBlockedMode === 'sync' && (
+                  {visibleCloseBlockedMode === 'sync' && (
                     <>
                       <FolderSync className="w-4 h-4 icon-sync" />
                       Folder Sync in Progress
                     </>
                   )}
-                  {closeBlockedMode === 'index' && (
+                  {visibleCloseBlockedMode === 'index' && (
                     <>
                       <Layers className="w-4 h-4 icon-packages" />
                       Repository Index Syncing
@@ -6296,11 +6329,11 @@ export default function App() {
                 <div className="p-3.5 rounded-md theme-warning-banner text-xs leading-relaxed flex items-start gap-2.5">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>
-                    {closeBlockedMode === 'upload' &&
+                    {visibleCloseBlockedMode === 'upload' &&
                       'A package upload is currently in progress. Please cancel the active upload or wait for it to finish before closing GHCR Manager.'}
-                    {closeBlockedMode === 'sync' &&
+                    {visibleCloseBlockedMode === 'sync' &&
                       'A folder sync is currently in progress. Please cancel the active folder sync or wait for it to finish before closing GHCR Manager.'}
-                    {closeBlockedMode === 'index' &&
+                    {visibleCloseBlockedMode === 'index' &&
                       'The repository file index is currently syncing with GitHub. Please wait a few seconds for it to finish before closing GHCR Manager.'}
                   </span>
                 </div>
