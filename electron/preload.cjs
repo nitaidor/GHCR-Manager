@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('desktop:saveExtractedFiles', defaultFolderName, files),
   buildOciLayerFile: (opts) => ipcRenderer.invoke('desktop:buildOciLayerFile', opts),
   uploadBlobFromFile: (opts) => ipcRenderer.invoke('desktop:uploadBlobFromFile', opts),
+  streamAndUploadOciLayer: (opts) => ipcRenderer.invoke('desktop:streamAndUploadOciLayer', opts),
   deleteTempFile: (tempPath) => ipcRenderer.invoke('desktop:deleteTempFile', tempPath),
   prepareExtractDestination: (opts) =>
     ipcRenderer.invoke('desktop:prepareExtractDestination', opts),

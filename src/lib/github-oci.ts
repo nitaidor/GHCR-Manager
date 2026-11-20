@@ -2,6 +2,7 @@ import {
   crossPlatformHttpRequest,
   decodeJson,
   decodeText,
+  isAbortError,
   mapWithConcurrency,
 } from './http';
 import {
@@ -402,8 +403,20 @@ async function getGhcrBearerToken(
   return bearer;
 }
 
+const WEB_BLOB_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB max GHCR PATCH chunk
+const MIN_ADAPTIVE_UPLOAD_CHUNK_BYTES = 256 * 1024; // 256 KiB adaptive floor
+
+function isWebChunkTooLargeResponse(status: number, bodyText: string): boolean {
+  if (status === 413) return true;
+  return (
+    status === 416 &&
+    /exceeds the maximum permissible limit|too large|maximum.*limit/i.test(bodyText)
+  );
+}
+
 /**
- * Uploads a single blob (config or layer) to ghcr.io using POST + PUT monolithic upload.
+ * Uploads a single blob (config or layer) to ghcr.io, using a monolithic PUT for blobs
+ * <= 4 MiB (with automatic chunked fallback) and 4 MiB PATCH chunks for larger blobs.
  */
 async function uploadBlobToGhcr(
   registryToken: string,
@@ -449,26 +462,121 @@ async function uploadBlobToGhcr(
     throw new Error('ghcr.io blob upload response missing Location header.');
   }
 
-  const uploadUrlObj = new URL(locationHeader, 'https://ghcr.io');
-  uploadUrlObj.searchParams.set('digest', digest);
+  let sessionUrl = new URL(locationHeader, 'https://ghcr.io').toString();
 
-  // 3. Complete upload with PUT
-  const putRes = await crossPlatformHttpRequest({
-    url: uploadUrlObj.toString(),
-    method: 'PUT',
-    headers: {
-      Authorization: `Bearer ${registryToken}`,
-      'Content-Type': 'application/octet-stream',
-    },
-    body: blobBytes,
-    signal,
-  });
+  try {
+    let activeChunkLimit = WEB_BLOB_UPLOAD_CHUNK_BYTES;
 
-  if (putRes.status !== 201 && putRes.status !== 202) {
-    const bodyText = decodeText(putRes.body);
-    throw new Error(
-      `Failed to finish blob upload to ghcr.io (HTTP ${putRes.status}): ${bodyText}`
-    );
+    if (blobBytes.byteLength <= WEB_BLOB_UPLOAD_CHUNK_BYTES) {
+      const uploadUrlObj = new URL(sessionUrl);
+      uploadUrlObj.searchParams.set('digest', digest);
+
+      const putRes = await crossPlatformHttpRequest({
+        url: uploadUrlObj.toString(),
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${registryToken}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: blobBytes,
+        signal,
+      });
+
+      if (putRes.status === 201 || putRes.status === 202) {
+        return;
+      }
+
+      const bodyText = decodeText(putRes.body);
+      if (
+        isWebChunkTooLargeResponse(putRes.status, bodyText) &&
+        blobBytes.byteLength > MIN_ADAPTIVE_UPLOAD_CHUNK_BYTES
+      ) {
+        activeChunkLimit = Math.max(
+          MIN_ADAPTIVE_UPLOAD_CHUNK_BYTES,
+          Math.floor(blobBytes.byteLength / 2)
+        );
+      } else {
+        throw new Error(
+          `Failed to finish blob upload to ghcr.io (HTTP ${putRes.status}): ${bodyText}`
+        );
+      }
+    }
+
+    let offset = 0;
+    while (offset < blobBytes.byteLength) {
+      if (signal?.aborted) {
+        throw new DOMException('Upload cancelled', 'AbortError');
+      }
+      const len = Math.min(activeChunkLimit, blobBytes.byteLength - offset);
+      const chunkSlice = blobBytes.subarray(offset, offset + len);
+
+      const patchRes = await crossPlatformHttpRequest({
+        url: sessionUrl,
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${registryToken}`,
+          'Content-Type': 'application/octet-stream',
+          'Content-Range': `${offset}-${offset + len - 1}`,
+        },
+        body: chunkSlice,
+        signal,
+      });
+
+      if (patchRes.status === 202 || patchRes.status === 201 || patchRes.status === 204) {
+        const nextLoc = patchRes.headers['location'];
+        if (nextLoc) {
+          sessionUrl = new URL(nextLoc, sessionUrl).toString();
+        }
+        offset += len;
+        continue;
+      }
+
+      const bodyText = decodeText(patchRes.body);
+      if (
+        isWebChunkTooLargeResponse(patchRes.status, bodyText) &&
+        len > MIN_ADAPTIVE_UPLOAD_CHUNK_BYTES
+      ) {
+        activeChunkLimit = Math.max(
+          MIN_ADAPTIVE_UPLOAD_CHUNK_BYTES,
+          Math.floor(len / 2)
+        );
+        continue;
+      }
+
+      throw new Error(
+        `Failed to upload blob chunk at byte ${offset} (HTTP ${patchRes.status}): ${bodyText}`
+      );
+    }
+
+    const finalPutUrlObj = new URL(sessionUrl);
+    finalPutUrlObj.searchParams.set('digest', digest);
+    const finalPutRes = await crossPlatformHttpRequest({
+      url: finalPutUrlObj.toString(),
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${registryToken}`,
+        'Content-Length': '0',
+      },
+      signal,
+    });
+
+    if (finalPutRes.status !== 201 && finalPutRes.status !== 202) {
+      const bodyText = decodeText(finalPutRes.body);
+      throw new Error(
+        `Failed to finish blob upload to ghcr.io (HTTP ${finalPutRes.status}): ${bodyText}`
+      );
+    }
+  } catch (err) {
+    if ((signal?.aborted || isAbortError(err)) && sessionUrl) {
+      await crossPlatformHttpRequest({
+        url: sessionUrl,
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${registryToken}`,
+        },
+      }).catch(() => {});
+    }
+    throw err;
   }
 }
 
@@ -510,10 +618,15 @@ export async function buildAndPushOciImage(opts: {
     throw new DOMException('Upload cancelled', 'AbortError');
   }
 
-  const canStreamDesktop =
-    Boolean(desktopFiles && desktopFiles.length > 0) &&
+  const hasDesktopFiles = Boolean(desktopFiles && desktopFiles.length > 0);
+  const canDirectStreamDesktop =
+    hasDesktopFiles && Boolean(window.electronAPI?.streamAndUploadOciLayer);
+  const canLegacyStreamDesktop =
+    !canDirectStreamDesktop &&
+    hasDesktopFiles &&
     Boolean(window.electronAPI?.buildOciLayerFile) &&
     Boolean(window.electronAPI?.uploadBlobFromFile);
+  const canStreamDesktop = canDirectStreamDesktop || canLegacyStreamDesktop;
 
   const sourceEntries = canStreamDesktop ? desktopFiles! : files;
   if (sourceEntries.length === 0) {
@@ -559,55 +672,120 @@ export async function buildAndPushOciImage(opts: {
   let tempLayerPath: string | null = null;
 
   try {
-    onProgress?.({
-      stage: 'archiving',
-      message:
-        itemCount > 0
-          ? `Building OCI image "${ociPackageName}" from ${itemCount} file(s)...`
-          : `Building OCI image "${ociPackageName}" (empty folder${
-              emptyFolderCount === 1 ? '' : 's'
-            })...`,
-      percent: 10,
-    });
-
-    // 1. Build .tar.gz layer (streaming via disk on Desktop, or in-memory on Web/Mobile)
+    let registryToken: string;
     let uncompressedDigest: string;
     let compressedDigest: string;
     let compressedSize: number;
     let totalFileBytes: number;
     let fileMetaList: OciManifestFileMeta[];
     let inMemoryTargz: Uint8Array | null = null;
+    let layerAlreadyUploaded = false;
 
-    if (canStreamDesktop) {
-      const built = await window.electronAPI!.buildOciLayerFile!({
+    if (canDirectStreamDesktop) {
+      // Zero-temp-file Desktop streaming: authenticate first, then stream TAR+gzip directly in 4 MiB PATCH chunks
+      onProgress?.({
+        stage: 'authenticating',
+        message: `Authenticating with ghcr.io/${ownerLower}/${ociPackageName}...`,
+        percent: 5,
+      });
+
+      registryToken = await getGhcrBearerToken(
+        username,
+        githubToken,
+        ownerLower,
+        ociPackageName,
+        'pull,push'
+      );
+
+      if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
+      onProgress?.({
+        stage: 'uploading-layer',
+        message:
+          itemCount > 0
+            ? `Streaming & uploading OCI image "${ociPackageName}" from ${itemCount} file(s)...`
+            : `Streaming & uploading OCI image "${ociPackageName}" (empty folder${
+                emptyFolderCount === 1 ? '' : 's'
+              })...`,
+        percent: 10,
+      });
+
+      const streamed = await window.electronAPI!.streamAndUploadOciLayer!({
         files: desktopFiles!,
+        uploadInitUrl: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/uploads/`,
+        registryToken,
+        basicAuthHeader: `Basic ${toBase64(`${username}:${githubToken.trim()}`)}`,
+        scopeParam: `repository:${ownerLower}/${ociPackageName}:pull,push`,
         requestId,
       });
-      tempLayerPath = built.tempPath;
-      uncompressedDigest = built.uncompressedDigest;
-      compressedDigest = built.compressedDigest;
-      compressedSize = built.compressedSize;
-      totalFileBytes = built.totalFileBytes;
-      fileMetaList = built.fileMetaList;
-    } else {
-      let layer;
-      try {
-        layer = await buildOciLayerFromFiles(files);
-      } catch (err) {
-        throw normalizeMemoryLimitError(err, 'upload');
+
+      if (streamed.registryToken) {
+        registryToken = streamed.registryToken;
       }
-      uncompressedDigest = layer.uncompressedDigest;
-      compressedDigest = layer.compressedDigest;
-      compressedSize = layer.compressedSize;
-      totalFileBytes = layer.totalFileBytes;
-      inMemoryTargz = layer.targzBytes;
-      fileMetaList = files.map((f) => {
-        const clean =
-          f.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') || '.';
-        return f.isDirectory
-          ? { path: clean, size: 0, isDirectory: true }
-          : { path: clean, size: f.data.byteLength };
+      uncompressedDigest = streamed.uncompressedDigest;
+      compressedDigest = streamed.compressedDigest;
+      compressedSize = streamed.compressedSize;
+      totalFileBytes = streamed.totalFileBytes;
+      fileMetaList = streamed.fileMetaList;
+      layerAlreadyUploaded = true;
+    } else {
+      onProgress?.({
+        stage: 'archiving',
+        message:
+          itemCount > 0
+            ? `Building OCI image "${ociPackageName}" from ${itemCount} file(s)...`
+            : `Building OCI image "${ociPackageName}" (empty folder${
+                emptyFolderCount === 1 ? '' : 's'
+              })...`,
+        percent: 10,
       });
+
+      // 1. Build .tar.gz layer (legacy temp-file streaming on Desktop, or in-memory on Web/Mobile)
+      if (canLegacyStreamDesktop) {
+        const built = await window.electronAPI!.buildOciLayerFile!({
+          files: desktopFiles!,
+          requestId,
+        });
+        tempLayerPath = built.tempPath;
+        uncompressedDigest = built.uncompressedDigest;
+        compressedDigest = built.compressedDigest;
+        compressedSize = built.compressedSize;
+        totalFileBytes = built.totalFileBytes;
+        fileMetaList = built.fileMetaList;
+      } else {
+        let layer;
+        try {
+          layer = await buildOciLayerFromFiles(files);
+        } catch (err) {
+          throw normalizeMemoryLimitError(err, 'upload');
+        }
+        uncompressedDigest = layer.uncompressedDigest;
+        compressedDigest = layer.compressedDigest;
+        compressedSize = layer.compressedSize;
+        totalFileBytes = layer.totalFileBytes;
+        inMemoryTargz = layer.targzBytes;
+        fileMetaList = files.map((f) => {
+          const clean =
+            f.relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') || '.';
+          return f.isDirectory
+            ? { path: clean, size: 0, isDirectory: true }
+            : { path: clean, size: f.data.byteLength };
+        });
+      }
+
+      // Authenticate with ghcr.io
+      onProgress?.({
+        stage: 'authenticating',
+        message: `Authenticating with ghcr.io/${ownerLower}/${ociPackageName}...`,
+        percent: 48,
+      });
+
+      registryToken = await getGhcrBearerToken(
+        username,
+        githubToken,
+        ownerLower,
+        ociPackageName,
+        'pull,push'
+      );
     }
 
     const createdAt = new Date().toISOString();
@@ -678,27 +856,12 @@ export async function buildAndPushOciImage(opts: {
 
     const manifestBytes = encoder.encode(JSON.stringify(manifestObj, null, 2));
 
-    // 4. Authenticate with ghcr.io
-    onProgress?.({
-      stage: 'authenticating',
-      message: `Authenticating with ghcr.io/${ownerLower}/${ociPackageName}...`,
-      percent: 48,
-    });
-
-    let registryToken = await getGhcrBearerToken(
-      username,
-      githubToken,
-      ownerLower,
-      ociPackageName,
-      'pull,push'
-    );
-
-    // 5. Upload Config Blob
+    // 4. Upload Config Blob
     if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
     onProgress?.({
       stage: 'uploading-config',
       message: `Uploading image configuration (${configBytes.byteLength} B)...`,
-      percent: 52,
+      percent: layerAlreadyUploaded ? 90 : 52,
     });
 
     await uploadBlobToGhcr(
@@ -710,49 +873,51 @@ export async function buildAndPushOciImage(opts: {
       signal
     );
 
-    // 6. Upload Layer Blob (.tar.gz)
-    if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
-    onProgress?.({
-      stage: 'uploading-layer',
-      message: `Uploading compressed image layer (${formatBytes(compressedSize)})...`,
-      percent: 55,
-    });
-
-    if (canStreamDesktop && tempLayerPath) {
-      const headRes = await crossPlatformHttpRequest({
-        url: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/${compressedDigest}`,
-        method: 'HEAD',
-        headers: { Authorization: `Bearer ${registryToken}` },
-        signal,
+    // 5. Upload Layer Blob (.tar.gz) when not already streamed directly
+    if (!layerAlreadyUploaded) {
+      if (signal?.aborted) throw new DOMException('Upload cancelled', 'AbortError');
+      onProgress?.({
+        stage: 'uploading-layer',
+        message: `Uploading compressed image layer (${formatBytes(compressedSize)})...`,
+        percent: 55,
       });
 
-      if (headRes.status !== 200) {
-        const uploadResult = await window.electronAPI!.uploadBlobFromFile!({
-          tempPath: tempLayerPath,
-          uploadInitUrl: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/uploads/`,
-          digest: compressedDigest,
-          registryToken,
-          basicAuthHeader: `Basic ${toBase64(`${username}:${githubToken.trim()}`)}`,
-          scopeParam: `repository:${ownerLower}/${ociPackageName}:pull,push`,
-          compressedSize,
-          requestId,
+      if (canLegacyStreamDesktop && tempLayerPath) {
+        const headRes = await crossPlatformHttpRequest({
+          url: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/${compressedDigest}`,
+          method: 'HEAD',
+          headers: { Authorization: `Bearer ${registryToken}` },
+          signal,
         });
-        if (uploadResult?.registryToken) {
-          registryToken = uploadResult.registryToken;
+
+        if (headRes.status !== 200) {
+          const uploadResult = await window.electronAPI!.uploadBlobFromFile!({
+            tempPath: tempLayerPath,
+            uploadInitUrl: `https://ghcr.io/v2/${ownerLower}/${ociPackageName}/blobs/uploads/`,
+            digest: compressedDigest,
+            registryToken,
+            basicAuthHeader: `Basic ${toBase64(`${username}:${githubToken.trim()}`)}`,
+            scopeParam: `repository:${ownerLower}/${ociPackageName}:pull,push`,
+            compressedSize,
+            requestId,
+          });
+          if (uploadResult?.registryToken) {
+            registryToken = uploadResult.registryToken;
+          }
         }
-      }
-    } else if (inMemoryTargz) {
-      try {
-        await uploadBlobToGhcr(
-          registryToken,
-          ownerLower,
-          ociPackageName,
-          compressedDigest,
-          inMemoryTargz,
-          signal
-        );
-      } catch (err) {
-        throw normalizeMemoryLimitError(err, 'upload');
+      } else if (inMemoryTargz) {
+        try {
+          await uploadBlobToGhcr(
+            registryToken,
+            ownerLower,
+            ociPackageName,
+            compressedDigest,
+            inMemoryTargz,
+            signal
+          );
+        } catch (err) {
+          throw normalizeMemoryLimitError(err, 'upload');
+        }
       }
     }
 

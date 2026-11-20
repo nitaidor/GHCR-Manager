@@ -49,6 +49,10 @@ const {
   sanitizeFolderName,
   writeStreamChunk,
 } = require('../electron/streaming-tar.cjs');
+const {
+  BLOB_UPLOAD_CHUNK_BYTES,
+  streamAndUploadOciLayer,
+} = require('../electron/oci-upload.cjs');
 
 async function runTests() {
   console.log('1. Testing single-file and multi-file naming rules...');
@@ -1068,6 +1072,381 @@ async function runTests() {
       }),
     ]);
     assert.equal(crossRepoMax, 1);
+
+    console.log('16. Testing zero-temp-file 4 MiB streaming OCI upload (chunking, adaptive cap, 401 refresh, abort)...');
+    const createMockRegistry = (opts: {
+      maxPatchBytes?: number;
+      expectedLimitLabel?: string;
+      failChunk2With401Once?: boolean;
+      delaySecondPatchMs?: number;
+      onSecondPatchStart?: () => void;
+    }) => {
+      const state = {
+        maxPatchBytes: opts.maxPatchBytes ?? BLOB_UPLOAD_CHUNK_BYTES,
+        expectedLimitLabel: opts.expectedLimitLabel ?? '4.00MiB',
+        expectedToken: 'tok-initial',
+        failed401Once: false,
+        sessions: new Map<
+          string,
+          {
+            chunks: Buffer[];
+            offset: number;
+            patchSizes: number[];
+            monolithicPutSize: number | null;
+            committedDigest: string | null;
+            deleted: boolean;
+          }
+        >(),
+        deletedCount: 0,
+        lastSessionId: '',
+      };
+
+      const srv = http.createServer(async (req, res) => {
+        const reqChunks: Buffer[] = [];
+        for await (const c of req) {
+          reqChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+        }
+        const body = Buffer.concat(reqChunks);
+        const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
+
+        if (req.method === 'POST' && urlObj.pathname === '/v2/alice/pkg/blobs/uploads/') {
+          if (req.headers.authorization !== `Bearer ${state.expectedToken}`) {
+            res.statusCode = 401;
+            res.end('unauthorized');
+            return;
+          }
+          const sid = `sess-${state.sessions.size + 1}`;
+          state.lastSessionId = sid;
+          state.sessions.set(sid, {
+            chunks: [],
+            offset: 0,
+            patchSizes: [],
+            monolithicPutSize: null,
+            committedDigest: null,
+            deleted: false,
+          });
+          res.statusCode = 202;
+          res.setHeader('Location', `/v2/alice/pkg/blobs/uploads/${sid}`);
+          res.end();
+          return;
+        }
+
+        const sessMatch = urlObj.pathname.match(/^\/v2\/alice\/pkg\/blobs\/uploads\/(sess-\d+)$/);
+        if (!sessMatch) {
+          res.statusCode = 404;
+          res.end('not found');
+          return;
+        }
+        const sess = state.sessions.get(sessMatch[1]);
+        if (!sess || sess.deleted) {
+          res.statusCode = 404;
+          res.end('session not found');
+          return;
+        }
+
+        if (req.method === 'DELETE') {
+          sess.deleted = true;
+          state.deletedCount += 1;
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+
+        if (req.headers.authorization !== `Bearer ${state.expectedToken}`) {
+          res.statusCode = 401;
+          res.end('unauthorized');
+          return;
+        }
+
+        if (req.method === 'GET') {
+          res.statusCode = 204;
+          res.setHeader('Range', sess.offset > 0 ? `0-${sess.offset - 1}` : '0-0');
+          res.end();
+          return;
+        }
+
+        if (req.method === 'PATCH') {
+          if (
+            opts.failChunk2With401Once &&
+            !state.failed401Once &&
+            sess.patchSizes.length === 1
+          ) {
+            state.failed401Once = true;
+            state.expectedToken = 'tok-refreshed';
+            res.statusCode = 401;
+            res.end('token expired');
+            return;
+          }
+
+          if (sess.patchSizes.length === 1 && opts.onSecondPatchStart) {
+            opts.onSecondPatchStart();
+          }
+          if (sess.patchSizes.length === 1 && opts.delaySecondPatchMs) {
+            await new Promise((r) => setTimeout(r, opts.delaySecondPatchMs));
+          }
+
+          if (body.length > state.maxPatchBytes) {
+            res.statusCode = 416;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                errors: [
+                  {
+                    code: 'REQUESTED_RANGE_NOT_SATISFIABLE',
+                    message: `the request body is too large and exceeds the maximum permissible limit of ${state.expectedLimitLabel}`,
+                  },
+                ],
+              })
+            );
+            return;
+          }
+
+          const contentRange = String(req.headers['content-range'] || '');
+          const m = contentRange.match(/^(\d+)-(\d+)$/);
+          if (!m) {
+            res.statusCode = 400;
+            res.end('missing content-range');
+            return;
+          }
+          const rStart = Number(m[1]);
+          const rEnd = Number(m[2]);
+          if (rStart !== sess.offset || rEnd - rStart + 1 !== body.length) {
+            res.statusCode = 416;
+            res.setHeader('Range', sess.offset > 0 ? `0-${sess.offset - 1}` : '0-0');
+            res.end('range mismatch');
+            return;
+          }
+
+          sess.chunks.push(body);
+          sess.offset += body.length;
+          sess.patchSizes.push(body.length);
+          res.statusCode = 202;
+          res.setHeader('Location', `/v2/alice/pkg/blobs/uploads/${sessMatch[1]}`);
+          res.setHeader('Range', `0-${sess.offset - 1}`);
+          res.end();
+          return;
+        }
+
+        if (req.method === 'PUT') {
+          const digest = urlObj.searchParams.get('digest');
+          if (body.length > 0) {
+            if (body.length > state.maxPatchBytes) {
+              res.statusCode = 416;
+              res.end(
+                JSON.stringify({
+                  errors: [
+                    {
+                      code: 'REQUESTED_RANGE_NOT_SATISFIABLE',
+                      message: `the request body is too large and exceeds the maximum permissible limit of ${state.expectedLimitLabel}`,
+                    },
+                  ],
+                })
+              );
+              return;
+            }
+            sess.chunks.push(body);
+            sess.offset += body.length;
+            sess.monolithicPutSize = body.length;
+          }
+          const assembled = Buffer.concat(sess.chunks);
+          const actualDigest = `sha256:${crypto.createHash('sha256').update(assembled).digest('hex')}`;
+          if (digest !== actualDigest) {
+            res.statusCode = 400;
+            res.end(`digest mismatch: expected ${digest}, got ${actualDigest}`);
+            return;
+          }
+          sess.committedDigest = actualDigest;
+          res.statusCode = 201;
+          res.end();
+          return;
+        }
+
+        res.statusCode = 405;
+        res.end('method not allowed');
+      });
+
+      return new Promise<{
+        baseUrl: string;
+        state: typeof state;
+        close: () => Promise<void>;
+      }>((resolve) => {
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address();
+          assert.ok(addr && typeof addr === 'object');
+          resolve({
+            baseUrl: `http://127.0.0.1:${addr.port}`,
+            state,
+            close: () => new Promise<void>((done) => srv.close(() => done())),
+          });
+        });
+      });
+    };
+
+    const parseTarFromTargzBuffer = async (targzBuf: Buffer) => {
+      const extractedFiles = new Map<string, Buffer>();
+      let curPath = '';
+      let curChunks: Buffer[] = [];
+      const parser = createNodeTarStreamParser({
+        onFileStart: ({ path: p }: { path: string }) => {
+          curPath = p;
+          curChunks = [];
+        },
+        onFileData: (chunk: Buffer) => {
+          curChunks.push(Buffer.from(chunk));
+        },
+        onFileEnd: () => {
+          extractedFiles.set(curPath, Buffer.concat(curChunks));
+        },
+      });
+      await parser.feed(zlib.gunzipSync(targzBuf));
+      assert.equal(parser.isDone(), true);
+      return extractedFiles;
+    };
+
+    // Case A: > 9 MiB incompressible random bytes with strict 4.00 MiB PATCH cap & zero temp files
+    const srcStreamDir = path.join(tmpWorkDir, 'stream-src');
+    await fs.mkdir(srcStreamDir, { recursive: true });
+    const random95Path = path.join(srcStreamDir, 'random-9.5mb.bin');
+    const random95Bytes = crypto.randomBytes(9 * 1024 * 1024 + 512 * 1024);
+    await fs.writeFile(random95Path, random95Bytes);
+
+    const mockA = await createMockRegistry({});
+    try {
+      const tempBefore = (await fs.readdir(os.tmpdir())).filter((n) =>
+        n.startsWith('ghcr-manager-layer-')
+      );
+      const resA = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${mockA.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+      });
+      const tempAfter = (await fs.readdir(os.tmpdir())).filter((n) =>
+        n.startsWith('ghcr-manager-layer-')
+      );
+      assert.equal(tempAfter.length, tempBefore.length);
+      const sessA = mockA.state.sessions.get(mockA.state.lastSessionId)!;
+      assert.ok(sessA.patchSizes.length >= 3);
+      assert.ok(sessA.patchSizes.every((s) => s > 0 && s <= 4 * 1024 * 1024));
+      assert.equal(sessA.monolithicPutSize, null);
+      assert.equal(sessA.committedDigest, resA.compressedDigest);
+      const assembledA = Buffer.concat(sessA.chunks);
+      assert.equal(assembledA.length, resA.compressedSize);
+      const extractedA = await parseTarFromTargzBuffer(assembledA);
+      assert.equal(extractedA.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await mockA.close();
+    }
+
+    // Case B: Small file (< 4 MiB) uses monolithic PUT with 0 PATCH requests
+    const smallPath = path.join(srcStreamDir, 'small.bin');
+    const smallBytes = crypto.randomBytes(128 * 1024);
+    await fs.writeFile(smallPath, smallBytes);
+    const mockB = await createMockRegistry({});
+    try {
+      const resB = await streamAndUploadOciLayer({
+        files: [{ fullPath: smallPath, relativePath: 'small.bin', size: smallBytes.length }],
+        uploadInitUrl: `${mockB.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+      });
+      const sessB = mockB.state.sessions.get(mockB.state.lastSessionId)!;
+      assert.equal(sessB.patchSizes.length, 0);
+      assert.ok(sessB.monolithicPutSize !== null && sessB.monolithicPutSize < 4 * 1024 * 1024);
+      assert.equal(sessB.committedDigest, resB.compressedDigest);
+      const extractedB = await parseTarFromTargzBuffer(Buffer.concat(sessB.chunks));
+      assert.equal(extractedB.get('small.bin')?.equals(smallBytes), true);
+    } finally {
+      await mockB.close();
+    }
+
+    // Case C: Adaptive chunk halving when server enforces stricter 1.00 MiB PATCH cap
+    const random45Path = path.join(srcStreamDir, 'random-4.5mb.bin');
+    const random45Bytes = crypto.randomBytes(4 * 1024 * 1024 + 512 * 1024);
+    await fs.writeFile(random45Path, random45Bytes);
+    const mockC = await createMockRegistry({
+      maxPatchBytes: 1024 * 1024,
+      expectedLimitLabel: '1.00MiB',
+    });
+    try {
+      const resC = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random45Path,
+            relativePath: 'random-4.5mb.bin',
+            size: random45Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${mockC.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+      });
+      const sessC = mockC.state.sessions.get(mockC.state.lastSessionId)!;
+      assert.ok(sessC.patchSizes.length >= 5);
+      assert.ok(sessC.patchSizes.every((s) => s > 0 && s <= 1024 * 1024));
+      assert.equal(sessC.committedDigest, resC.compressedDigest);
+      const extractedC = await parseTarFromTargzBuffer(Buffer.concat(sessC.chunks));
+      assert.equal(extractedC.get('random-4.5mb.bin')?.equals(random45Bytes), true);
+    } finally {
+      await mockC.close();
+    }
+
+    // Case D: Mid-upload HTTP 401 triggers token refresh and completes upload
+    const mockD = await createMockRegistry({ failChunk2With401Once: true });
+    let refreshCount = 0;
+    try {
+      const resD = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random45Path,
+            relativePath: 'random-4.5mb.bin',
+            size: random45Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${mockD.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        refreshToken: async () => {
+          refreshCount += 1;
+          return 'tok-refreshed';
+        },
+      });
+      assert.equal(refreshCount, 1);
+      assert.equal(resD.registryToken, 'tok-refreshed');
+      const sessD = mockD.state.sessions.get(mockD.state.lastSessionId)!;
+      assert.equal(sessD.committedDigest, resD.compressedDigest);
+    } finally {
+      await mockD.close();
+    }
+
+    // Case E: Mid-upload abort cancels cleanly and sends DELETE for upload session cleanup
+    const abortUploadCtrl = new AbortController();
+    const mockE = await createMockRegistry({
+      delaySecondPatchMs: 250,
+      onSecondPatchStart: () => abortUploadCtrl.abort(),
+    });
+    try {
+      await assert.rejects(
+        streamAndUploadOciLayer({
+          files: [
+            {
+              fullPath: random95Path,
+              relativePath: 'random-9.5mb.bin',
+              size: random95Bytes.length,
+            },
+          ],
+          uploadInitUrl: `${mockE.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+          registryToken: 'tok-initial',
+          signal: abortUploadCtrl.signal,
+        }),
+        (err: unknown) => Boolean(err && typeof err === 'object' && (err as Error).name === 'AbortError')
+      );
+      assert.equal(mockE.state.deletedCount, 1);
+    } finally {
+      await mockE.close();
+    }
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }

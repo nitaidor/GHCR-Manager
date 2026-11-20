@@ -13,12 +13,17 @@ const {
   sanitizeFolderName,
   writeStreamChunk,
 } = require('./streaming-tar.cjs');
+const {
+  BLOB_UPLOAD_CHUNK_BYTES,
+  MIN_ADAPTIVE_CHUNK_BYTES,
+  isChunkTooLargeResponse,
+  streamAndUploadOciLayer,
+} = require('./oci-upload.cjs');
 
 const activeLayerStreams = new Map();
 const activeTransfers = new Map();
 const activeTempFiles = new Set();
 const activeStagingDirs = new Set();
-const BLOB_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024; // 16 MiB per OCI PATCH request
 
 async function renameWithRetry(srcPath, destPath) {
   let lastErr = null;
@@ -743,7 +748,7 @@ app.whenReady().then(() => {
           throw new Error('ghcr.io blob upload response missing Location header.');
         }
 
-        sessionUrl = new URL(locationHeader, 'https://ghcr.io').toString();
+        sessionUrl = new URL(locationHeader, uploadInitUrl).toString();
 
         if (totalSize <= BLOB_UPLOAD_CHUNK_BYTES) {
           const singleBuf = Buffer.allocUnsafe(totalSize);
@@ -780,6 +785,7 @@ app.whenReady().then(() => {
         }
 
         const chunkBuf = Buffer.allocUnsafe(BLOB_UPLOAD_CHUNK_BYTES);
+        let activePatchLimit = BLOB_UPLOAD_CHUNK_BYTES;
         let offset = 0;
         let lastSentPct = -1;
 
@@ -787,7 +793,7 @@ app.whenReady().then(() => {
           if (abortController.signal.aborted) {
             throw createAbortError('Upload cancelled');
           }
-          const toRead = Math.min(BLOB_UPLOAD_CHUNK_BYTES, totalSize - offset);
+          const toRead = Math.min(activePatchLimit, totalSize - offset);
           const bytesRead = await readExactChunk(fileHandle, chunkBuf, toRead, offset);
           if (bytesRead === 0) {
             throw new Error('Unexpected end of temporary archive file while uploading.');
@@ -808,6 +814,16 @@ app.whenReady().then(() => {
 
           if (patchRes.status !== 202 && patchRes.status !== 201 && patchRes.status !== 204) {
             const bodyText = await patchRes.text().catch(() => '');
+            if (
+              isChunkTooLargeResponse(patchRes.status, bodyText) &&
+              bytesRead > MIN_ADAPTIVE_CHUNK_BYTES
+            ) {
+              activePatchLimit = Math.max(
+                MIN_ADAPTIVE_CHUNK_BYTES,
+                Math.floor(bytesRead / 2)
+              );
+              continue;
+            }
             throw new Error(
               `Failed to upload layer chunk at byte ${offset} (HTTP ${patchRes.status}): ${bodyText}`
             );
@@ -862,6 +878,81 @@ app.whenReady().then(() => {
         if (fileHandle) {
           await fileHandle.close().catch(() => {});
         }
+      }
+    }
+  );
+
+  ipcMain.handle(
+    'desktop:streamAndUploadOciLayer',
+    async (
+      event,
+      {
+        files,
+        uploadInitUrl,
+        registryToken,
+        basicAuthHeader,
+        scopeParam,
+        requestId,
+      }
+    ) => {
+      const abortController = new AbortController();
+      if (requestId) activeTransfers.set(requestId, abortController);
+      let lastSentPct = -1;
+      let lastSentUploadedBytes = -1;
+
+      try {
+        const result = await streamAndUploadOciLayer({
+          files,
+          uploadInitUrl,
+          registryToken,
+          refreshToken:
+            basicAuthHeader && scopeParam
+              ? () => refreshGhcrTokenNode(basicAuthHeader, scopeParam)
+              : undefined,
+          fetchFn: fetchWithSafeRedirects,
+          signal: abortController.signal,
+          onProgress: ({ processedBytes, totalBytes, uploadedBytes, percent }) => {
+            const scaledPct = 10 + Math.round((percent / 100) * 76); // 10% -> 86%
+            if (
+              requestId &&
+              (scaledPct !== lastSentPct || uploadedBytes !== lastSentUploadedBytes)
+            ) {
+              lastSentPct = scaledPct;
+              lastSentUploadedBytes = uploadedBytes;
+              const message =
+                totalBytes > 0
+                  ? `Streaming & uploading layer (${formatBytesNode(processedBytes)} / ${formatBytesNode(totalBytes)}, ${formatBytesNode(uploadedBytes)} sent)...`
+                  : `Streaming & uploading layer (${formatBytesNode(uploadedBytes)} sent)...`;
+              event.sender.send('desktop:transferProgress', {
+                requestId,
+                stage: 'uploading-layer',
+                message,
+                percent: scaledPct,
+              });
+            }
+          },
+        });
+
+        if (requestId) {
+          event.sender.send('desktop:transferProgress', {
+            requestId,
+            stage: 'uploading-layer',
+            message: `Uploaded compressed image layer (${formatBytesNode(result.compressedSize)})`,
+            percent: 88,
+          });
+        }
+
+        return {
+          uncompressedDigest: result.uncompressedDigest,
+          compressedDigest: result.compressedDigest,
+          compressedSize: result.compressedSize,
+          totalFileBytes: result.totalFileBytes,
+          fileCount: result.fileCount,
+          fileMetaList: result.fileMetaList,
+          registryToken: result.registryToken,
+        };
+      } finally {
+        if (requestId) activeTransfers.delete(requestId);
       }
     }
   );

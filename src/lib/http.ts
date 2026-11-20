@@ -94,6 +94,28 @@ declare global {
         compressedSize: number;
         requestId?: string;
       }) => Promise<{ registryToken?: string }>;
+      streamAndUploadOciLayer?: (opts: {
+        files: Array<{
+          fullPath: string;
+          relativePath: string;
+          size?: number;
+          mtime?: number;
+          isDirectory?: boolean;
+        }>;
+        uploadInitUrl: string;
+        registryToken: string;
+        basicAuthHeader?: string;
+        scopeParam?: string;
+        requestId?: string;
+      }) => Promise<{
+        uncompressedDigest: string;
+        compressedDigest: string;
+        compressedSize: number;
+        totalFileBytes: number;
+        fileCount: number;
+        fileMetaList: Array<{ path: string; size: number; isDirectory?: boolean }>;
+        registryToken?: string;
+      }>;
       deleteTempFile?: (tempPath: string) => Promise<void>;
       prepareExtractDestination?: (opts: {
         defaultFolderName: string;
