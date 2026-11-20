@@ -5913,17 +5913,17 @@ export default function App() {
               </div>
 
               <div className="p-5 space-y-4">
-                <div className="p-3.5 rounded-md theme-error-banner text-xs leading-relaxed">
+                <div className="p-3.5 rounded-md theme-error-banner text-xs leading-relaxed break-words">
                   {isPackageDelete ? (
                     <>
                       Are you sure you want to permanently remove the entire package{' '}
-                      <strong className="font-mono break-all">{pkgName}</strong> and all of its versions from GitHub Packages?
+                      <strong className="font-mono break-words">{pkgName}</strong> and all of its versions from GitHub Packages?
                     </>
                   ) : (
                     <>
                       <div>Are you sure you want to permanently remove:</div>
                       <div>
-                        <strong className="font-mono break-all">
+                        <strong className="font-mono break-words">
                           {pkgName}
                           {info?.pullSuffix}
                         </strong>
@@ -5931,7 +5931,7 @@ export default function App() {
                       {siblingCount <= 1 && (
                         <span className="block mt-1.5">
                           Since this is the only version remaining, this will permanently delete package{' '}
-                          <strong className="font-mono break-all">{pkgName}</strong> from GitHub Packages.
+                          <strong className="font-mono break-words">{pkgName}</strong> from GitHub Packages.
                         </span>
                       )}
                     </>
