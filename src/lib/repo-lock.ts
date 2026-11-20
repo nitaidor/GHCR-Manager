@@ -16,9 +16,35 @@ export interface RepoLockRepoTarget {
   id: number;
   name: string;
   full_name: string;
+  hasCommits?: boolean;
+  permissions?: {
+    push?: boolean;
+  };
   owner: {
     login: string;
   };
+}
+
+/**
+ * Resolves a deterministic, account-wide lock repository for per-package locks (`pkg-<name>`)
+ * by picking the lowest-ID selectable (non-empty, push-enabled) repository owned by
+ * `targetOwnerLogin` (defaulting to `fallbackRepo.owner.login`), falling back to `fallbackRepo`.
+ */
+export function resolveCanonicalOwnerLockRepo<T extends RepoLockRepoTarget>(
+  repos: readonly T[],
+  fallbackRepo: T,
+  targetOwnerLogin?: string
+): T {
+  const ownerLower = (targetOwnerLogin || fallbackRepo.owner.login).trim().toLowerCase();
+  let best: T | null = null;
+  for (const r of repos) {
+    if (r.owner.login.trim().toLowerCase() !== ownerLower) continue;
+    if (r.hasCommits === false || r.permissions?.push === false) continue;
+    if (!best || r.id < best.id) {
+      best = r;
+    }
+  }
+  return best || fallbackRepo;
 }
 
 export interface RepoLockLeasePayload {

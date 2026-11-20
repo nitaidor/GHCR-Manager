@@ -107,6 +107,7 @@ import {
   acquireRepoIndexLock,
   acquireRepoLock,
   acquireRepoPackageLocks,
+  resolveCanonicalOwnerLockRepo,
   type ActiveRepoLock,
   type ActiveRepoLockBundle,
   type RepoLockWaitInfo,
@@ -231,7 +232,7 @@ export default function App() {
         return {
           darkTheme: parsed.darkTheme || 'default',
           lightTheme: parsed.lightTheme || 'default',
-          clockFormat: parsed.clockFormat === '12h' ? '12h' : '24h',
+          clockFormat: parsed.clockFormat === '24h' ? '24h' : '12h',
           dateFormat: VALID_DATE_FORMATS.includes(parsed.dateFormat)
             ? parsed.dateFormat
             : 'YYYY-MM-DD',
@@ -243,7 +244,7 @@ export default function App() {
     return {
       darkTheme: 'default',
       lightTheme: 'default',
-      clockFormat: '24h',
+      clockFormat: '12h',
       dateFormat: 'YYYY-MM-DD',
     };
   });
@@ -1726,8 +1727,13 @@ export default function App() {
         percent: 2,
       });
 
+      const pkgLockRepo = resolveCanonicalOwnerLockRepo(
+        repos,
+        selectedRepo,
+        modalLivePkg?.owner.login || selectedRepo.owner.login
+      );
       pkgLock = await acquireRepoLock({
-        repo: selectedRepo,
+        repo: pkgLockRepo,
         githubToken: authToken,
         ownerLogin: user.login,
         lockKey: getPackageLockKey(targetPkgName),
@@ -2541,8 +2547,13 @@ export default function App() {
         percent: 0,
       });
 
+      const pkgLockRepo = resolveCanonicalOwnerLockRepo(
+        repos,
+        selectedRepo,
+        selectedRepo.owner.login
+      );
       lockBundle = await acquireRepoPackageLocks({
-        repo: selectedRepo,
+        repo: pkgLockRepo,
         githubToken: authToken,
         ownerLogin: user.login,
         packageNames: activePkgNames,
@@ -2649,6 +2660,30 @@ export default function App() {
           freshByPkgName[plan.ociName]?.packageItem?.owner.type ||
           plan.packageOwnerType,
       }));
+
+      const batchTagCollisions: string[] = [];
+      for (const plan of resolvedPlans) {
+        const replaceIdSet = new Set(plan.replaceVersions.map((v) => v.id));
+        const liveVersions = freshByPkgName[plan.ociName]?.versions || [];
+        const collides = liveVersions.some(
+          (v) =>
+            !replaceIdSet.has(v.id) &&
+            (v.metadata?.container?.tags || []).includes(plan.tag)
+        );
+        if (collides) {
+          batchTagCollisions.push(`${plan.ociName}:${plan.tag}`);
+        }
+      }
+      if (batchTagCollisions.length > 0) {
+        await lockBundle.releaseAll();
+        lockBundle = null;
+        setSyncModalError(
+          `Tag collision detected for ${batchTagCollisions.join(
+            ', '
+          )}. Please enter a new tag or tick the existing version to replace it, then click Sync again.`
+        );
+        return;
+      }
 
       for (let i = 0; i < resolvedPlans.length; i++) {
         if (abortCtrl.signal.aborted) {
@@ -3469,13 +3504,14 @@ export default function App() {
     const isOtherPkg = otherPackages.some(
       (p) => p.name.toLowerCase() === pkgKey
     );
-    const shouldLockPkg = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
+    const shouldLockPkg = !isRepoIndexPackageName(pkg.name);
+    const shouldUpdateSelectedIndex = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
     let pkgLock: ActiveRepoLock | null = null;
 
     try {
       if (shouldLockPkg) {
         pkgLock = await acquireRepoLock({
-          repo: selectedRepo,
+          repo: resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login),
           githubToken: authToken,
           ownerLogin: user.login,
           lockKey: getPackageLockKey(pkg.name),
@@ -3520,10 +3556,12 @@ export default function App() {
             delete next[vKey];
             return next;
           });
-          await enqueueRepoIndexMutation({
-            repo: selectedRepo,
-            ...(liveState.exists ? { removeKeys: [vKey] } : { removePkgNames: [pkg.name] }),
-          });
+          if (shouldUpdateSelectedIndex) {
+            await enqueueRepoIndexMutation({
+              repo: selectedRepo,
+              ...(liveState.exists ? { removeKeys: [vKey] } : { removePkgNames: [pkg.name] }),
+            });
+          }
           await refreshPackages();
           return;
         }
@@ -3541,7 +3579,7 @@ export default function App() {
           pkg,
           `Removed "${pkg.name}" (last remaining version deleted) from GitHub Packages.`
         );
-        if (shouldLockPkg) {
+        if (shouldUpdateSelectedIndex) {
           await enqueueRepoIndexMutation({
             repo: selectedRepo,
             removePkgNames: [pkg.name],
@@ -3563,7 +3601,7 @@ export default function App() {
             text: `Removed version "${pkg.name}${info.pullSuffix}" from GitHub Packages.`,
           },
         }));
-        if (shouldLockPkg) {
+        if (shouldUpdateSelectedIndex) {
           await enqueueRepoIndexMutation({
             repo: selectedRepo,
             removeKeys: [vKey],
@@ -3591,7 +3629,8 @@ export default function App() {
     const isOtherPkg = otherPackages.some(
       (p) => p.name.toLowerCase() === pkgKey
     );
-    const shouldLockPkg = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
+    const shouldLockPkg = !isRepoIndexPackageName(pkg.name);
+    const shouldUpdateSelectedIndex = !isOtherPkg && !isRepoIndexPackageName(pkg.name);
     const beforeVersions = packageVersionsMap[pkgKey] || [];
     setDeletingPkgName(pkg.name);
     setConfirmDeletePkg(null);
@@ -3599,7 +3638,7 @@ export default function App() {
     try {
       if (shouldLockPkg) {
         pkgLock = await acquireRepoLock({
-          repo: selectedRepo,
+          repo: resolveCanonicalOwnerLockRepo(repos, selectedRepo, pkg.owner.login),
           githubToken: authToken,
           ownerLogin: user.login,
           lockKey: getPackageLockKey(pkg.name),
@@ -3636,10 +3675,12 @@ export default function App() {
             pkg,
             `Removed package "${pkg.name}" from GitHub Packages.`
           );
-          await enqueueRepoIndexMutation({
-            repo: selectedRepo,
-            removePkgNames: [pkg.name],
-          });
+          if (shouldUpdateSelectedIndex) {
+            await enqueueRepoIndexMutation({
+              repo: selectedRepo,
+              removePkgNames: [pkg.name],
+            });
+          }
           await refreshPackages();
           return;
         }
@@ -3671,7 +3712,7 @@ export default function App() {
         pkg,
         `Removed package "${pkg.name}" from GitHub Packages.`
       );
-      if (shouldLockPkg) {
+      if (shouldUpdateSelectedIndex) {
         await enqueueRepoIndexMutation({
           repo: selectedRepo,
           removePkgNames: [pkg.name],
@@ -3781,9 +3822,6 @@ export default function App() {
                         </span>
                       )
                     )}
-                  </div>
-                  <div className="text-[11px] text-gray-400">
-                    Fine-grained PATs must grant <code>Contents: Read and write</code> and <code>Packages: Read and write</code>.
                   </div>
                   <a
                     href={tokenGenUrl}
@@ -5430,6 +5468,13 @@ export default function App() {
                                   const isDetailsExpanded =
                                     expandedVersionKeys.has(vKey) || hasMatchingInnerFile;
                                   const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.pullSuffix}`;
+                                  const displayPullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.displayPullSuffix}`;
+                                  const fullVersionTitle = info.isUntagged
+                                    ? `${pkg.name} (untagged · ${version.name})`
+                                    : `${pkg.name}:${info.tags.join(', ')}`;
+                                  const displayVersionTitle = info.isUntagged
+                                    ? `${pkg.name} (untagged · ${info.shortDigest})`
+                                    : `${pkg.name}:${info.shortTagsLabel}`;
                                   const uploadedAt = version.created_at
                                     ? formatDisplayDateTime(
                                         version.created_at,
@@ -5441,22 +5486,25 @@ export default function App() {
                                   return (
                                     <div key={version.id} className={versionCardClass}>
                                       <div className="flex flex-wrap items-start justify-between gap-3">
-                                        <div className="space-y-1 min-w-0">
-                                          <div className="flex items-center gap-2 flex-wrap">
-                                            <code className="text-xs font-bold text-white font-mono break-all">
-                                              {info.isUntagged
-                                                ? `${pkg.name} (untagged · ${info.shortDigest})`
-                                                : `${pkg.name}:${info.tags.join(', ')}`}
+                                        <div className="space-y-1 min-w-0 flex-1">
+                                          <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                            <code
+                                              className="text-xs font-bold text-white font-mono truncate max-w-full"
+                                              title={fullVersionTitle}
+                                            >
+                                              {displayVersionTitle}
                                             </code>
                                             {uploadedAt && (
-                                              <span className="text-[11px] text-gray-500">
+                                              <span className="text-[11px] text-gray-500 shrink-0">
                                                 {uploadedAt}
                                               </span>
                                             )}
                                           </div>
 
-                                          <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
-                                            <span className="break-all">{pullCmd}</span>
+                                          <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono min-w-0">
+                                            <span className="truncate" title={pullCmd}>
+                                              {displayPullCmd}
+                                            </span>
                                             <button
                                               type="button"
                                               onClick={() => copyToClipboard(pullCmd)}
@@ -5926,16 +5974,17 @@ export default function App() {
               </div>
 
               <div className="p-5 space-y-4">
-                <div className="p-3.5 rounded-md theme-warning-banner text-xs leading-relaxed">
-                  A folder named{' '}
-                  <strong className="font-mono break-all">
-                    {extractConflict.folderName}
-                  </strong>{' '}
-                  already exists inside{' '}
-                  <span className="font-mono break-all">
+                <div className="p-3.5 rounded-md theme-warning-banner text-xs leading-relaxed space-y-1">
+                  <div>
+                    A folder named{' '}
+                    <strong className="font-mono break-all">
+                      {extractConflict.folderName}
+                    </strong>{' '}
+                    already exists inside:
+                  </div>
+                  <div className="font-mono break-all">
                     {extractConflict.parentDir}
-                  </span>
-                  .
+                  </div>
                 </div>
 
                 <p className="text-xs text-gray-300 leading-relaxed">

@@ -169,11 +169,16 @@ export const VersionFileDetailsPanel: React.FC<VersionFileDetailsPanelProps> = (
           </span>
         )}
         <span>
-          Layer Size:{' '}
+          Image Size:{' '}
           <strong className="text-gray-200">
             {formatBytes(details.compressedSize)}
-          </strong>{' '}
-          (Uncompressed: {formatBytes(details.totalUncompressedBytes)})
+          </strong>
+        </span>
+        <span>
+          Uncompressed:{' '}
+          <strong className="text-gray-200">
+            {formatBytes(details.totalUncompressedBytes)}
+          </strong>
         </span>
       </div>
 

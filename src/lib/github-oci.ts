@@ -17,9 +17,12 @@ import {
   formatUniqueRepoIndexTag,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
+  getVersionReferenceInfo,
+  MAX_DISPLAY_TAG_CHARS,
   REPO_INDEX_KEEP_VERSIONS,
   REPO_INDEX_MODE,
   toOciImageName,
+  truncateTagForDisplay,
   type ClockFormat,
   type DateFormat,
 } from './naming';
@@ -107,25 +110,7 @@ export interface GitHubAuthInfo {
   oauthScopes: string[] | null;
 }
 
-export function getVersionReferenceInfo(version: GitHubPackageVersion): {
-  tags: string[];
-  primaryTag: string;
-  isUntagged: boolean;
-  shortDigest: string;
-  inspectRef: string;
-  pullSuffix: string;
-} {
-  const tags = (version.metadata?.container?.tags || []).filter(Boolean);
-  const primaryTag = tags[0] || '';
-  const isUntagged = tags.length === 0;
-  const digest = version.name || '';
-  const shortDigest = digest.startsWith('sha256:')
-    ? `${digest.slice(0, 19)}…`
-    : digest.slice(0, 16);
-  const inspectRef = digest.startsWith('sha256:') ? digest : primaryTag || digest;
-  const pullSuffix = primaryTag ? `:${primaryTag}` : `@${digest}`;
-  return { tags, primaryTag, isUntagged, shortDigest, inspectRef, pullSuffix };
-}
+export { getVersionReferenceInfo, MAX_DISPLAY_TAG_CHARS, truncateTagForDisplay };
 
 export interface OciManifestFileMeta {
   path: string;

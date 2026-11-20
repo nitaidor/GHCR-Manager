@@ -848,10 +848,17 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
                                 />
                                 <div className="min-w-0">
                                   <div className="flex items-center gap-2 flex-wrap">
-                                    <code className="text-[11px] font-mono font-semibold text-white break-all">
+                                    <code
+                                      className="text-[11px] font-mono font-semibold text-white truncate max-w-full"
+                                      title={
+                                        info.isUntagged
+                                          ? `${entry.ociName} (untagged · ${version.name})`
+                                          : `${entry.ociName}:${info.tags.join(', ')}`
+                                      }
+                                    >
                                       {info.isUntagged
                                         ? `${entry.ociName} (untagged · ${info.shortDigest})`
-                                        : `${entry.ociName}:${info.tags.join(', ')}`}
+                                        : `${entry.ociName}:${info.shortTagsLabel}`}
                                     </code>
                                     {isChecked && (
                                       <span className="text-[10px] px-1.5 py-0.5 rounded status-badge-warning font-semibold">

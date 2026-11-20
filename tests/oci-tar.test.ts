@@ -14,7 +14,9 @@ import {
   getPackageLockKey,
   getRepoIndexDisplayTitle,
   getRepoIndexPackageName,
+  getVersionReferenceInfo,
   isRepoIndexPackageName,
+  MAX_DISPLAY_TAG_CHARS,
   toGitRefSafeLockSegment,
   toOciImageName,
   validateFilesSelectionName,
@@ -24,6 +26,7 @@ import {
   acquireRepoIndexLock,
   acquireRepoLock,
   acquireRepoPackageLocks,
+  resolveCanonicalOwnerLockRepo,
   type HttpRequestFn,
 } from '../src/lib/repo-lock.ts';
 import {
@@ -662,13 +665,13 @@ async function runTests() {
 
     console.log('11. Testing formatDisplayDateTime across all DateFormat and ClockFormat settings...');
     const sampleDisplayDate = new Date(2026, 10, 20, 0, 26, 18); // 2026-11-20 00:26:18 local
-    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'YYYY-MM-DD'), '2026-11-20, 00:26:18');
-    assert.equal(formatDisplayDateTime(sampleDisplayDate, '12h', 'YYYY-MM-DD'), '2026-11-20, 12:26:18 AM');
-    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'YY-MM-DD'), '26-11-20, 00:26:18');
-    assert.equal(formatDisplayDateTime(sampleDisplayDate, '12h', 'DD-MM-YYYY'), '20-11-2026, 12:26:18 AM');
-    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'DD-MM-YY'), '20-11-26, 00:26:18');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'YYYY-MM-DD'), '2026/11/20, 00:26:18');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '12h', 'YYYY-MM-DD'), '2026/11/20, 12:26:18 AM');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'YY-MM-DD'), '26/11/20, 00:26:18');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '12h', 'DD-MM-YYYY'), '20/11/2026, 12:26:18 AM');
+    assert.equal(formatDisplayDateTime(sampleDisplayDate, '24h', 'DD-MM-YY'), '20/11/26, 00:26:18');
     const sampleAfternoon = new Date(2026, 10, 20, 15, 4, 9);
-    assert.equal(formatDisplayDateTime(sampleAfternoon, '12h', 'DD-MM-YY'), '20-11-26, 03:04:09 PM');
+    assert.equal(formatDisplayDateTime(sampleAfternoon, '12h', 'DD-MM-YY'), '20/11/26, 03:04:09 PM');
     assert.equal(formatDisplayDateTime('not-a-date', '24h', 'YYYY-MM-DD'), '');
 
     console.log('12. Testing cancel + immediate re-upload lock race & 2-phase fencing...');
@@ -945,6 +948,126 @@ async function runTests() {
     } finally {
       srv.close();
     }
+
+    console.log('14. Testing getVersionReferenceInfo display truncation vs full pull command...');
+    const fullDigest = 'sha256:37f5d6a6c659264e400da52d8888362c6cdf288235f9e0aa8b063c6310e982c9';
+    const untaggedRef = getVersionReferenceInfo({
+      name: fullDigest,
+      metadata: { container: { tags: [] } },
+    });
+    assert.equal(untaggedRef.isUntagged, true);
+    assert.equal(untaggedRef.pullSuffix, `@${fullDigest}`);
+    assert.equal(untaggedRef.shortDigest, 'sha256:37f5d6a6c659…');
+    assert.equal(untaggedRef.displayPullSuffix, '@sha256:37f5d6a6c659…');
+
+    const longTag = 'very-long-custom-tag-name-that-definitely-exceeds-twenty-eight-characters';
+    const taggedRef = getVersionReferenceInfo({
+      name: fullDigest,
+      metadata: { container: { tags: [longTag] } },
+    });
+    assert.equal(taggedRef.isUntagged, false);
+    assert.equal(taggedRef.pullSuffix, `:${longTag}`);
+    assert.equal(taggedRef.shortTagsLabel, `${longTag.slice(0, MAX_DISPLAY_TAG_CHARS)}…`);
+    assert.equal(taggedRef.displayPullSuffix, `:${longTag.slice(0, MAX_DISPLAY_TAG_CHARS)}…`);
+
+    console.log('15. Testing resolveCanonicalOwnerLockRepo across different selected repositories...');
+    const repoOldestEmpty = {
+      id: 10,
+      name: 'empty-oldest',
+      full_name: 'alice/empty-oldest',
+      hasCommits: false,
+      permissions: { push: true },
+      owner: { login: 'alice' },
+    };
+    const repoOtherOwnerOldest = {
+      id: 20,
+      name: 'org-repo',
+      full_name: 'acme/org-repo',
+      hasCommits: true,
+      permissions: { push: true },
+      owner: { login: 'acme' },
+    };
+    const repoReadOnlyOlder = {
+      id: 30,
+      name: 'readonly-repo',
+      full_name: 'alice/readonly-repo',
+      hasCommits: true,
+      permissions: { push: false },
+      owner: { login: 'alice' },
+    };
+    const repoCanonical = {
+      id: 42,
+      name: 'demo',
+      full_name: 'alice/demo',
+      hasCommits: true,
+      permissions: { push: true },
+      owner: { login: 'alice' },
+    };
+    const repoB = {
+      id: 105,
+      name: 'repo-b',
+      full_name: 'alice/repo-b',
+      hasCommits: true,
+      permissions: { push: true },
+      owner: { login: 'alice' },
+    };
+    const repoC = {
+      id: 200,
+      name: 'repo-c',
+      full_name: 'alice/repo-c',
+      hasCommits: true,
+      permissions: { push: true },
+      owner: { login: 'alice' },
+    };
+    const allRepos = [repoC, repoReadOnlyOlder, repoCanonical, repoOtherOwnerOldest, repoOldestEmpty, repoB];
+    // PC1 selects Repo B while PC2 selects Repo C -> both resolve to repoCanonical (`alice/demo`)
+    const lockRepoPc1 = resolveCanonicalOwnerLockRepo(allRepos, repoB, 'alice');
+    const lockRepoPc2 = resolveCanonicalOwnerLockRepo(allRepos, repoC, 'alice');
+    assert.equal(lockRepoPc1.id, 42);
+    assert.equal(lockRepoPc2.id, 42);
+
+    // Verify PC1 (Repo B selected) and PC2 (Repo C selected) contend on the exact same lock ref
+    let crossRepoActive = 0;
+    let crossRepoMax = 0;
+    await Promise.all([
+      acquireRepoLock({
+        repo: lockRepoPc1,
+        githubToken: 'tok',
+        ownerLogin: 'alice',
+        lockKey: getPackageLockKey('shared-cross-repo'),
+        packageName: 'shared-cross-repo',
+        operation: 'upload',
+        sessionId: 'pc1-repoB',
+        confirmSettleMs: 25,
+        pollIntervalMs: 25,
+        httpRequest: racyHttp,
+      }).then(async (lock) => {
+        crossRepoActive += 1;
+        crossRepoMax = Math.max(crossRepoMax, crossRepoActive);
+        await new Promise((r) => setTimeout(r, 60));
+        crossRepoActive -= 1;
+        await lock.release();
+      }),
+      acquireRepoLock({
+        repo: lockRepoPc2,
+        githubToken: 'tok',
+        ownerLogin: 'alice',
+        lockKey: getPackageLockKey('shared-cross-repo'),
+        packageName: 'shared-cross-repo',
+        operation: 'upload',
+        sessionId: 'pc2-repoC',
+        confirmSettleMs: 25,
+        pollIntervalMs: 25,
+        httpRequest: racyHttp,
+      }).then(async (lock) => {
+        crossRepoActive += 1;
+        crossRepoMax = Math.max(crossRepoMax, crossRepoActive);
+        await new Promise((r) => setTimeout(r, 60));
+        crossRepoActive -= 1;
+        await lock.release();
+      }),
+    ]);
+    assert.equal(crossRepoMax, 1);
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }

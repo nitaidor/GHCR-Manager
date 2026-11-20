@@ -15,7 +15,7 @@ export type DateFormat = 'YYYY-MM-DD' | 'YY-MM-DD' | 'DD-MM-YYYY' | 'DD-MM-YY';
 
 const OCI_TAG_REGEX = /^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$/;
 
-function formatDatePart(date: Date, dateFormat: DateFormat): string {
+function formatDatePart(date: Date, dateFormat: DateFormat, sep = '-'): string {
   const fullYear = String(date.getFullYear());
   const shortYear = fullYear.slice(-2);
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -23,14 +23,14 @@ function formatDatePart(date: Date, dateFormat: DateFormat): string {
 
   switch (dateFormat) {
     case 'YY-MM-DD':
-      return `${shortYear}-${month}-${day}`;
+      return `${shortYear}${sep}${month}${sep}${day}`;
     case 'DD-MM-YYYY':
-      return `${day}-${month}-${fullYear}`;
+      return `${day}${sep}${month}${sep}${fullYear}`;
     case 'DD-MM-YY':
-      return `${day}-${month}-${shortYear}`;
+      return `${day}${sep}${month}${sep}${shortYear}`;
     case 'YYYY-MM-DD':
     default:
-      return `${fullYear}-${month}-${day}`;
+      return `${fullYear}${sep}${month}${sep}${day}`;
   }
 }
 
@@ -43,7 +43,7 @@ export function formatTimestampTag(
   clockFormat: ClockFormat = '24h',
   dateFormat: DateFormat = 'YYYY-MM-DD'
 ): string {
-  const datePart = formatDatePart(date, dateFormat);
+  const datePart = formatDatePart(date, dateFormat, '-');
   const h24 = date.getHours();
   const min = String(date.getMinutes()).padStart(2, '0');
   const sec = String(date.getSeconds()).padStart(2, '0');
@@ -62,7 +62,7 @@ export function formatTimestampTag(
 
 /**
  * Formats a Date or ISO timestamp for human-readable UI display using the user's
- * configured DateFormat and ClockFormat settings.
+ * configured DateFormat and ClockFormat settings (using '/' date separators).
  */
 export function formatDisplayDateTime(
   dateInput: Date | string | number,
@@ -72,7 +72,7 @@ export function formatDisplayDateTime(
   const date = dateInput instanceof Date ? dateInput : new Date(dateInput);
   if (Number.isNaN(date.getTime())) return '';
 
-  const datePart = formatDatePart(date, dateFormat);
+  const datePart = formatDatePart(date, dateFormat, '/');
   const h24 = date.getHours();
   const min = String(date.getMinutes()).padStart(2, '0');
   const sec = String(date.getSeconds()).padStart(2, '0');
@@ -322,4 +322,59 @@ export function getRepoIndexDisplayTitle(repoName: string): string {
 
 export function isRepoIndexPackageName(pkgName: string): boolean {
   return pkgName.toLowerCase().startsWith(REPO_INDEX_PACKAGE_PREFIX);
+}
+
+export const MAX_DISPLAY_TAG_CHARS = 28;
+
+export function truncateTagForDisplay(
+  text: string,
+  maxChars = MAX_DISPLAY_TAG_CHARS
+): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}…`;
+}
+
+export function getVersionReferenceInfo(version: {
+  name?: string;
+  metadata?: {
+    container?: {
+      tags?: string[];
+    };
+  };
+}): {
+  tags: string[];
+  primaryTag: string;
+  shortTagsLabel: string;
+  isUntagged: boolean;
+  shortDigest: string;
+  inspectRef: string;
+  pullSuffix: string;
+  displayPullSuffix: string;
+} {
+  const tags = (version.metadata?.container?.tags || []).filter(Boolean);
+  const primaryTag = tags[0] || '';
+  const fullTagsLabel = tags.join(', ');
+  const shortTagsLabel = truncateTagForDisplay(fullTagsLabel);
+  const isUntagged = tags.length === 0;
+  const digest = version.name || '';
+  const shortDigest = digest.startsWith('sha256:')
+    ? `${digest.slice(0, 19)}…`
+    : digest.length > 16
+    ? `${digest.slice(0, 16)}…`
+    : digest;
+  const inspectRef = digest.startsWith('sha256:') ? digest : primaryTag || digest;
+  const pullSuffix = primaryTag ? `:${primaryTag}` : `@${digest}`;
+  const displayPullSuffix = primaryTag
+    ? `:${truncateTagForDisplay(primaryTag)}`
+    : `@${shortDigest}`;
+  return {
+    tags,
+    primaryTag,
+    shortTagsLabel,
+    isUntagged,
+    shortDigest,
+    inspectRef,
+    pullSuffix,
+    displayPullSuffix,
+  };
 }
