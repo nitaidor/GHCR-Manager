@@ -24,6 +24,7 @@ import {
 import {
   formatDisplayDateTime,
   formatTimestampTag,
+  truncateTagForDisplay,
   validateOciTag,
   type ClockFormat,
   type DateFormat,
@@ -240,7 +241,10 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 min-w-0">
               <Package className="w-5 h-5 icon-upload shrink-0" />
-              <h3 className="text-base font-bold text-white truncate">
+              <h3
+                className="text-base font-bold text-white truncate"
+                title={packageName}
+              >
                 Create Image &quot;{packageName}&quot;
               </h3>
             </div>
@@ -329,6 +333,7 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
               const isScanning = inspectingKey === stateKey;
               const isExpanded = expandedKeys.has(stateKey);
               const isChecked = selectedReplaceIds.has(version.id);
+              const shortPkgName = truncateTagForDisplay(packageName, 28);
               const createdLabel = version.created_at
                 ? formatDisplayDateTime(version.created_at, clockFormat, dateFormat)
                 : '';
@@ -372,8 +377,8 @@ export const UploadVersionModal: React.FC<UploadVersionModalProps> = ({
                             }
                           >
                             {info.isUntagged
-                              ? `${packageName} (untagged · ${info.shortDigest})`
-                              : `${packageName}:${info.shortTagsLabel}`}
+                              ? `${shortPkgName} (untagged · ${info.shortDigest})`
+                              : `${shortPkgName}:${info.shortTagsLabel}`}
                           </code>
                           {isChecked && (
                             <span className="text-[10px] px-1.5 py-0.5 rounded status-badge-warning inline-flex items-center gap-1 font-semibold">

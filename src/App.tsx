@@ -100,6 +100,7 @@ import {
   isRepoIndexPackageName,
   REPO_INDEX_KEEP_VERSIONS,
   toOciImageName,
+  truncateTagForDisplay,
   validateFilesSelectionName,
   type DateFormat,
 } from './lib/naming';
@@ -5361,6 +5362,8 @@ export default function App() {
                         headerMetaNote?: string;
                       }) => {
                         const pkgKey = pkg.name.toLowerCase();
+                        const shortPkgHeaderName = truncateTagForDisplay(pkg.name, 36);
+                        const shortPkgVersionName = truncateTagForDisplay(pkg.name, 28);
                         const settingsUrl = `${pkg.html_url}/settings`;
                         const outerCardClass = isIndexCard
                           ? 'p-4 rounded-md theme-index-card space-y-3'
@@ -5372,20 +5375,29 @@ export default function App() {
                         return (
                           <div key={pkg.id} className={outerCardClass}>
                             <div className="flex flex-wrap items-center justify-between gap-3">
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <Package className="w-4 h-4 icon-packages" />
+                              <div className="flex items-center gap-2 flex-wrap min-w-0 flex-1">
+                                <Package className="w-4 h-4 icon-packages shrink-0" />
                                 {displayTitleOverride ? (
                                   <>
-                                    <span className="text-sm font-bold text-gray-300">
-                                      {displayTitleOverride}
+                                    <span
+                                      className="text-sm font-bold text-gray-300 truncate max-w-full"
+                                      title={displayTitleOverride}
+                                    >
+                                      {truncateTagForDisplay(displayTitleOverride, 40)}
                                     </span>
-                                    <span className="text-[11px] font-mono text-gray-400">
-                                      ({pkg.name})
+                                    <span
+                                      className="text-[11px] font-mono text-gray-400 truncate max-w-full"
+                                      title={pkg.name}
+                                    >
+                                      ({shortPkgHeaderName})
                                     </span>
                                   </>
                                 ) : (
-                                  <span className="text-sm font-bold text-white font-mono">
-                                    {pkg.name}
+                                  <span
+                                    className="text-sm font-bold text-white font-mono truncate max-w-full"
+                                    title={pkg.name}
+                                  >
+                                    {shortPkgHeaderName}
                                   </span>
                                 )}
                                 <span
@@ -5468,13 +5480,13 @@ export default function App() {
                                   const isDetailsExpanded =
                                     expandedVersionKeys.has(vKey) || hasMatchingInnerFile;
                                   const pullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.pullSuffix}`;
-                                  const displayPullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${pkg.name}${info.displayPullSuffix}`;
+                                  const displayPullCmd = `docker pull ghcr.io/${pkg.owner.login.toLowerCase()}/${shortPkgVersionName}${info.displayPullSuffix}`;
                                   const fullVersionTitle = info.isUntagged
                                     ? `${pkg.name} (untagged · ${version.name})`
                                     : `${pkg.name}:${info.tags.join(', ')}`;
                                   const displayVersionTitle = info.isUntagged
-                                    ? `${pkg.name} (untagged · ${info.shortDigest})`
-                                    : `${pkg.name}:${info.shortTagsLabel}`;
+                                    ? `${shortPkgVersionName} (untagged · ${info.shortDigest})`
+                                    : `${shortPkgVersionName}:${info.shortTagsLabel}`;
                                   const uploadedAt = version.created_at
                                     ? formatDisplayDateTime(
                                         version.created_at,

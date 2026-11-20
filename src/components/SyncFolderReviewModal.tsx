@@ -28,6 +28,7 @@ import type { DesktopRootFolderItem } from '../lib/http';
 import {
   formatDisplayDateTime,
   formatTimestampTag,
+  truncateTagForDisplay,
   validateOciTag,
   type ClockFormat,
   type DateFormat,
@@ -602,9 +603,13 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
                       )}
                       <div className="min-w-0 space-y-1">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <code className="text-xs font-mono font-bold text-white break-all">
-                            {entry.ociName}
-                            {!isSkipped && `:${val.resolvedTag || '...'}`}
+                          <code
+                            className="text-xs font-mono font-bold text-white truncate max-w-full"
+                            title={`${entry.ociName}${!isSkipped ? `:${val.resolvedTag || '...'}` : ''}`}
+                          >
+                            {truncateTagForDisplay(entry.ociName, 28)}
+                            {!isSkipped &&
+                              `:${truncateTagForDisplay(val.resolvedTag || '...')}`}
                           </code>
                           {!exists ? (
                             <span className="text-[10px] px-1.5 py-0.5 rounded status-badge-valid font-semibold">
@@ -857,8 +862,8 @@ export const SyncFolderReviewModal: React.FC<SyncFolderReviewModalProps> = ({
                                       }
                                     >
                                       {info.isUntagged
-                                        ? `${entry.ociName} (untagged · ${info.shortDigest})`
-                                        : `${entry.ociName}:${info.shortTagsLabel}`}
+                                        ? `${truncateTagForDisplay(entry.ociName, 28)} (untagged · ${info.shortDigest})`
+                                        : `${truncateTagForDisplay(entry.ociName, 28)}:${info.shortTagsLabel}`}
                                     </code>
                                     {isChecked && (
                                       <span className="text-[10px] px-1.5 py-0.5 rounded status-badge-warning font-semibold">
