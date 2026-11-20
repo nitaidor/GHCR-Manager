@@ -596,6 +596,7 @@ export async function buildAndPushOciImage(opts: {
   mode: 'single-file' | 'multi-file' | 'root-file' | 'root-subfolder' | 'repo-index';
   files?: TarInputFile[];
   desktopFiles?: DesktopStreamingInputFile[];
+  uploadTransferMode?: 'stream' | 'chunked';
   beforePublishManifest?: () => Promise<void>;
   onProgress?: (update: PushProgressUpdate) => void;
   signal?: AbortSignal;
@@ -715,6 +716,7 @@ export async function buildAndPushOciImage(opts: {
         registryToken,
         basicAuthHeader: `Basic ${toBase64(`${username}:${githubToken.trim()}`)}`,
         scopeParam: `repository:${ownerLower}/${ociPackageName}:pull,push`,
+        uploadMode: opts.uploadTransferMode === 'chunked' ? 'chunked' : 'stream',
         requestId,
       });
 

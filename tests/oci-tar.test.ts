@@ -1896,6 +1896,31 @@ async function runTests() {
     } finally {
       await streamMockG.close();
     }
+
+    // Case H: uploadMode='chunked' goes straight to 4 MiB chunked PATCH with 0 continuous attempts
+    const streamMockH = await createStreamingMockRegistry({});
+    try {
+      const resH = await streamAndUploadOciLayer({
+        files: [
+          {
+            fullPath: random95Path,
+            relativePath: 'random-9.5mb.bin',
+            size: random95Bytes.length,
+          },
+        ],
+        uploadInitUrl: `${streamMockH.baseUrl}/v2/alice/pkg/blobs/uploads/`,
+        registryToken: 'tok-initial',
+        uploadMode: 'chunked',
+      });
+      assert.equal(resH.uploadMode, 'chunked');
+      assert.equal(streamMockH.state.streamingAttempts, 0);
+      assert.ok(streamMockH.state.chunkedPatchCalls >= 3);
+      const sessH = streamMockH.state.sessions.get(streamMockH.state.lastCommittedSessionId)!;
+      const extractedH = await parseTarFromTargzBuffer(Buffer.concat(sessH.chunks));
+      assert.equal(extractedH.get('random-9.5mb.bin')?.equals(random95Bytes), true);
+    } finally {
+      await streamMockH.close();
+    }
   } finally {
     await fs.rm(tmpWorkDir, { recursive: true, force: true });
   }

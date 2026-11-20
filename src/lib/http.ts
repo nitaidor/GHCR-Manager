@@ -112,6 +112,7 @@ declare global {
         registryToken: string;
         basicAuthHeader?: string;
         scopeParam?: string;
+        uploadMode?: 'stream' | 'chunked';
         requestId?: string;
       }) => Promise<{
         uncompressedDigest: string;

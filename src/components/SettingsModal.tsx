@@ -9,9 +9,10 @@ import {
   RefreshCw,
   ExternalLink,
   Check,
+  Upload,
 } from 'lucide-react';
 import type { GitHubRepo } from '../lib/github-oci';
-import type { AppSettings } from './Header';
+import type { AppSettings, UploadTransferMode } from './Header';
 import {
   formatTimestampTag,
   type ClockFormat,
@@ -26,6 +27,7 @@ interface SettingsModalProps {
   isDarkMode: boolean;
   setIsDarkMode: (val: boolean) => void;
   isSignedIn: boolean;
+  isDesktopEnv?: boolean;
   repos: GitHubRepo[];
   selectedRepo: GitHubRepo | null;
   onSelectRepo: (repo: GitHubRepo) => void;
@@ -45,6 +47,23 @@ const CLOCK_FORMAT_OPTIONS: Array<{ value: ClockFormat; label: string; sample: s
   { value: '24h', label: '24-Hour', sample: '13.05.09' },
 ];
 
+const UPLOAD_TRANSFER_MODE_OPTIONS: Array<{
+  value: UploadTransferMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'stream',
+    label: 'Fast Stream',
+    description: 'Continuous stream with auto 4 MiB fallback (fastest)',
+  },
+  {
+    value: 'chunked',
+    label: 'Chunked (4 MiB)',
+    description: 'Best for slower/unstable networks or >10 min uploads',
+  },
+];
+
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
@@ -53,6 +72,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isDarkMode,
   setIsDarkMode,
   isSignedIn,
+  isDesktopEnv = false,
   repos,
   selectedRepo,
   onSelectRepo,
@@ -447,6 +467,78 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             </div>
           </section>
+
+          {/* Upload Transfer Mode Section */}
+          {(() => {
+            const effectiveTransferMode: UploadTransferMode = isDesktopEnv
+              ? settings.uploadTransferMode
+              : 'chunked';
+
+            return (
+              <section>
+                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-3 border-b border-[#30363d] pb-2">
+                  Uploads
+                </h3>
+                <div className="bg-[#0d1117] p-4 rounded-md border border-[#30363d]">
+                  <div className="flex items-center gap-2 mb-1">
+                    <Upload className="w-4 h-4 text-gray-400" />
+                    <p className="font-medium text-gray-200 text-sm">
+                      Upload Transfer Mode
+                    </p>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Choose how large image layers (&gt; 4 MiB) are uploaded to GitHub Packages.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {UPLOAD_TRANSFER_MODE_OPTIONS.map((opt) => {
+                      const isDisabled = !isDesktopEnv && opt.value === 'stream';
+                      const isActive = effectiveTransferMode === opt.value;
+
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          disabled={isDisabled}
+                          aria-disabled={isDisabled}
+                          title={
+                            isDisabled
+                              ? 'Fast Stream requires running GHCR Manager as a desktop application.'
+                              : undefined
+                          }
+                          onClick={() => {
+                            if (isDisabled) return;
+                            setSettings((prev) => ({
+                              ...prev,
+                              uploadTransferMode: opt.value,
+                            }));
+                          }}
+                          className={`p-2.5 text-left text-xs rounded border font-medium transition-colors flex flex-col gap-1 ${
+                            isDisabled
+                              ? 'border-[#30363d] repo-option-disabled'
+                              : isActive
+                                ? 'active-variant cursor-pointer'
+                                : 'border-[#30363d] text-gray-400 hover:border-gray-500 cursor-pointer'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2 w-full">
+                            <span className="font-semibold">{opt.label}</span>
+                            {isDisabled && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#30363d] bg-[#0d1117]">
+                                Desktop only
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[11px] opacity-80 leading-snug">
+                            {opt.description}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </section>
+            );
+          })()}
         </div>
       </div>
     </div>

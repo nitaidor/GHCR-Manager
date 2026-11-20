@@ -11,11 +11,14 @@ import {
 import type { GitHubRepo, GitHubUser } from '../lib/github-oci';
 import type { ClockFormat, DateFormat } from '../lib/naming';
 
+export type UploadTransferMode = 'stream' | 'chunked';
+
 export interface AppSettings {
   darkTheme: 'default' | 'green' | 'red';
   lightTheme: 'default' | 'monochrome';
   clockFormat: ClockFormat;
   dateFormat: DateFormat;
+  uploadTransferMode: UploadTransferMode;
 }
 
 interface HeaderProps {

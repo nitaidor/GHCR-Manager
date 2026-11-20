@@ -238,6 +238,8 @@ export default function App() {
           dateFormat: VALID_DATE_FORMATS.includes(parsed.dateFormat)
             ? parsed.dateFormat
             : 'YYYY-MM-DD',
+          uploadTransferMode:
+            parsed.uploadTransferMode === 'chunked' ? 'chunked' : 'stream',
         };
       }
     } catch {
@@ -248,6 +250,7 @@ export default function App() {
       lightTheme: 'default',
       clockFormat: '12h',
       dateFormat: 'YYYY-MM-DD',
+      uploadTransferMode: 'stream',
     };
   });
 
@@ -2038,6 +2041,7 @@ export default function App() {
             : 'multi-file',
         files: tarInputs,
         desktopFiles,
+        uploadTransferMode: settings.uploadTransferMode,
         beforePublishManifest: () => pkgLock!.verifyHeld(),
         signal: abortCtrl.signal,
         onProgress: (p) => setUploadProgress(p),
@@ -2834,6 +2838,7 @@ export default function App() {
             mode: plan.item.kind,
             files: tarFiles,
             desktopFiles,
+            uploadTransferMode: settings.uploadTransferMode,
             beforePublishManifest: () => lockBundle!.verifyAllHeld(),
             signal: abortCtrl.signal,
             onProgress: (p) => {
@@ -6218,6 +6223,7 @@ export default function App() {
         isDarkMode={isDarkMode}
         setIsDarkMode={setIsDarkMode}
         isSignedIn={Boolean(user)}
+        isDesktopEnv={isDesktopEnv}
         repos={repos}
         selectedRepo={selectedRepo}
         onSelectRepo={(repo) => setSelectedRepo(repo)}

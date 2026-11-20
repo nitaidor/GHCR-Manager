@@ -952,6 +952,7 @@ app.whenReady().then(() => {
         registryToken,
         basicAuthHeader,
         scopeParam,
+        uploadMode,
         requestId,
       }
     ) => {
@@ -967,6 +968,7 @@ app.whenReady().then(() => {
           files,
           uploadInitUrl,
           registryToken,
+          uploadMode: uploadMode === 'chunked' ? 'chunked' : 'stream',
           refreshToken:
             basicAuthHeader && scopeParam
               ? () => refreshGhcrTokenNode(basicAuthHeader, scopeParam)

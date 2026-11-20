@@ -734,6 +734,7 @@ async function streamAndUploadOciLayerContinuousAttempt({
  */
 async function streamAndUploadOciLayer(opts) {
   const {
+    uploadMode = 'stream',
     refreshToken,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     fallbackDelayMs = DEFAULT_FALLBACK_DELAY_MS,
@@ -741,6 +742,10 @@ async function streamAndUploadOciLayer(opts) {
     onStatusMessage,
     signal,
   } = opts;
+
+  if (uploadMode === 'chunked') {
+    return await streamAndUploadOciLayerChunked(opts);
+  }
 
   let currentToken = opts.registryToken;
 
